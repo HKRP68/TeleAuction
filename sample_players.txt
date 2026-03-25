@@ -1,0 +1,34 @@
+# Sample player list — paste this into Telegram after /add_player_list
+# Format: Name, Role, PreviousTeam, Nationality, BasePrice, Tier
+
+/add_player_list
+1 Virat Kohli, Bat, RCB, Indian, 2cr, Marquee
+2 Rohit Sharma, Bat, MI, Indian, 2cr, Marquee
+3 MS Dhoni, WK, CSK, Indian, 2cr, Marquee
+4 Jasprit Bumrah, Bowl, MI, Indian, 2cr, Marquee
+5 Hardik Pandya, AR, MI, Indian, 2cr, Marquee
+6 KL Rahul, WK, LSG, Indian, 2cr, A
+7 Shubman Gill, Bat, GT, Indian, 2cr, A
+8 Rishabh Pant, WK, DC, Indian, 2cr, A
+9 Ravindra Jadeja, AR, CSK, Indian, 2cr, A
+10 Mohammed Shami, Bowl, GT, Indian, 2cr, A
+11 Pat Cummins, Bowl, SRH, Overseas, 3cr, Marquee
+12 David Warner, Bat, DC, Overseas, 3cr, Marquee
+13 Jos Buttler, WK, RR, Overseas, 2cr, Marquee
+14 Trent Boult, Bowl, RR, Overseas, 2cr, A
+15 Rashid Khan, AR, GT, Overseas, 2cr, Marquee
+16 Glenn Maxwell, AR, RCB, Overseas, 2cr, A
+17 Faf du Plessis, Bat, RCB, Overseas, 2cr, A
+18 Quinton de Kock, WK, LSG, Overseas, 2cr, A
+19 Suryakumar Yadav, Bat, MI, Indian, 200, A
+20 Shreyas Iyer, Bat, KKR, Indian, 200, A
+21 Axar Patel, AR, DC, Indian, 200, B
+22 Yuzvendra Chahal, Bowl, RR, Indian, 200, B
+23 Bhuvneshwar Kumar, Bowl, SRH, Indian, 200, B
+24 Ishan Kishan, WK, MI, Indian, 200, B
+25 Washington Sundar, AR, SRH, Indian, 100, B
+26 Deepak Chahar, Bowl, CSK, Indian, 100, B
+27 Arshdeep Singh, Bowl, PBKS, Indian, 100, B
+28 Shivam Dube, AR, CSK, Indian, 100, C
+29 Tilak Varma, Bat, MI, Indian, 75, C
+30 Rinku Singh, Bat, KKR, Indian, 75, C
