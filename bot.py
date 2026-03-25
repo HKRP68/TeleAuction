@@ -1502,8 +1502,12 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ─────────────────────────────────────────────
-# FLASK HEALTH CHECK
+# FLASK ROUTES (health + webhook on ONE port)
 # ─────────────────────────────────────────────
+
+# PTB application reference (set in main)
+_ptb_app: Optional[Application] = None
+
 
 @flask_app.route("/health")
 def health():
@@ -1513,6 +1517,26 @@ def health():
 @flask_app.route("/")
 def root():
     return "🏏 IPL Auction Bot is running!", 200
+
+
+@flask_app.route(f"/webhook", methods=["POST"])
+def webhook():
+    """Receive Telegram updates via webhook on the same port as Flask."""
+    import json as _json
+    from telegram import Update as _Update
+
+    if _ptb_app is None:
+        return "Bot not ready", 503
+
+    data = request.get_json(force=True)
+    update = _Update.de_json(data, _ptb_app.bot)
+
+    # Process update in the bot's event loop
+    asyncio.run_coroutine_threadsafe(
+        _ptb_app.process_update(update),
+        _ptb_app.update_queue._loop if hasattr(_ptb_app.update_queue, "_loop") else asyncio.get_event_loop(),
+    )
+    return "ok", 200
 
 
 # ─────────────────────────────────────────────
@@ -1551,8 +1575,20 @@ def build_application() -> Application:
     return app
 
 
+async def setup_webhook(app: Application, webhook_url: str):
+    """Register the webhook URL with Telegram and initialize the app."""
+    await app.initialize()
+    await app.bot.set_webhook(
+        url=f"{webhook_url}/webhook",
+        allowed_updates=["message", "callback_query"],
+        drop_pending_updates=True,
+    )
+    await app.start()
+    logger.info(f"Webhook set to {webhook_url}/webhook")
+
+
 def main():
-    """Entry point — runs polling or webhook based on environment."""
+    """Entry point — polling (local) or webhook (Render/Railway)."""
     if not Config.BOT_TOKEN or Config.BOT_TOKEN == "YOUR_BOT_TOKEN_HERE":
         raise ValueError("❌ BOT_TOKEN is not set! Check your .env file.")
 
@@ -1560,27 +1596,52 @@ def main():
         raise ValueError("❌ SUPER_ADMIN_ID is not set! Check your .env file.")
 
     logger.info("Starting IPL Auction Bot...")
-    app = build_application()
+
+    ptb_app = build_application()
 
     if Config.WEBHOOK_URL:
-        # Production webhook mode (Railway / Render)
-        import threading as _threading
+        # ── PRODUCTION: webhook mode, single port ──────────────────
+        # Set up the event loop and register webhook with Telegram
+        global _ptb_app
+        _ptb_app = ptb_app
 
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+
+        # Store loop reference so webhook route can schedule coroutines
+        flask_app._ptb_loop = loop
+
+        # Monkey-patch the webhook route to use this loop
+        @flask_app.route("/webhook", methods=["POST"], endpoint="webhook_v2")
+        def webhook_handler():
+            from telegram import Update as _Update
+            data = request.get_json(force=True)
+            update = _Update.de_json(data, _ptb_app.bot)
+            asyncio.run_coroutine_threadsafe(
+                _ptb_app.process_update(update), loop
+            )
+            return "ok", 200
+
+        # Initialize PTB (register webhook) in the event loop
+        loop.run_until_complete(setup_webhook(ptb_app, Config.WEBHOOK_URL))
+
+        # Run Flask (which receives Telegram POSTs) in a background thread
+        import threading
         def run_flask():
-            flask_app.run(host="0.0.0.0", port=Config.PORT)
+            flask_app.run(host="0.0.0.0", port=Config.PORT, use_reloader=False)
 
-        _threading.Thread(target=run_flask, daemon=True).start()
+        flask_thread = threading.Thread(target=run_flask, daemon=True)
+        flask_thread.start()
 
-        app.run_webhook(
-            listen="0.0.0.0",
-            port=Config.PORT + 1,
-            url_path=Config.BOT_TOKEN,
-            webhook_url=f"{Config.WEBHOOK_URL}/{Config.BOT_TOKEN}",
-        )
+        logger.info(f"Running in WEBHOOK mode on port {Config.PORT}")
+
+        # Keep the event loop running (for timers/async tasks)
+        loop.run_forever()
+
     else:
-        # Development polling mode
+        # ── DEVELOPMENT: polling mode ──────────────────────────────
         logger.info("Running in POLLING mode (development)...")
-        app.run_polling(drop_pending_updates=True)
+        ptb_app.run_polling(drop_pending_updates=True)
 
 
 if __name__ == "__main__":
