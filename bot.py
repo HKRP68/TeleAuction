@@ -622,11 +622,20 @@ def eff_uid(uid: int) -> int:
     return uid
 
 
-def get_rtm_eligible(aid: int, exclude_uid: int) -> list:
-    """All participants with rtm_cards > 0, excluding the current highest bidder."""
+def get_rtm_eligible(aid: int, exclude_uid: int, ipl_team: str = "") -> list:
+    """
+    All participants with rtm_cards > 0, excluding the current highest bidder.
+    If ipl_team is given, only teams whose rtm_team matches that ipl_team are returned.
+    Players with no ipl_team are never RTM-eligible.
+    """
+    if not ipl_team or not ipl_team.strip():
+        return []   # No ipl_team on player → RTM not applicable
     return [
         r for r in db.get_all_parts(aid)
-        if r["rtm_cards"] > 0 and r["user_id"] != exclude_uid and not r["is_muted"]
+        if (r["rtm_cards"] > 0
+            and r["user_id"] != exclude_uid
+            and not r["is_muted"]
+            and r["rtm_team"].strip().lower() == ipl_team.strip().lower())
     ]
 
 
@@ -725,11 +734,13 @@ def rtm_counter_text(player_row, rtm_team: str, orig_bidder: str, orig_bid: int)
 def rtm_ask_text(player_row, counter: int, rtm_team: str) -> str:
     aid = player_row["auction_id"]
     return (
-        f"🔥 *Counter Bid!*\n{'─'*28}\n"
-        f"*{live.rtm_orig_bidder_name}* raised to *{fmt(counter,aid)}*\n\n"
-        f"*{rtm_team}* — do you accept *{fmt(counter,aid)}* for *{player_row['name']}*?\n\n"
-        f"✅ YES → Player sold to you for {fmt(counter,aid)}\n"
-        f"❌ NO → Player goes to {live.rtm_orig_bidder_name} for {fmt(live.rtm_orig_bid,aid)}"
+        f"🔥 *Counter Bid Received!*\n{'─'*28}\n"
+        f"Player: *{player_row['name']}*\n"
+        f"*{live.rtm_orig_bidder_name}* raised to *{fmt(counter, aid)}*\n\n"
+        f"*{rtm_team}* — do you accept *{fmt(counter, aid)}* for *{player_row['name']}*?\n\n"
+        f"✅ *YES* → Player sold to *{rtm_team}* for *{fmt(counter, aid)}*\n"
+        f"❌ *NO* → Player goes to *{live.rtm_orig_bidder_name}* "
+        f"for *{fmt(live.rtm_orig_bid, aid)}* (original bid, final)"
     )
 
 
@@ -813,8 +824,37 @@ async def _mark_unsold(context: ContextTypes.DEFAULT_TYPE, pr):
 
 
 async def _check_rtm(context: ContextTypes.DEFAULT_TYPE, pr):
-    """After timer expires with a bid — finalize directly. RTM is only via /rtm command."""
-    await _finalize(context, pr)
+    """
+    After timer expires with a bid — check if any team holds a matching RTM card.
+    If yes  → open RTM window (text-only, no button) and start RTM_OFFERED timer.
+    If no   → finalize immediately.
+    """
+    ipl_team = pr.get("ipl_team", "") or ""
+    eligible = get_rtm_eligible(live.auction_id, live.highest_bidder_id, ipl_team)
+
+    if not eligible:
+        await _finalize(context, pr)
+        return
+
+    # Enter RTM_OFFERED state
+    live.rtm_state = RTM_OFFERED
+    names = ", ".join(team_display(r) for r in eligible)
+
+    msg = await context.bot.send_message(
+        chat_id=live.chat_id,
+        text=(
+            f"🎴 *RTM AVAILABLE!*\n{'─'*28}\n"
+            f"Player: *{pr['name']}* (Prev Team: *{ipl_team}*)\n"
+            f"Sold to: *{live.highest_bidder_name}* for "
+            f"*{fmt(live.current_bid, live.auction_id)}*\n\n"
+            f"Teams with RTM card: {names}\n\n"
+            f"Use /rtm or /right\\_to\\_match within *{Config.RTM_TIMER}s* to exercise RTM.\n"
+            f"If no RTM is used, player goes to *{live.highest_bidder_name}*."
+        ),
+        parse_mode=ParseMode.MARKDOWN,
+    )
+    live.rtm_offer_msg_id = msg.message_id
+    live.timer_task = asyncio.create_task(_rtm_offer_timer(context))
 
 
 async def _rtm_offer_timer(context: ContextTypes.DEFAULT_TYPE):
@@ -1131,7 +1171,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/purse [@user] — Check purse & squad\n"
         "/squad [@user] — View squad\n"
         "/bid <amount> — Place bid\n"
-        "/rtm — Use your RTM card\n"
+        "/rtm — Use RTM card (after bid timer expires, if you hold a matching card)\n"
         "/status — Current auction status\n"
         "/mybidhistory — Your bid results\n"
         "/auctionhistory — Past auctions\n"
@@ -1162,10 +1202,10 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "/autosell <secs|off>\n"
             "/autonext <enable|disable|secs>\n"
             "\n*ADMIN: TEAMS*\n"
-            "/auctionowners — List all owners\n"
+            "/auctionowners — List all owners & usernames\n"
             "/soldplayers — Sold list with jump links\n"
             "/unsoldplayers — Unsold list\n"
-            "/setrtm @user <cards> <team>\n"
+            "/setrtm @user <cards> <TEAM> — Assign RTM (TEAM = ipl_team in player list)\n"
             "/mute\\_team @user | /unmute\\_team @user\n"
             "/teamup @primary @proxy\n"
             "/setpurse @user <amt>\n"
@@ -1492,20 +1532,30 @@ async def cmd_auction_owners(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await update.message.reply_text("No participants yet.")
         return
 
+    def _uname(uid: int) -> str:
+        """Return @username if available, else first_name, else 'Unknown'."""
+        u = db.get_user(uid)
+        if not u:
+            return "Unknown"
+        if u["username"]:
+            return f"@{u['username']}"
+        return u["first_name"] or "Unknown"
+
     lines = [f"👥 *Auction Owners — {live.auction_name}*\n{'─'*28}"]
     for i, r in enumerate(parts, 1):
-        main_uname = f"@{r['username']}" if r["username"] else f"ID:{r['user_id']}"
+        main_uname = _uname(r["user_id"])
         co = db.get_co_owners(aid, r["user_id"])
         if co:
-            co_parts = []
-            for c in co:
-                cu = db.get_user(c["linked_user_id"])
-                co_uname = f"@{cu['username']}" if cu and cu["username"] else f"ID:{c['linked_user_id']}"
-                co_parts.append(co_uname)
-            co_str = ", " + ", ".join(co_parts)
+            co_names = [_uname(c["linked_user_id"]) for c in co]
+            co_str = "  _(+co: " + ", ".join(co_names) + ")_"
         else:
             co_str = ""
-        lines.append(f"{i}. *{r['team_name']}* — {main_uname}{co_str}")
+        rtm_info = (
+            f"  🎴 RTM: {r['rtm_team']} ×{r['rtm_cards']}"
+            if r["rtm_cards"] > 0 and r["rtm_team"]
+            else ""
+        )
+        lines.append(f"{i}. *{r['team_name']}* — {main_uname}{co_str}{rtm_info}")
 
     await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
 
@@ -1711,28 +1761,34 @@ async def cmd_set_rtm(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     if len(context.args) < 3 or not live.auction_id:
         await update.message.reply_text(
-            "Usage: /setrtm @user <cards> <TeamName>\n"
-            "e.g. /setrtm @dhoni 2 CSK"
+            "Usage: /setrtm @user <cards> <TEAM>\n"
+            "• <cards> = number of RTM uses\n"
+            "• <TEAM>  = IPL team name as used in /addplayer (e.g. RCB, CSK, MI)\n\n"
+            "Example: /setrtm @dhoni 2 CSK\n"
+            "         /setrtm @virat 1 RCB"
         )
         return
 
     uid = db.resolve_uid(context.args[0])
     if not uid:
-        await update.message.reply_text("User not found.")
+        await update.message.reply_text("User not found. They must /start first.")
         return
 
     try:
         cards = int(context.args[1])
+        if cards < 0:
+            raise ValueError
     except ValueError:
-        await update.message.reply_text("Cards must be a number.")
+        await update.message.reply_text("Cards must be a non-negative integer.")
         return
 
-    team = " ".join(context.args[2:])
+    team = " ".join(context.args[2:]).strip()
     db.set_rtm(live.auction_id, uid, cards, team)
-    row = db.get_part(live.auction_id, uid)
+    row  = db.get_part(live.auction_id, uid)
     name = team_display(row) if row else str(uid)
     await update.message.reply_text(
-        f"✅ *{name}* assigned *{cards}* RTM card(s) for team *{team}*.",
+        f"✅ *{name}* assigned *{cards}* RTM card(s) for IPL team *{team}*.\n\n"
+        f"They can use /rtm after a *{team}* player's bid timer expires.",
         parse_mode=ParseMode.MARKDOWN,
     )
 
@@ -2487,52 +2543,78 @@ async def cmd_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # RTM HELPER
 # ─────────────────────────────────────────────────────────
 async def _handle_rtm_use(update, context: ContextTypes.DEFAULT_TYPE, uid: int):
-    """Core logic for when a team tries to use RTM."""
+    """Core logic for when a team tries to use RTM via /rtm or /right_to_match command."""
     aid = live.auction_id
+
+    async def err(m):
+        if update.callback_query:
+            await update.callback_query.answer(m, show_alert=True)
+        else:
+            await update.message.reply_text(m)
+
     if not live.active or not live.current_player_id:
-        msg = "No active auction."
-        if update.callback_query: await update.callback_query.answer(msg, show_alert=True)
-        else: await update.message.reply_text(msg)
+        await err("No active auction.")
         return
 
-    if live.rtm_state not in (RTM_NONE, RTM_OFFERED):
-        msg = "RTM already in progress."
-        if update.callback_query: await update.callback_query.answer(msg, show_alert=True)
-        else: await update.message.reply_text(msg)
+    # RTM can only be invoked during the RTM_OFFERED window (after timer expires)
+    if live.rtm_state not in (RTM_OFFERED,):
+        if live.rtm_state in (RTM_ACTIVE, RTM_COUNTER):
+            await err("RTM already in progress. Wait for it to resolve.")
+        else:
+            await err(
+                "RTM window is not open yet. "
+                "Wait for the bid timer to expire — if you hold a matching RTM card, "
+                "a window will open."
+            )
         return
 
     if live.highest_bidder_id is None:
-        msg = "No bid placed yet — nothing to RTM against."
-        if update.callback_query: await update.callback_query.answer(msg, show_alert=True)
-        else: await update.message.reply_text(msg)
+        await err("No bid placed yet — nothing to RTM against.")
         return
 
     if uid == live.highest_bidder_id:
-        msg = "You are the highest bidder — you cannot RTM yourself!"
-        if update.callback_query: await update.callback_query.answer(msg, show_alert=True)
-        else: await update.message.reply_text(msg)
+        await err("You are the highest bidder — you cannot RTM yourself!")
+        return
+
+    pr = db.get_player(live.current_player_id)
+    if not pr:
+        await err("Player not found.")
+        return
+
+    ipl_team = pr.get("ipl_team", "") or ""
+    if not ipl_team.strip():
+        await err("This player has no previous IPL team — RTM is not applicable.")
         return
 
     row = db.get_part(aid, uid)
     if not row or row["rtm_cards"] <= 0:
-        msg = "You have no RTM cards."
-        if update.callback_query: await update.callback_query.answer(msg, show_alert=True)
-        else: await update.message.reply_text(msg)
+        await err("You have no RTM cards.")
+        return
+
+    # Check that this team's RTM card matches the player's ipl_team
+    rtm_team_assigned = (row["rtm_team"] or "").strip()
+    if rtm_team_assigned.lower() != ipl_team.strip().lower():
+        await err(
+            f"Your RTM card is for *{rtm_team_assigned or 'N/A'}*, "
+            f"but this player's previous team is *{ipl_team}*. "
+            f"RTM does not apply."
+        )
         return
 
     if row["purse"] < live.current_bid:
-        msg = f"Not enough purse to RTM! You need {fmt(live.current_bid,aid)}."
-        if update.callback_query: await update.callback_query.answer(msg, show_alert=True)
-        else: await update.message.reply_text(msg)
+        await err(f"Not enough purse to RTM! You need {fmt(live.current_bid, aid)}.")
         return
 
-    # Cancel any running timers
+    # Cancel RTM offer timer
     if live.timer_task and not live.timer_task.done():
         live.timer_task.cancel()
 
-    # Deduct RTM card
-    db.cx.execute("UPDATE participants SET rtm_cards=MAX(0,rtm_cards-1)"
-                  " WHERE auction_id=? AND user_id=?", (aid, uid))
+    # Deduct one RTM card
+    db.cx.execute(
+        "UPDATE participants SET rtm_cards=MAX(0,rtm_cards-1)"
+        " WHERE auction_id=? AND user_id=?",
+        (aid, uid),
+    )
     db.cx.commit()
 
     live.rtm_state            = RTM_ACTIVE
@@ -2542,19 +2624,27 @@ async def _handle_rtm_use(update, context: ContextTypes.DEFAULT_TYPE, uid: int):
     live.rtm_orig_bidder_name = live.highest_bidder_name
     live.rtm_orig_bid         = live.current_bid
 
-    pr = db.get_player(live.current_player_id)
-
     if update.callback_query:
         await update.callback_query.answer("RTM card used!", show_alert=True)
 
+    # Announce RTM use and invite original bidder to counter
     msg = await context.bot.send_message(
         chat_id=live.chat_id,
-        text=rtm_counter_text(pr, live.rtm_team_name,
-                              live.rtm_orig_bidder_name, live.rtm_orig_bid),
+        text=(
+            f"🎴 *{live.rtm_team_name}* uses RTM on *{pr['name']}*!\n"
+            f"{'─'*28}\n"
+            f"Current highest bid: *{fmt(live.rtm_orig_bid, aid)}* "
+            f"by *{live.rtm_orig_bidder_name}*\n\n"
+            f"*{live.rtm_orig_bidder_name}* — raise your bid using:\n"
+            f"`/bid <amount>`  e.g. `/bid 19cr`\n\n"
+            f"⏱ You have *{Config.RTM_TIMER}s* to counter. "
+            f"If no counter, *{live.rtm_team_name}* wins the player at "
+            f"*{fmt(live.rtm_orig_bid, aid)}*."
+        ),
         parse_mode=ParseMode.MARKDOWN,
     )
     live.rtm_msg_id = msg.message_id
-    # Start RTM counter window
+    # Start counter window — waits for original bidder to /bid
     live.timer_task = asyncio.create_task(_rtm_counter_timer(context))
 
 
@@ -2635,9 +2725,12 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await process_bid(update, context, uid, bid_l)
         return
 
-    # ── RTM USE ───────────────────────────────
+    # ── RTM USE (button path disabled — use /rtm command) ──
     if data == "rtm_use":
-        await _handle_rtm_use(update, context, eff_uid(uid))
+        await query.answer(
+            "Use the /rtm or /right_to_match command to exercise RTM.",
+            show_alert=True,
+        )
         return
 
     # ── RTM SKIP (after timer-based RTM offer) ─
@@ -2660,8 +2753,9 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # ── RTM YES (RTM team accepts counter bid) ─
     if data == "rtm_yes":
         euid = eff_uid(uid)
-        if live.rtm_state != RTM_COUNTER or live.rtm_team_id != euid:
-            await query.answer("Not your action.", show_alert=True)
+        is_rtm_team = (live.rtm_team_id == euid)
+        if live.rtm_state != RTM_COUNTER or (not is_rtm_team and not db.is_admin(uid)):
+            await query.answer("Only the RTM team or admin can accept/decline.", show_alert=True)
             return
         live.current_bid         = live.rtm_counter_bid
         live.highest_bidder_id   = live.rtm_team_id
@@ -2681,8 +2775,9 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # ── RTM NO (RTM team declines counter bid) ─
     if data == "rtm_no":
         euid = eff_uid(uid)
-        if live.rtm_state != RTM_COUNTER or live.rtm_team_id != euid:
-            await query.answer("Not your action.", show_alert=True)
+        is_rtm_team = (live.rtm_team_id == euid)
+        if live.rtm_state != RTM_COUNTER or (not is_rtm_team and not db.is_admin(uid)):
+            await query.answer("Only the RTM team or admin can accept/decline.", show_alert=True)
             return
         live.current_bid         = live.rtm_orig_bid
         live.highest_bidder_id   = live.rtm_orig_bidder_id
