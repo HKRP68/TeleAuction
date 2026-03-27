@@ -608,6 +608,12 @@ def team_display(row) -> str:
     return f"{row['team_name']}{uname}"
 
 
+def bid_display(row) -> str:
+    """'@username - TeamName' format used in bid messages (no tagging)."""
+    uname = f"@{row['username']}" if row["username"] else f"ID:{row['user_id']}"
+    return f"{uname} - {row['team_name']}"
+
+
 def eff_uid(uid: int) -> int:
     """Return primary user_id if this user is a co-owner, else uid itself."""
     if live.auction_id:
@@ -681,10 +687,7 @@ def bid_keyboard(player_row, current_bid: int) -> InlineKeyboardMarkup:
             InlineKeyboardButton(f"💰 Bid {fmt(b1,aid)}", callback_data=f"bid_{b1}"),
             InlineKeyboardButton(f"➕ Bid {fmt(b2,aid)}", callback_data=f"bid_{b2}"),
         ],
-        [
-            InlineKeyboardButton("🎴 Use RTM", callback_data="rtm_use"),
-            InlineKeyboardButton("💼 My Purse", callback_data="my_purse"),
-        ],
+        [InlineKeyboardButton("💼 My Purse", callback_data="my_purse")],
     ])
 
 
@@ -810,22 +813,8 @@ async def _mark_unsold(context: ContextTypes.DEFAULT_TYPE, pr):
 
 
 async def _check_rtm(context: ContextTypes.DEFAULT_TYPE, pr):
-    """After timer expires with a bid — check if any team has RTM cards."""
-    aid = live.auction_id
-    rtm_eligible = get_rtm_eligible(aid, live.highest_bidder_id)
-
-    if rtm_eligible:
-        live.rtm_state = RTM_OFFERED
-        msg = await context.bot.send_message(
-            chat_id=live.chat_id,
-            text=rtm_offer_text(pr, rtm_eligible),
-            parse_mode=ParseMode.MARKDOWN,
-            reply_markup=rtm_offer_keyboard(),
-        )
-        live.rtm_offer_msg_id = msg.message_id
-        live.timer_task = asyncio.create_task(_rtm_offer_timer(context))
-    else:
-        await _finalize(context, pr)
+    """After timer expires with a bid — finalize directly. RTM is only via /rtm command."""
+    await _finalize(context, pr)
 
 
 async def _rtm_offer_timer(context: ContextTypes.DEFAULT_TYPE):
@@ -1080,7 +1069,7 @@ async def process_bid(update, context: ContextTypes.DEFAULT_TYPE,
     prev_name             = live.highest_bidder_name
     live.current_bid      = bid_l
     live.highest_bidder_id   = uid
-    live.highest_bidder_name = team_display(part)
+    live.highest_bidder_name = bid_display(part)
 
     # Record as bid attempt (not won yet)
     db.record_bid(aid, uid, pr["player_id"], pr["name"], bid_l, won=False)
@@ -1089,7 +1078,7 @@ async def process_bid(update, context: ContextTypes.DEFAULT_TYPE,
         live.timer_task = asyncio.create_task(bid_timer(context))
 
     duration = live.auto_sell_secs or Config.BID_TIMER
-    outbid   = f"⬆️ Outbids: {prev_name}" if prev_name and prev_name != team_display(part) else "🎯 Opening bid!"
+    outbid   = f"⬆️ Outbids: {prev_name}" if prev_name and prev_name != bid_display(part) else "🎯 Opening bid!"
 
     new_msg = await context.bot.send_message(
         chat_id=live.chat_id,
@@ -1097,7 +1086,7 @@ async def process_bid(update, context: ContextTypes.DEFAULT_TYPE,
             f"💥 *New Bid*\n{'─'*28}\n"
             f"Player: *{pr['name']}*\n"
             f"Amount: *{fmt(bid_l,aid)}*\n"
-            f"Team: *{team_display(part)}*\n"
+            f"By: *{bid_display(part)}*\n"
             f"{outbid}\n"
             f"⏱ Timer: {duration}s"
         ),
@@ -1504,14 +1493,19 @@ async def cmd_auction_owners(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return
 
     lines = [f"👥 *Auction Owners — {live.auction_name}*\n{'─'*28}"]
-    for r in parts:
+    for i, r in enumerate(parts, 1):
+        main_uname = f"@{r['username']}" if r["username"] else f"ID:{r['user_id']}"
         co = db.get_co_owners(aid, r["user_id"])
-        co_names = ""
         if co:
-            co_names = ", " + ", ".join(
-                db.display(c["linked_user_id"]) for c in co
-            )
-        lines.append(f"• *{r['team_name']}* — @{r['username'] or r['user_id']}{co_names}")
+            co_parts = []
+            for c in co:
+                cu = db.get_user(c["linked_user_id"])
+                co_uname = f"@{cu['username']}" if cu and cu["username"] else f"ID:{c['linked_user_id']}"
+                co_parts.append(co_uname)
+            co_str = ", " + ", ".join(co_parts)
+        else:
+            co_str = ""
+        lines.append(f"{i}. *{r['team_name']}* — {main_uname}{co_str}")
 
     await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
 
@@ -2178,27 +2172,120 @@ async def cmd_resume(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("▶️ Auction RESUMED!")
 
 
+async def cmd_auction_summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Full auction summary — admin command."""
+    await _reg(update.effective_user)
+    if not db.is_admin(update.effective_user.id):
+        await update.message.reply_text("Admin only.")
+        return
+    aid = live.auction_id
+    if not aid:
+        await update.message.reply_text("No auction session.")
+        return
+
+    sold_list   = db.get_sold(aid)
+    unsold_list = db.get_unsold(aid)
+    parts       = sorted(db.get_all_parts(aid), key=lambda r: r["total_spent"], reverse=True)
+    total_purse = sum(r["total_spent"] for r in parts)
+
+    lines = [
+        f"📊 *{live.auction_name} — Full Summary*\n{'─'*28}\n"
+        f"✅ Sold: *{len(sold_list)}*  ❌ Unsold: *{len(unsold_list)}*\n"
+        f"💰 Total Purse Used: *{fmt(total_purse, aid)}*\n",
+    ]
+
+    # Sold players list
+    lines.append(f"*Sold Players ({len(sold_list)}):*")
+    for p in sold_list:
+        buyer = db.get_part(aid, p["sold_to"]) if p["sold_to"] else None
+        bname = team_display(buyer) if buyer else "?"
+        lines.append(f"  • {p['name']} → {bname} — {fmt(p['sold_price'] or 0, aid)}")
+
+    # Unsold players list
+    if unsold_list:
+        lines.append(f"\n*Unsold Players ({len(unsold_list)}):*")
+        for p in unsold_list:
+            lines.append(f"  • {p['name']} ({p['role']})")
+
+    # Per-team breakdown
+    lines.append(f"\n{'─'*28}\n*Team Breakdown:*")
+    for r in parts:
+        sq   = [db.get_player(p) for p in json.loads(r["squad"])]
+        sq   = [p for p in sq if p]
+        roles: dict = {}
+        for p in sq:
+            roles[p["role"]] = roles.get(p["role"], 0) + 1
+        role_str = "  ".join(f"{r_emoji(k)}{k[:3]}:{v}" for k, v in roles.items()) or "Empty"
+        # Count RTM cards used: original - current
+        orig_row = db.cx.execute(
+            "SELECT rtm_cards FROM participants WHERE auction_id=? AND user_id=?",
+            (aid, r["user_id"])
+        ).fetchone()
+        rtm_used_count = "—"  # We track remaining cards; used = assigned - remaining
+        lines.append(
+            f"\n🏏 *{team_display(r)}*\n"
+            f"  Purse Used: {fmt(r['total_spent'],aid)}  |  Left: {fmt(r['purse'],aid)}\n"
+            f"  Squad: {len(sq)} players  |  RTM Left: {r['rtm_cards']}\n"
+            f"  {role_str}"
+        )
+
+    # Send in chunks if too long
+    text = "\n".join(lines)
+    if len(text) > 3800:
+        chunks, chunk = [], []
+        for line in lines:
+            if len("\n".join(chunk + [line])) > 3800:
+                chunks.append("\n".join(chunk))
+                chunk = [line]
+            else:
+                chunk.append(line)
+        if chunk:
+            chunks.append("\n".join(chunk))
+        for ch in chunks:
+            await update.message.reply_text(ch, parse_mode=ParseMode.MARKDOWN)
+    else:
+        await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
+
+
 async def cmd_end_auction(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Ask for confirmation before ending."""
     await _reg(update.effective_user)
     if not db.is_admin(update.effective_user.id):
         await update.message.reply_text("Admin only.")
         return
     if not live.active:
-        await update.message.reply_text("No active auction.")
+        await update.message.reply_text("No active auction to end.")
         return
+
+    await update.message.reply_text(
+        f"⚠️ *End Auction?*\n{'─'*28}\n"
+        f"Auction: *{live.auction_name}*\n"
+        f"Sold: {live.sold_count}  |  Unsold: {live.unsold_count}\n\n"
+        f"*Yes* — End the auction and save results.\n"
+        f"*No* — Pause instead. Resume with /resumeauction.",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("✅ Yes, End Auction", callback_data="endauction_yes"),
+            InlineKeyboardButton("❌ No, Pause", callback_data="endauction_no"),
+        ]]),
+    )
+
+
+async def _do_end_auction(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
+    """Internal: actually end the auction, save snapshot, send summary."""
     if live.timer_task and not live.timer_task.done():
         live.timer_task.cancel()
 
-    live.active         = False
+    live.active            = False
     live.current_player_id = None
     aid = live.auction_id
     db.set_auction_status(aid, "completed")
 
-    parts = sorted(db.get_all_parts(aid), key=lambda r: r["total_spent"], reverse=True)
-    medals = ["🥇","🥈","🥉"]
+    parts   = sorted(db.get_all_parts(aid), key=lambda r: r["total_spent"], reverse=True)
+    medals  = ["🥇","🥈","🥉"]
     summary = {"name": live.auction_name, "sold": live.sold_count,
                "unsold": live.unsold_count, "teams": []}
-    lines = [
+    lines   = [
         f"🏆 *{live.auction_name} — FINAL SUMMARY*\n{'─'*28}\n"
         f"✅ Sold: {live.sold_count}  ❌ Unsold: {live.unsold_count}\n"
     ]
@@ -2225,7 +2312,16 @@ async def cmd_end_auction(update: Update, context: ContextTypes.DEFAULT_TYPE):
         })
 
     db.save_snapshot(aid, summary)
-    await update.message.reply_text("\n\n".join(lines), parse_mode=ParseMode.MARKDOWN)
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text="\n\n".join(lines),
+        parse_mode=ParseMode.MARKDOWN,
+    )
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text="✅ *Auction Successfully Ended!* Start a new one with /create\\_auction.",
+        parse_mode=ParseMode.MARKDOWN,
+    )
 
 
 async def cmd_auto_sell(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2441,7 +2537,7 @@ async def _handle_rtm_use(update, context: ContextTypes.DEFAULT_TYPE, uid: int):
 
     live.rtm_state            = RTM_ACTIVE
     live.rtm_team_id          = uid
-    live.rtm_team_name        = team_display(row)
+    live.rtm_team_name        = bid_display(row)
     live.rtm_orig_bidder_id   = live.highest_bidder_id
     live.rtm_orig_bidder_name = live.highest_bidder_name
     live.rtm_orig_bid         = live.current_bid
@@ -2707,6 +2803,37 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await context.bot.send_message(chat_id=query.message.chat_id, text=text)
         return
 
+    # ── END AUCTION CONFIRM ──────────────────
+    if data == "endauction_yes":
+        if not db.is_admin(uid):
+            await query.answer("Admin only.", show_alert=True)
+            return
+        if not live.active:
+            await query.answer("Auction already ended.", show_alert=True)
+            return
+        try:
+            await query.edit_message_text("⏳ Ending auction and saving results...")
+        except Exception:
+            pass
+        await query.answer()
+        await _do_end_auction(context, query.message.chat_id)
+        return
+
+    if data == "endauction_no":
+        if not db.is_admin(uid):
+            await query.answer("Admin only.", show_alert=True)
+            return
+        live.paused = True
+        try:
+            await query.edit_message_text(
+                "⏸ *Auction Paused.*\nUse /resumeauction to continue.",
+                parse_mode=ParseMode.MARKDOWN,
+            )
+        except Exception:
+            pass
+        await query.answer("Auction paused.")
+        return
+
     await query.answer()
 
 
@@ -2745,6 +2872,8 @@ DOT_MAP = {
     "auctionowners": cmd_auction_owners,
     "soldplayers": cmd_sold_players,
     "unsoldplayers": cmd_unsold_players,
+    "auctionsummary": cmd_auction_summary, "auction_summary": cmd_auction_summary,
+    "right_to_match": cmd_rtm, "rtm": cmd_rtm,
 }
 
 
@@ -2784,7 +2913,7 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("squad", cmd_squad))
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("bid", cmd_bid))
-    app.add_handler(CommandHandler("rtm", cmd_rtm))
+    app.add_handler(CommandHandler(["rtm","right_to_match"], cmd_rtm))
     app.add_handler(CommandHandler(["mybidhistory","bidhistory"], cmd_my_bid_history))
     app.add_handler(CommandHandler(["auctionhistory","auction_history"], cmd_auction_history))
     app.add_handler(CommandHandler("leaderboard", cmd_leaderboard))
@@ -2799,6 +2928,7 @@ def build_app() -> Application:
     app.add_handler(CommandHandler(["auctionowners","auction_owners"], cmd_auction_owners))
     app.add_handler(CommandHandler(["soldplayers","sold_players"], cmd_sold_players))
     app.add_handler(CommandHandler(["unsoldplayers","unsold_players"], cmd_unsold_players))
+    app.add_handler(CommandHandler(["auctionsummary","auction_summary"], cmd_auction_summary))
 
     # Admin: players
     app.add_handler(CommandHandler("addplayer", cmd_add_player))
