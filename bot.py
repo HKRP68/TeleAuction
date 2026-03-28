@@ -718,57 +718,58 @@ def rtm_check_text(player_row, eligible: list) -> str:
     ipl   = player_row["ipl_team"] or "N/A"
     names = "\n".join(f"  • *{team_display(r)}*" for r in eligible)
     return (
-        f"⏰ *AUCTION PAUSED \\- RTM CHECK*\n"
+        f"⏰ *AUCTION PAUSED - RTM CHECK*\n"
         f"{'═'*20}\n\n"
-        f"🏏 *{flag(player_row['nationality'])} {player_row['name']}* \\({ipl}\\)\n"
-        f"🎯 {player_row['role']} \\| {player_row['nationality']}\n\n"
-        f"💵 *Final Bid:* ₹{_cr(live.current_bid)}\n"
+        f"🏏 *{flag(player_row['nationality'])} {player_row['name']}* ({ipl})\n"
+        f"🎯 {player_row['role']} | {player_row['nationality']}\n\n"
+        f"💵 *Final Bid:* {fmt(live.current_bid, player_row['auction_id'])}\n"
         f"👤 *Leading Team:* {live.highest_bidder_name}\n\n"
         f"🎴 *RTM ALERT*\n"
-        f"Team\\(s\\) with *{ipl}* RTM card:\n"
+        f"Team(s) with *{ipl}* RTM card:\n"
         f"{names}\n\n"
-        f"⏱️ *{Config.RTM_OFFER_TIMER} seconds* to use RTM\\!\n"
-        f"Use: `/rtm {player_row['name']}` or `/right_to_match {player_row['name']}`"
+        f"⏱ *{Config.RTM_OFFER_TIMER} seconds* to use RTM!\n"
+        f"Use: /rtm or /right\\_to\\_match"
     )
 
 
 # ── STEP 2: RTM CARD ACTIVATED ────────────────────────────
 def rtm_activated_text(player_row) -> str:
     ipl = player_row["ipl_team"] or "N/A"
+    aid = player_row["auction_id"]
     return (
-        f"🎴 *RTM CARD ACTIVATED\\!*\n"
+        f"🎴 *RTM CARD ACTIVATED!*\n"
         f"{'═'*20}\n\n"
         f"🏏 *{player_row['name']}*\n"
-        f"💰 Original Bid: *₹{_cr(live.rtm_orig_bid)}*\n"
+        f"💰 Original Bid: *{fmt(live.rtm_orig_bid, aid)}*\n"
         f"👤 Original Winner: *{live.rtm_orig_bidder_name}*\n\n"
-        f"🎯 *{live.rtm_team_name}* has used RTM Card for *{ipl}*\\!\n\n"
+        f"🎯 *{live.rtm_team_name}* has used RTM Card for *{ipl}*!\n\n"
         f"📋 *WHAT HAPPENS NOW?*\n"
-        f"1️⃣ {live.rtm_orig_bidder_name} can raise the bid "
-        f"\\(use `/bid {player_row['name']} <amount>`\\)\n"
-        f"2️⃣ If raised, {live.rtm_team_name} must Accept or Reject the new amount\n"
-        f"3️⃣ If no raise in {Config.RTM_COUNTER_TIMER}s, "
-        f"{live.rtm_team_name} gets player for ₹{_cr(live.rtm_orig_bid)}\n\n"
-        f"⏱️ *{Config.RTM_COUNTER_TIMER} seconds* for {live.rtm_orig_bidder_name} to raise\\.\\.\\."
+        f"1. {live.rtm_orig_bidder_name} can raise the bid (use /bid <amount>)\n"
+        f"2. If raised, {live.rtm_team_name} must Accept or Reject the new amount\n"
+        f"3. If no raise in {Config.RTM_COUNTER_TIMER}s, "
+        f"{live.rtm_team_name} gets player for {fmt(live.rtm_orig_bid, aid)}\n\n"
+        f"⏱ *{Config.RTM_COUNTER_TIMER} seconds* for {live.rtm_orig_bidder_name} to raise..."
     )
 
 
 # ── STEP 3: BID RAISED by original bidder ─────────────────
 def rtm_bid_raised_text(player_row, new_bid: int) -> str:
     diff = new_bid - live.rtm_orig_bid
+    aid  = player_row["auction_id"]
     return (
-        f"⬆️ *BID RAISED\\!*\n"
+        f"⬆️ *BID RAISED!*\n"
         f"{'═'*20}\n\n"
         f"🏏 *{player_row['name']}*\n\n"
-        f"💵 New Bid: *₹{_cr(new_bid)}* ⬆️\n"
+        f"💵 New Bid: *{fmt(new_bid, aid)}*\n"
         f"👤 Raised By: *{live.rtm_orig_bidder_name}*\n"
-        f"📈 Increase: \\+₹{_cr(diff)}\n\n"
+        f"📈 Increase: +{fmt(diff, aid)}\n\n"
         f"🎴 *RTM DECISION REQUIRED*\n"
         f"{live.rtm_team_name}, do you match this new bid?\n\n"
         f"💭 *Your Options:*\n"
-        f"✅ *YES* → Buy player for ₹{_cr(new_bid)} \\(Deducted from purse\\)\n"
-        f"❌ *NO* → Lose player to {live.rtm_orig_bidder_name} for ₹{_cr(live.rtm_orig_bid)}\n\n"
-        f"⏱️ *{Config.RTM_DECISION_TIMER} seconds* to decide\\!\n\n"
-        f"_Only {live.rtm_team_name} or Admin can click_"
+        f"✅ *YES* → Buy player for {fmt(new_bid, aid)}\n"
+        f"❌ *NO* → Lose player to {live.rtm_orig_bidder_name} for {fmt(live.rtm_orig_bid, aid)}\n\n"
+        f"⏱ *{Config.RTM_DECISION_TIMER} seconds* to decide!\n\n"
+        f"_Only {live.rtm_team_name} can click_"
     )
 
 
@@ -779,17 +780,18 @@ def rtm_accepted_text(player_row, final_price: int, winner_name: str,
     import datetime
     ts  = datetime.datetime.now().strftime("%H:%M:%S")
     ipl = player_row["ipl_team"] or "N/A"
+    aid = player_row["auction_id"]
     return (
-        f"✅ *RTM ACCEPTED \\- PLAYER SOLD\\!*\n"
+        f"✅ *RTM ACCEPTED - PLAYER SOLD!*\n"
         f"{'═'*20}\n\n"
-        f"🏏 *{flag(player_row['nationality'])} {player_row['name']}* \\({ipl}\\)\n"
-        f"🎯 {player_row['role']} \\| {player_row['nationality']}\n\n"
-        f"💰 *Final Price:* ₹{_cr(final_price)}\n"
-        f"🏆 *Winner:* *{winner_name}* 🎴 \\(via RTM\\)\n\n"
+        f"🏏 *{flag(player_row['nationality'])} {player_row['name']}* ({ipl})\n"
+        f"🎯 {player_row['role']} | {player_row['nationality']}\n\n"
+        f"💰 *Final Price:* {fmt(final_price, aid)}\n"
+        f"🏆 *Winner:* *{winner_name}* 🎴 (via RTM)\n\n"
         f"📊 *Transaction:*\n"
-        f"• Deducted: ₹{_cr(final_price)} from {winner_name}\n"
-        f"• Remaining Purse: ₹{_cr(remaining_purse)}\n"
-        f"• Squad: {squad_count} players\n\n"
+        f"  Deducted: {fmt(final_price, aid)} from {winner_name}\n"
+        f"  Remaining Purse: {fmt(remaining_purse, aid)}\n"
+        f"  Squad: {squad_count} players\n\n"
         f"❌ {original_team} loses the bid\n\n"
         f"⏰ Sold at: {ts}"
     )
@@ -802,19 +804,20 @@ def rtm_declined_text(player_row, original_bid: int, original_team: str,
     import datetime
     ts  = datetime.datetime.now().strftime("%H:%M:%S")
     ipl = player_row["ipl_team"] or "N/A"
+    aid = player_row["auction_id"]
     return (
-        f"❌ *RTM DECLINED \\- ORIGINAL SALE\\!*\n"
+        f"❌ *RTM DECLINED - ORIGINAL SALE!*\n"
         f"{'═'*20}\n\n"
-        f"🏏 *{flag(player_row['nationality'])} {player_row['name']}* \\({ipl}\\)\n"
-        f"🎯 {player_row['role']} \\| {player_row['nationality']}\n\n"
-        f"💰 *Final Price:* ₹{_cr(original_bid)} \\(Original bid\\)\n"
+        f"🏏 *{flag(player_row['nationality'])} {player_row['name']}* ({ipl})\n"
+        f"🎯 {player_row['role']} | {player_row['nationality']}\n\n"
+        f"💰 *Final Price:* {fmt(original_bid, aid)} (Original bid)\n"
         f"🏆 *Winner:* *{original_team}*\n\n"
         f"🎴 {rtm_team} declined to match the raised bid\n\n"
         f"📊 *Transaction:*\n"
-        f"• Deducted: ₹{_cr(original_bid)} from {original_team}\n"
-        f"• Remaining Purse: ₹{_cr(remaining_purse)}\n"
-        f"• Squad: {squad_count} players\n\n"
-        f"✅ {original_team} wins the player\\!\n\n"
+        f"  Deducted: {fmt(original_bid, aid)} from {original_team}\n"
+        f"  Remaining Purse: {fmt(remaining_purse, aid)}\n"
+        f"  Squad: {squad_count} players\n\n"
+        f"✅ {original_team} wins the player!\n\n"
         f"⏰ Sold at: {ts}"
     )
 
@@ -823,18 +826,19 @@ def rtm_declined_text(player_row, original_bid: int, original_team: str,
 def rtm_no_raise_text(player_row, orig_bid: int, rtm_team: str,
                       rtm_cards_left: int, squad_count: int,
                       original_team: str) -> str:
+    aid = player_row["auction_id"]
     return (
-        f"🎴 *RTM SUCCESSFUL \\- NO RAISE\\!*\n"
+        f"🎴 *RTM SUCCESSFUL - NO RAISE!*\n"
         f"{'═'*20}\n\n"
         f"🏏 *{flag(player_row['nationality'])} {player_row['name']}*\n\n"
-        f"⏱️ {original_team} did not raise the bid\n\n"
-        f"💰 *Final Price:* ₹{_cr(orig_bid)} \\(Original amount\\)\n"
-        f"🏆 *Winner:* *{rtm_team}* 🎴 \\(via RTM\\)\n\n"
+        f"⏱ {original_team} did not raise the bid\n\n"
+        f"💰 *Final Price:* {fmt(orig_bid, aid)} (Original amount)\n"
+        f"🏆 *Winner:* *{rtm_team}* 🎴 (via RTM)\n\n"
         f"📊 *Transaction:*\n"
-        f"• Deducted: ₹{_cr(orig_bid)} from {rtm_team}\n"
-        f"• RTM Cards Remaining: {rtm_cards_left}\n"
-        f"• Squad: {squad_count} players\n\n"
-        f"✅ Player acquired using RTM card\\!"
+        f"  Deducted: {fmt(orig_bid, aid)} from {rtm_team}\n"
+        f"  RTM Cards Remaining: {rtm_cards_left}\n"
+        f"  Squad: {squad_count} players\n\n"
+        f"✅ Player acquired using RTM card!"
     )
 
 
@@ -843,24 +847,25 @@ def rtm_summary_text(player_row, base_price: int, original_bid: int,
                      team_b: str, team_a: str, raised_bid: int,
                      accepted: Optional[bool], winner_team: str,
                      final_amount: int, rtm_cards_left: int) -> str:
+    aid = player_row["auction_id"]
     steps = (
-        f"1️⃣ Base: ₹{_cr(base_price) if base_price else 'Open'}\n"
-        f"2️⃣ Final Bid: ₹{_cr(original_bid)} by {team_b}\n"
-        f"3️⃣ 🎴 RTM used by {team_a}\n"
+        f"1. Base: {fmt(base_price, aid) if base_price else 'Open'}\n"
+        f"2. Final Bid: {fmt(original_bid, aid)} by {team_b}\n"
+        f"3. 🎴 RTM used by {team_a}\n"
     )
     if raised_bid and raised_bid != original_bid:
-        steps += f"4️⃣ ⬆️ Raised to: ₹{_cr(raised_bid)} by {team_b}\n"
+        steps += f"4. Raised to: {fmt(raised_bid, aid)} by {team_b}\n"
         outcome = "✅ Accepted" if accepted else "❌ Rejected"
-        steps += f"5️⃣ {outcome} by {team_a}"
+        steps += f"5. {outcome} by {team_a}"
     else:
-        steps += f"4️⃣ No raise — {team_a} wins at original bid"
+        steps += f"4. No raise — {team_a} wins at original bid"
     return (
-        f"📋 *RTM SUMMARY \\- {player_row['name']}*\n"
+        f"📋 *RTM SUMMARY - {player_row['name']}*\n"
         f"{'═'*20}\n\n"
         f"🔨 Auction Flow:\n{steps}\n\n"
         f"🏆 Winner: *{winner_team}*\n"
-        f"💰 Paid: ₹{_cr(final_amount)}\n\n"
-        f"📊 RTM Cards Left:\n{team_a}: {rtm_cards_left} card\\(s\\)"
+        f"💰 Paid: {fmt(final_amount, aid)}\n\n"
+        f"📊 RTM Cards Left:\n{team_a}: {rtm_cards_left} card(s)"
     )
 
 
@@ -869,36 +874,34 @@ def rtm_error_text(player_name: str, ipl_team: str, reason: str) -> str:
     return (
         f"❌ *RTM ERROR*\n"
         f"{'═'*20}\n\n"
-        f"You cannot use RTM for {player_name}\\!\n\n"
+        f"You cannot use RTM for {player_name}!\n\n"
         f"Reason: {reason}\n\n"
-        f"💡 Check: `/myrtm` to see your available RTM cards"
+        f"💡 Check: /myrtm to see your available RTM cards"
     )
 
 
-# ── ERROR: Wrong team trying to raise bid ─────────────────
 def rtm_raise_error_text(original_team: str, your_team: str) -> str:
     return (
         f"❌ *RAISE BID ERROR*\n"
         f"{'═'*20}\n\n"
-        f"Only *{original_team}* \\(current highest bidder\\) can raise the bid\\!\n\n"
+        f"Only *{original_team}* (current highest bidder) can raise the bid!\n\n"
         f"You are: {your_team}\n\n"
-        f"💡 Wait for {original_team} to decide or let the RTM team win\\."
+        f"💡 Wait for {original_team} to decide or let the RTM team win."
     )
 
 
-# ── ERROR: RTM team must use buttons, not /bid ────────────
 def rtm_wait_decision_text(rtm_team: str, new_bid: int, original_bid: int,
                             original_team: str, secs_left: int) -> str:
     return (
         f"❌ *WAIT FOR DECISION*\n"
         f"{'═'*20}\n\n"
-        f"{rtm_team}, you must click the buttons\\!\n\n"
-        f"The original bidder has raised to ₹{_cr(new_bid)}\\.\n\n"
+        f"{rtm_team}, you must click the buttons!\n\n"
+        f"The original bidder has raised to {fmt(new_bid, live.auction_id)}.\n\n"
         f"Click:\n"
-        f"✅ *YES* to buy for ₹{_cr(new_bid)}\n"
+        f"✅ *YES* to buy for {fmt(new_bid, live.auction_id)}\n"
         f"❌ *NO* to give up "
-        f"\\(player goes to {original_team} for ₹{_cr(original_bid)}\\)\n\n"
-        f"⏱️ {secs_left}s remaining\\.\\.\\."
+        f"(player goes to {original_team} for {fmt(original_bid, live.auction_id)})\n\n"
+        f"⏱ {secs_left}s remaining..."
     )
 
 
@@ -926,43 +929,74 @@ def reauction_confirm_keyboard() -> InlineKeyboardMarkup:
 # TIMER & AUCTION CORE
 # ─────────────────────────────────────────────────────────
 async def bid_timer(context: ContextTypes.DEFAULT_TYPE):
-    duration = live.auto_sell_secs or Config.BID_TIMER
-    end = _time.time() + duration
-    live.timer_ends_at = end
+    """
+    Countdown timer. Sleeps in 1-second ticks, updates message every 5s,
+    fires _mark_unsold or _check_rtm on expiry.
+    Wrapped in try/except so any crash is logged and a safe fallback fires.
+    """
+    try:
+        duration = live.auto_sell_secs or Config.BID_TIMER
+        live.timer_ends_at = _time.time() + duration
+        tick = 0
 
-    while True:
-        await asyncio.sleep(5)
-        if not live.active or live.paused or not live.current_player_id:
+        while True:
+            await asyncio.sleep(1)
+            if not live.active or live.paused:
+                return
+            if not live.current_player_id:
+                return
+
+            remaining = max(0, int(live.timer_ends_at - _time.time()))
+            if remaining <= 0:
+                break
+
+            # Update the live bid message every 5 seconds
+            tick += 1
+            if tick % 5 == 0 and live.last_bid_msg_id:
+                pr = db.get_player(live.current_player_id)
+                if pr:
+                    try:
+                        await context.bot.edit_message_text(
+                            chat_id=live.chat_id,
+                            message_id=live.last_bid_msg_id,
+                            text=bid_status_text(pr, live.current_bid,
+                                                 live.highest_bidder_name, remaining),
+                            parse_mode=ParseMode.MARKDOWN,
+                            reply_markup=bid_keyboard(pr, live.current_bid),
+                        )
+                    except Exception:
+                        pass  # Message unchanged or too old — harmless
+
+        # ── Timer expired ──────────────────────────────
+        if not live.active or not live.current_player_id:
             return
-        remaining = max(0, int(live.timer_ends_at - _time.time()))
-        if remaining <= 0:
-            break
-        if live.last_bid_msg_id:
-            pr = db.get_player(live.current_player_id)
-            if pr:
-                try:
-                    await context.bot.edit_message_text(
-                        chat_id=live.chat_id,
-                        message_id=live.last_bid_msg_id,
-                        text=bid_status_text(pr, live.current_bid,
-                                             live.highest_bidder_name, remaining),
-                        parse_mode=ParseMode.MARKDOWN,
-                        reply_markup=bid_keyboard(pr, live.current_bid),
-                    )
-                except Exception:
-                    pass
 
-    if not live.active or not live.current_player_id:
-        return
+        pr = db.get_player(live.current_player_id)
+        if not pr:
+            return
 
-    pr = db.get_player(live.current_player_id)
-    if not pr:
-        return
+        if live.current_bid == 0:
+            await _mark_unsold(context, pr)
+        else:
+            await _check_rtm(context, pr)
 
-    if live.current_bid == 0:
-        await _mark_unsold(context, pr)
-    else:
-        await _check_rtm(context, pr)
+    except asyncio.CancelledError:
+        raise   # Normal cancellation (admin /sold, /pass etc.) — let it propagate
+    except Exception as exc:
+        logger.error(f"bid_timer CRASHED: {exc}", exc_info=True)
+        # Safe fallback: attempt to finalize whatever state we're in
+        try:
+            if live.current_player_id and live.active:
+                pr = db.get_player(live.current_player_id)
+                if pr:
+                    if live.current_bid > 0 and live.highest_bidder_id:
+                        logger.info("bid_timer fallback: finalizing sale")
+                        await _finalize(context, pr)
+                    else:
+                        logger.info("bid_timer fallback: marking unsold")
+                        await _mark_unsold(context, pr)
+        except Exception as e2:
+            logger.error(f"bid_timer fallback also failed: {e2}", exc_info=True)
 
 
 async def _mark_unsold(context: ContextTypes.DEFAULT_TYPE, pr):
@@ -999,7 +1033,7 @@ async def _check_rtm(context: ContextTypes.DEFAULT_TYPE, pr):
     msg = await context.bot.send_message(
         chat_id=live.chat_id,
         text=rtm_check_text(pr, eligible),
-        parse_mode=ParseMode.MARKDOWN_V2,
+        parse_mode=ParseMode.MARKDOWN,
     )
     live.rtm_offer_msg_id = msg.message_id
     live.timer_task = asyncio.create_task(_rtm_offer_timer(context))
@@ -1017,10 +1051,10 @@ async def _rtm_offer_timer(context: ContextTypes.DEFAULT_TYPE):
         await context.bot.send_message(
             chat_id=live.chat_id,
             text=(
-                f"⏰ RTM window expired\\. "
-                f"*{live.highest_bidder_name}* wins the player\\!"
+                f"⏰ RTM window expired. "
+                f"*{live.highest_bidder_name}* wins the player!"
             ),
-            parse_mode=ParseMode.MARKDOWN_V2,
+            parse_mode=ParseMode.MARKDOWN,
         )
         pr = db.get_player(live.current_player_id) if live.current_player_id else None
         if pr:
@@ -1065,7 +1099,7 @@ async def _rtm_counter_timer(context: ContextTypes.DEFAULT_TYPE):
             squad_count   = sq_count,
             original_team = live.rtm_orig_bidder_name,
         ),
-        parse_mode=ParseMode.MARKDOWN_V2,
+        parse_mode=ParseMode.MARKDOWN,
     )
     await _finalize(context, pr, rtm_accepted=True, rtm_no_raise=True)
 
@@ -1107,7 +1141,7 @@ async def _rtm_decision_timer(context: ContextTypes.DEFAULT_TYPE):
             squad_count    = sq_count,
             rtm_team       = live.rtm_team_name,
         ),
-        parse_mode=ParseMode.MARKDOWN_V2,
+        parse_mode=ParseMode.MARKDOWN,
     )
     await _finalize(context, pr, rtm_declined=True)
 
@@ -1170,16 +1204,16 @@ async def _finalize(context: ContextTypes.DEFAULT_TYPE, pr,
         # Normal non-RTM sold
         ts = datetime.datetime.now().strftime("%H:%M:%S")
         sold_text = (
-            f"🔨 *SOLD\\!*\n"
+            f"🔨 *SOLD!*\n"
             f"{'═'*20}\n\n"
             f"🏏 *{flag(pr['nationality'])} {pr['name']}*\n"
-            f"🎯 {pr['role']} \\| {pr['nationality']}\n\n"
-            f"💰 *Final Price:* ₹{_cr(final_price)}\n"
+            f"🎯 {pr['role']} | {pr['nationality']}\n\n"
+            f"💰 *Final Price:* {fmt(final_price, aid)}\n"
             f"🏆 *Winner:* *{winner_name}*\n\n"
             f"📊 *Transaction:*\n"
-            f"• Deducted: ₹{_cr(final_price)} from {winner_name}\n"
-            f"• Remaining Purse: ₹{_cr(remaining)}\n"
-            f"• Squad: {sq_count} players\n\n"
+            f"  Deducted: {fmt(final_price, aid)} from {winner_name}\n"
+            f"  Remaining Purse: {fmt(remaining, aid)}\n"
+            f"  Squad: {sq_count} players\n\n"
             f"⏰ Sold at: {ts}"
         )
 
@@ -1187,7 +1221,7 @@ async def _finalize(context: ContextTypes.DEFAULT_TYPE, pr,
         msg = await context.bot.send_message(
             chat_id=live.chat_id,
             text=sold_text,
-            parse_mode=ParseMode.MARKDOWN_V2,
+            parse_mode=ParseMode.MARKDOWN,
             reply_markup=reauction_keyboard(),
         )
     else:
@@ -1195,7 +1229,7 @@ async def _finalize(context: ContextTypes.DEFAULT_TYPE, pr,
         msg = await context.bot.send_message(
             chat_id=live.chat_id,
             text="_Next player ↓_",
-            parse_mode=ParseMode.MARKDOWN_V2,
+            parse_mode=ParseMode.MARKDOWN,
             reply_markup=reauction_keyboard(),
         )
 
@@ -1220,7 +1254,7 @@ async def _finalize(context: ContextTypes.DEFAULT_TYPE, pr,
                     final_amount  = final_price,
                     rtm_cards_left= cards_l,
                 ),
-                parse_mode=ParseMode.MARKDOWN_V2,
+                parse_mode=ParseMode.MARKDOWN,
             )
         except Exception:
             pass
@@ -1337,15 +1371,11 @@ async def process_bid(update, context: ContextTypes.DEFAULT_TYPE,
     part = db.get_part(aid, uid) if aid else None
 
     async def err(m, md_v2: bool = False):
-        pm = ParseMode.MARKDOWN_V2 if md_v2 else None
         if update.callback_query:
-            plain = m.replace("*", "").replace("\\", "").replace("`", "")
+            plain = m.replace("*", "").replace("\\", "").replace("`", "").replace("_", "")
             await update.callback_query.answer(plain[:200], show_alert=True)
         else:
-            if pm:
-                await update.message.reply_text(m, parse_mode=pm)
-            else:
-                await update.message.reply_text(m)
+            await update.message.reply_text(m, parse_mode=ParseMode.MARKDOWN)
 
     if not part:
         await err("You are not registered in this auction.")
@@ -1430,7 +1460,7 @@ async def process_bid(update, context: ContextTypes.DEFAULT_TYPE,
         ask_msg = await context.bot.send_message(
             chat_id=live.chat_id,
             text=rtm_bid_raised_text(pr, bid_l),
-            parse_mode=ParseMode.MARKDOWN_V2,
+            parse_mode=ParseMode.MARKDOWN,
             reply_markup=InlineKeyboardMarkup([[
                 InlineKeyboardButton("✅ YES", callback_data="rtm_yes"),
                 InlineKeyboardButton("❌ NO",  callback_data="rtm_no"),
@@ -1443,9 +1473,9 @@ async def process_bid(update, context: ContextTypes.DEFAULT_TYPE,
             await update.callback_query.answer(f"Bid raised to ₹{_cr(bid_l)}Cr!")
         else:
             await update.message.reply_text(
-                f"⬆️ Bid raised to *₹{_cr(bid_l)}Cr* — "
-                f"waiting for *{live.rtm_team_name}* to decide\\!",
-                parse_mode=ParseMode.MARKDOWN_V2,
+                f"⬆️ Bid raised to *{fmt(bid_l, aid)}* — "
+                f"waiting for *{live.rtm_team_name}* to decide!",
+                parse_mode=ParseMode.MARKDOWN,
             )
         return
 
@@ -1811,7 +1841,7 @@ async def cmd_my_rtm(update: Update, context: ContextTypes.DEFAULT_TYPE):
         txt = (
             f"🎴 *No RTM Cards Remaining*\n{'─'*24}\n\n"
             f"Your assigned IPL team was: *{team}*\n"
-            f"All RTM cards have been used or none were assigned\\."
+            f"All RTM cards have been used or none were assigned."
         )
     else:
         txt = (
@@ -1819,9 +1849,9 @@ async def cmd_my_rtm(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"Cards remaining: *{cards}*\n"
             f"Assigned IPL team: *{team}*\n\n"
             f"When a *{team}* player is auctioned and the bid timer expires,\n"
-            f"you will be notified\\. Then use `/rtm` to activate your card\\!"
+            f"you will be notified. Then use /rtm to activate your card!"
         )
-    await update.message.reply_text(txt, parse_mode=ParseMode.MARKDOWN_V2)
+    await update.message.reply_text(txt, parse_mode=ParseMode.MARKDOWN)
 
 
 async def cmd_my_bid_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -3150,7 +3180,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             await query.edit_message_text(
                 rtm_accepted_text(pr, final_bid, rtm_name, rem_purse, sq_count, orig_bidder),
-                parse_mode=ParseMode.MARKDOWN_V2,
+                parse_mode=ParseMode.MARKDOWN,
             )
         except Exception:
             pass
@@ -3184,7 +3214,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             await query.edit_message_text(
                 rtm_declined_text(pr, orig_bid, orig_name, rem_purse, sq_count, rtm_name),
-                parse_mode=ParseMode.MARKDOWN_V2,
+                parse_mode=ParseMode.MARKDOWN,
             )
         except Exception:
             pass
