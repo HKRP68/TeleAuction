@@ -954,22 +954,22 @@ def reauction_confirm_keyboard() -> InlineKeyboardMarkup:
 async def bid_timer(context: ContextTypes.DEFAULT_TYPE):
     """
     Smart countdown timer:
-    • Resets to full BID_TIMER on every new bid (task is cancelled + restarted).
-    • At half-time with no new bid → sends a "hurry up" warning message.
-    • Final 3s → sends one message per second (3… 2… 1…).
+    • Cancels + restarts on every new bid (full duration reset).
+    • At half-time (BidTimer/2) remaining → sends ⏱ Xs LEFT! warning.
+    • At 3s, 2s, 1s → sends one message per second with urgency text.
     • Fires SOLD / UNSOLD on expiry.
-    Wrapped in try/except so crashes are logged and a fallback fires.
     """
     try:
-        duration     = live.auto_sell_secs or Config.BID_TIMER
-        half         = max(1, duration // 2)   # BID_TIMER / 2
-        end          = _time.time() + duration
+        duration          = live.auto_sell_secs or Config.BID_TIMER
+        half              = max(3, duration // 2)   # warning threshold
+        end               = _time.time() + duration
         live.timer_ends_at = end
 
-        half_warning_sent = False   # only send once per timer run
+        half_sent = False   # send the half-time warning only once per run
 
         while True:
             await asyncio.sleep(1)
+
             if not live.active or live.paused:
                 return
             if not live.current_player_id:
@@ -983,43 +983,42 @@ async def bid_timer(context: ContextTypes.DEFAULT_TYPE):
             if not pr:
                 return
 
-            # ── Half-time warning ─────────────────────────
-            if not half_warning_sent and remaining <= half:
-                half_warning_sent = True
-                if live.current_bid > 0:
-                    # Someone is leading — warn others to hurry
-                    await context.bot.send_message(
-                        chat_id=live.chat_id,
-                        text=(
-                            f"⚠️ *{remaining}s left!*\n"
-                            f"👑 *{live.highest_bidder_name}* is leading "
-                            f"at *{fmt(live.current_bid, live.auction_id)}*\n"
-                            f"Bid now or lose the player!"
-                        ),
-                        parse_mode=ParseMode.MARKDOWN,
-                    )
-                else:
-                    await context.bot.send_message(
-                        chat_id=live.chat_id,
-                        text=(
-                            f"⚠️ *{remaining}s left!*\n"
-                            f"No bids yet for *{pr['name']}* — "
-                            f"base price {fmt(pr['base_price'], pr['auction_id'])}"
-                        ),
-                        parse_mode=ParseMode.MARKDOWN,
-                    )
+            pname  = pr["name"]
+            bid_s  = fmt(live.current_bid, live.auction_id) if live.current_bid > 0 else fmt(pr["base_price"], pr["auction_id"])
+            leader = live.highest_bidder_name or "None"
 
-            # ── Final 3-2-1 countdown ─────────────────────
-            if 1 <= remaining <= 3:
+            # ── 3-2-1 countdown messages ──────────────────
+            if remaining <= 3:
+                urgency = {3: "Hurry! Final bids!", 2: "Last chance!", 1: "CLOSING NOW!"}
                 await context.bot.send_message(
                     chat_id=live.chat_id,
-                    text=f"🔔 *{remaining}* second{'s' if remaining > 1 else ''} left to bid!",
+                    text=(
+                        f"⏱️ *{remaining} SECOND{'S' if remaining > 1 else ''} LEFT!*\n"
+                        f"{'═'*20}\n\n"
+                        f"🏏 {pname}\n"
+                        f"💰 Current: *{bid_s}* — {leader}\n\n"
+                        f"_{urgency.get(remaining, '')}_"
+                    ),
                     parse_mode=ParseMode.MARKDOWN,
                 )
-                # Sleep exactly 1s then loop again for next count
-                continue
+                continue  # sleep 1s then next tick
 
-            # ── Regular edit every 5s ─────────────────────
+            # ── Half-time warning (sent once) ─────────────
+            if not half_sent and remaining <= half:
+                half_sent = True
+                await context.bot.send_message(
+                    chat_id=live.chat_id,
+                    text=(
+                        f"⏱️ *{remaining} SECONDS LEFT!*\n"
+                        f"{'═'*20}\n\n"
+                        f"🏏 {pname}\n"
+                        f"💰 Current: *{bid_s}* — {leader}\n\n"
+                        f"{'Raise your bid now!' if live.current_bid > 0 else 'No bids yet — open bidding!'}"
+                    ),
+                    parse_mode=ParseMode.MARKDOWN,
+                )
+
+            # ── Edit the live bid message every 5s ────────
             if remaining % 5 == 0 and live.last_bid_msg_id:
                 try:
                     await context.bot.edit_message_text(
@@ -1047,7 +1046,7 @@ async def bid_timer(context: ContextTypes.DEFAULT_TYPE):
             await _check_rtm(context, pr)
 
     except asyncio.CancelledError:
-        raise   # Normal — new bid cancelled this task
+        raise   # Normal — new bid cancelled this task, it will restart fresh
     except Exception as exc:
         logger.error(f"bid_timer CRASHED: {exc}", exc_info=True)
         try:
@@ -1100,22 +1099,25 @@ async def _check_rtm(context: ContextTypes.DEFAULT_TYPE, pr):
     db.add_to_squad(aid, winner_id, pr["player_id"])
     db.record_bid(aid, winner_id, pr["player_id"], pr["name"], sale_price, won=True)
 
-    winner_row = db.get_part(aid, winner_id)
-    remaining  = winner_row["purse"] if winner_row else 0
-    sq_count   = len(json.loads(winner_row["squad"])) if winner_row else 0
+    winner_row   = db.get_part(aid, winner_id)
+    remaining    = winner_row["purse"] if winner_row else 0
+    sq_count     = len(json.loads(winner_row["squad"])) if winner_row else 0
+    total_spent  = winner_row["total_spent"] if winner_row else 0
+    winner_uname = winner_row["username"] if winner_row else ""
+    winner_at    = f"(@{winner_uname})" if winner_uname else ""
 
     ts = ist_now()
     sold_text = (
-        f"🔨 *SOLD!*\n"
+        f"✅ *SOLD!* ✅\n"
         f"{'═'*20}\n\n"
         f"🏏 *{flag(pr['nationality'])} {pr['name']}*\n"
         f"🎯 {pr['role']} | {pr['nationality']}\n\n"
-        f"💰 *Final Price:* ₹{_cr(sale_price)}\n"
-        f"🏆 *Winner:* *{winner_name}*\n\n"
-        f"📊 *Transaction:*\n"
-        f"• Deducted: ₹{_cr(sale_price)} from {winner_name}\n"
-        f"• Remaining Purse: ₹{_cr(remaining)}\n"
-        f"• Squad: {sq_count} players\n\n"
+        f"💰 *{fmt(sale_price, aid)}*\n"
+        f"🏆 *{winner_name}* {winner_at}\n\n"
+        f"📊 Stats:\n"
+        f"• Purse Remaining: {fmt(remaining, aid)}\n"
+        f"• Players Bought: {sq_count}/25\n"
+        f"• Total Spent: {fmt(total_spent, aid)}\n\n"
         f"⏰ Sold at: {ts}"
     )
 
@@ -1331,22 +1333,25 @@ async def _finalize(context: ContextTypes.DEFAULT_TYPE, pr,
     db.add_to_squad(aid, winner_id, pr["player_id"])
     db.record_bid(aid, winner_id, pr["player_id"], pr["name"], final_price, won=True)
 
-    winner_row  = db.get_part(aid, winner_id)
-    remaining   = winner_row["purse"] if winner_row else 0
-    sq_count    = len(json.loads(winner_row["squad"])) if winner_row else 0
+    winner_row    = db.get_part(aid, winner_id)
+    remaining     = winner_row["purse"] if winner_row else 0
+    sq_count      = len(json.loads(winner_row["squad"])) if winner_row else 0
+    total_spent   = winner_row["total_spent"] if winner_row else 0
+    winner_uname  = winner_row["username"] if winner_row else ""
+    winner_at     = f"(@{winner_uname})" if winner_uname else ""
 
     ts = ist_now()
     sold_text = (
-        f"🔨 *SOLD!*\n"
+        f"✅ *SOLD!* ✅\n"
         f"{'═'*20}\n\n"
         f"🏏 *{flag(pr['nationality'])} {pr['name']}*\n"
         f"🎯 {pr['role']} | {pr['nationality']}\n\n"
-        f"💰 *Final Price:* ₹{_cr(final_price)}\n"
-        f"🏆 *Winner:* *{winner_name}*\n\n"
-        f"📊 *Transaction:*\n"
-        f"• Deducted: ₹{_cr(final_price)} from {winner_name}\n"
-        f"• Remaining Purse: ₹{_cr(remaining)}\n"
-        f"• Squad: {sq_count} players\n\n"
+        f"💰 *{fmt(final_price, aid)}*\n"
+        f"🏆 *{winner_name}* {winner_at}\n\n"
+        f"📊 Stats:\n"
+        f"• Purse Remaining: {fmt(remaining, aid)}\n"
+        f"• Players Bought: {sq_count}/25\n"
+        f"• Total Spent: {fmt(total_spent, aid)}\n\n"
         f"⏰ Sold at: {ts}"
     )
 
