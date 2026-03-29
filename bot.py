@@ -952,20 +952,75 @@ def reauction_confirm_keyboard() -> InlineKeyboardMarkup:
 # TIMER & AUCTION CORE
 # ─────────────────────────────────────────────────────────
 async def bid_timer(context: ContextTypes.DEFAULT_TYPE):
-    duration = live.auto_sell_secs or Config.BID_TIMER
-    end = _time.time() + duration
-    live.timer_ends_at = end
+    """
+    Smart countdown timer:
+    • Resets to full BID_TIMER on every new bid (task is cancelled + restarted).
+    • At half-time with no new bid → sends a "hurry up" warning message.
+    • Final 3s → sends one message per second (3… 2… 1…).
+    • Fires SOLD / UNSOLD on expiry.
+    Wrapped in try/except so crashes are logged and a fallback fires.
+    """
+    try:
+        duration     = live.auto_sell_secs or Config.BID_TIMER
+        half         = max(1, duration // 2)   # BID_TIMER / 2
+        end          = _time.time() + duration
+        live.timer_ends_at = end
 
-    while True:
-        await asyncio.sleep(5)
-        if not live.active or live.paused or not live.current_player_id:
-            return
-        remaining = max(0, int(live.timer_ends_at - _time.time()))
-        if remaining <= 0:
-            break
-        if live.last_bid_msg_id:
+        half_warning_sent = False   # only send once per timer run
+
+        while True:
+            await asyncio.sleep(1)
+            if not live.active or live.paused:
+                return
+            if not live.current_player_id:
+                return
+
+            remaining = max(0, int(live.timer_ends_at - _time.time()))
+            if remaining <= 0:
+                break
+
             pr = db.get_player(live.current_player_id)
-            if pr:
+            if not pr:
+                return
+
+            # ── Half-time warning ─────────────────────────
+            if not half_warning_sent and remaining <= half:
+                half_warning_sent = True
+                if live.current_bid > 0:
+                    # Someone is leading — warn others to hurry
+                    await context.bot.send_message(
+                        chat_id=live.chat_id,
+                        text=(
+                            f"⚠️ *{remaining}s left!*\n"
+                            f"👑 *{live.highest_bidder_name}* is leading "
+                            f"at *{fmt(live.current_bid, live.auction_id)}*\n"
+                            f"Bid now or lose the player!"
+                        ),
+                        parse_mode=ParseMode.MARKDOWN,
+                    )
+                else:
+                    await context.bot.send_message(
+                        chat_id=live.chat_id,
+                        text=(
+                            f"⚠️ *{remaining}s left!*\n"
+                            f"No bids yet for *{pr['name']}* — "
+                            f"base price {fmt(pr['base_price'], pr['auction_id'])}"
+                        ),
+                        parse_mode=ParseMode.MARKDOWN,
+                    )
+
+            # ── Final 3-2-1 countdown ─────────────────────
+            if 1 <= remaining <= 3:
+                await context.bot.send_message(
+                    chat_id=live.chat_id,
+                    text=f"🔔 *{remaining}* second{'s' if remaining > 1 else ''} left to bid!",
+                    parse_mode=ParseMode.MARKDOWN,
+                )
+                # Sleep exactly 1s then loop again for next count
+                continue
+
+            # ── Regular edit every 5s ─────────────────────
+            if remaining % 5 == 0 and live.last_bid_msg_id:
                 try:
                     await context.bot.edit_message_text(
                         chat_id=live.chat_id,
@@ -978,17 +1033,33 @@ async def bid_timer(context: ContextTypes.DEFAULT_TYPE):
                 except Exception:
                     pass
 
-    if not live.active or not live.current_player_id:
-        return
+        # ── Timer expired ──────────────────────────────────
+        if not live.active or not live.current_player_id:
+            return
 
-    pr = db.get_player(live.current_player_id)
-    if not pr:
-        return
+        pr = db.get_player(live.current_player_id)
+        if not pr:
+            return
 
-    if live.current_bid == 0:
-        await _mark_unsold(context, pr)
-    else:
-        await _check_rtm(context, pr)
+        if live.current_bid == 0:
+            await _mark_unsold(context, pr)
+        else:
+            await _check_rtm(context, pr)
+
+    except asyncio.CancelledError:
+        raise   # Normal — new bid cancelled this task
+    except Exception as exc:
+        logger.error(f"bid_timer CRASHED: {exc}", exc_info=True)
+        try:
+            if live.current_player_id and live.active:
+                pr = db.get_player(live.current_player_id)
+                if pr:
+                    if live.current_bid > 0 and live.highest_bidder_id:
+                        await _check_rtm(context, pr)
+                    else:
+                        await _mark_unsold(context, pr)
+        except Exception as e2:
+            logger.error(f"bid_timer fallback failed: {e2}", exc_info=True)
 
 
 async def _mark_unsold(context: ContextTypes.DEFAULT_TYPE, pr):
@@ -1535,12 +1606,6 @@ async def process_bid(update, context: ContextTypes.DEFAULT_TYPE,
         await err(v_err)
         return
 
-    # Anti-snipe
-    if live.timer_ends_at:
-        rem = live.timer_ends_at - _time.time()
-        if 0 < rem < Config.ANTI_SNIPE:
-            live.timer_ends_at = _time.time() + Config.ANTI_SNIPE
-
     # RTM counter scenario — original bidder raises bid → Step 3
     if live.rtm_state == RTM_ACTIVE and uid == live.rtm_orig_bidder_id:
         if live.timer_task and not live.timer_task.done():
@@ -1576,8 +1641,11 @@ async def process_bid(update, context: ContextTypes.DEFAULT_TYPE,
 
     db.record_bid(aid, uid, pr["player_id"], pr["name"], bid_l, won=False)
 
-    if live.timer_task is None or live.timer_task.done():
-        live.timer_task = asyncio.create_task(bid_timer(context))
+    # Cancel existing timer and start fresh — every bid resets to full duration
+    if live.timer_task and not live.timer_task.done():
+        live.timer_task.cancel()
+    live.timer_ends_at = None  # cleared so new bid_timer sets it fresh
+    live.timer_task = asyncio.create_task(bid_timer(context))
 
     duration = live.auto_sell_secs or Config.BID_TIMER
     outbid   = f"⬆️ Outbids: {prev_name}" if prev_name and prev_name != bid_display(part) else "🎯 Opening bid!"
@@ -1590,7 +1658,7 @@ async def process_bid(update, context: ContextTypes.DEFAULT_TYPE,
             f"Amount: *{fmt(bid_l,aid)}*\n"
             f"By: *{bid_display(part)}*\n"
             f"{outbid}\n"
-            f"⏱ Timer: {duration}s"
+            f"🔄 Timer reset: *{duration}s*"
         ),
         parse_mode=ParseMode.MARKDOWN,
         reply_markup=bid_keyboard(pr, bid_l),
