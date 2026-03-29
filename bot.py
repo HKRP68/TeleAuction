@@ -571,13 +571,33 @@ def fmt(lakhs: int, aid: Optional[int] = None) -> str:
 
 
 def parse_price(s: str) -> Optional[int]:
+    """
+    Convert bid string to Lakhs integer.
+    Rules:
+      /bid 19    → 19 crore  → 1900 L
+      /bid 0.9   → 0.9 crore → 90 L
+      /bid 19cr  → 19 crore  → 1900 L
+      /bid 50l   → 50 lakhs  → 50 L
+      /bid 150   → 150 crore → 15000 L (bare integers = crore)
+    """
     s = s.strip().lower().replace(" ", "")
     try:
-        if s.endswith("cr"): return int(float(s[:-2]) * 100)
-        if s.endswith("l"):  return int(float(s[:-1]))
-        return int(s)
+        if s.endswith("cr"):
+            return int(round(float(s[:-2]) * 100))
+        if s.endswith("l"):
+            return int(round(float(s[:-1])))
+        # Bare number — treat as crore
+        val = float(s)
+        return int(round(val * 100))
     except ValueError:
         return None
+
+
+def ist_now() -> str:
+    """Return current time in IST (UTC+5:30) as HH:MM:SS string."""
+    utc = datetime.datetime.utcnow()
+    ist = utc + datetime.timedelta(hours=5, minutes=30)
+    return ist.strftime("%I:%M:%S %p IST")
 
 
 def flag(nat: str) -> str:
@@ -784,8 +804,7 @@ def rtm_bid_raised_text(player_row, new_bid: int) -> str:
 def rtm_accepted_text(player_row, final_price: int, winner_name: str,
                       remaining_purse: int, squad_count: int,
                       original_team: str) -> str:
-    import datetime
-    ts  = datetime.datetime.now().strftime("%H:%M:%S")
+    ts  = ist_now()
     ipl = player_row["ipl_team"] or "N/A"
     return (
         f"✅ *RTM ACCEPTED \\- PLAYER SOLD\\!*\n"
@@ -807,8 +826,7 @@ def rtm_accepted_text(player_row, final_price: int, winner_name: str,
 def rtm_declined_text(player_row, original_bid: int, original_team: str,
                       remaining_purse: int, squad_count: int,
                       rtm_team: str) -> str:
-    import datetime
-    ts  = datetime.datetime.now().strftime("%H:%M:%S")
+    ts  = ist_now()
     ipl = player_row["ipl_team"] or "N/A"
     return (
         f"❌ *RTM DECLINED \\- ORIGINAL SALE\\!*\n"
@@ -986,7 +1004,7 @@ async def _mark_unsold(context: ContextTypes.DEFAULT_TYPE, pr):
         reply_markup=reauction_keyboard(),
     )
     live.reauction_msg_id = msg.message_id
-    await _try_auto_next(context)
+    asyncio.create_task(_plain_sold_cleanup(context))
 
 
 async def _check_rtm(context: ContextTypes.DEFAULT_TYPE, pr):
@@ -1015,8 +1033,7 @@ async def _check_rtm(context: ContextTypes.DEFAULT_TYPE, pr):
     remaining  = winner_row["purse"] if winner_row else 0
     sq_count   = len(json.loads(winner_row["squad"])) if winner_row else 0
 
-    import datetime
-    ts = datetime.datetime.now().strftime("%H:%M:%S")
+    ts = ist_now()
     sold_text = (
         f"🔨 *SOLD!*\n"
         f"{'═'*20}\n\n"
@@ -1061,8 +1078,8 @@ async def _check_rtm(context: ContextTypes.DEFAULT_TYPE, pr):
     live.highest_bidder_name = ""
 
     if not eligible:
-        # No RTM possible — go straight to auto-next
-        await _try_auto_next(context)
+        # No RTM possible — schedule button removal after 10s then auto-next
+        asyncio.create_task(_plain_sold_cleanup(context))
         return
 
     # ── Open 10s RTM window ───────────────────────────────
@@ -1078,11 +1095,21 @@ async def _check_rtm(context: ContextTypes.DEFAULT_TYPE, pr):
     )
 
 
+async def _plain_sold_cleanup(context: ContextTypes.DEFAULT_TYPE):
+    """
+    For normal sales with no RTM eligible teams:
+    wait 10s, remove the ReAuction button, then fire auto-next.
+    """
+    await asyncio.sleep(10)
+    await _remove_reauction_button(context)
+    await _try_auto_next(context)
+
+
 async def _rtm_window_timer(context: ContextTypes.DEFAULT_TYPE, player_id: int):
     """
     Silent 10-second window after SOLD.
     If /rtm is used → task is cancelled by _handle_rtm_use.
-    If it runs out → close window and fire auto-next.
+    If it runs out → close window, remove ReAuction button, fire auto-next.
     """
     try:
         await asyncio.sleep(Config.RTM_OFFER_TIMER)
@@ -1091,13 +1118,28 @@ async def _rtm_window_timer(context: ContextTypes.DEFAULT_TYPE, player_id: int):
 
     # Window expired with no RTM
     if live.rtm_state == RTM_OFFERED and live.rtm_window_open:
-        live.rtm_window_open  = False
-        live.rtm_state        = RTM_NONE
+        live.rtm_window_open       = False
+        live.rtm_state             = RTM_NONE
         live.rtm_window_player_id  = None
         live.rtm_window_winner_id  = None
         live.rtm_window_winner_name= ""
-        live.rtm_window_price = 0
+        live.rtm_window_price      = 0
+        # Remove the ReAuction button from the SOLD message
+        await _remove_reauction_button(context)
         await _try_auto_next(context)
+
+
+async def _remove_reauction_button(context: ContextTypes.DEFAULT_TYPE):
+    """Remove the ReAuction inline button after the 10s window expires."""
+    if live.reauction_msg_id and live.chat_id:
+        try:
+            await context.bot.edit_message_reply_markup(
+                chat_id=live.chat_id,
+                message_id=live.reauction_msg_id,
+                reply_markup=None,
+            )
+        except Exception:
+            pass  # Message too old or already edited — fine
 
 
 async def _rtm_offer_timer(context: ContextTypes.DEFAULT_TYPE):
@@ -1222,8 +1264,7 @@ async def _finalize(context: ContextTypes.DEFAULT_TYPE, pr,
     remaining   = winner_row["purse"] if winner_row else 0
     sq_count    = len(json.loads(winner_row["squad"])) if winner_row else 0
 
-    import datetime
-    ts = datetime.datetime.now().strftime("%H:%M:%S")
+    ts = ist_now()
     sold_text = (
         f"🔨 *SOLD!*\n"
         f"{'═'*20}\n\n"
@@ -1261,7 +1302,7 @@ async def _finalize(context: ContextTypes.DEFAULT_TYPE, pr,
     live.rtm_team_id         = None
     live.rtm_counter_bid     = 0
 
-    await _try_auto_next(context)
+    asyncio.create_task(_plain_sold_cleanup(context))
 
 
 async def _finalize_rtm(context: ContextTypes.DEFAULT_TYPE, pr,
@@ -1986,29 +2027,25 @@ async def cmd_auction_owners(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return
 
     def _uname(uid: int) -> str:
-        """Return @username if available, else first_name, else 'Unknown'."""
         u = db.get_user(uid)
         if not u:
-            return "Unknown"
-        if u["username"]:
-            return f"@{u['username']}"
-        return u["first_name"] or "Unknown"
+            return f"ID:{uid}"
+        return f"@{u['username']}" if u["username"] else (u["first_name"] or f"ID:{uid}")
 
-    lines = [f"👥 *Auction Owners — {live.auction_name}*\n{'─'*28}"]
+    lines = [f"👥 *Team Owners — {live.auction_name}*\n{'─'*28}"]
     for i, r in enumerate(parts, 1):
         main_uname = _uname(r["user_id"])
         co = db.get_co_owners(aid, r["user_id"])
         if co:
             co_names = [_uname(c["linked_user_id"]) for c in co]
-            co_str = "  _(+co: " + ", ".join(co_names) + ")_"
+            owners = main_uname + ", " + ", ".join(co_names)
         else:
-            co_str = ""
+            owners = main_uname
         rtm_info = (
-            f"  🎴 RTM: {r['rtm_team']} ×{r['rtm_cards']}"
-            if r["rtm_cards"] > 0 and r["rtm_team"]
-            else ""
+            f"\n   🎴 RTM: {r['rtm_team']} ×{r['rtm_cards']}"
+            if r["rtm_cards"] > 0 and r["rtm_team"] else ""
         )
-        lines.append(f"{i}. *{r['team_name']}* — {main_uname}{co_str}{rtm_info}")
+        lines.append(f"{i}. *{r['team_name']}* — {owners}{rtm_info}")
 
     await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
 
@@ -2625,14 +2662,14 @@ async def cmd_pass(update: Update, context: ContextTypes.DEFAULT_TYPE):
     db.set_player_status(pr["player_id"], "unsold")
     live.unsold_count    += 1
     _set_last_sold(pr["player_id"], pr["name"], None, "", 0)
-    live.current_player_id= None
+    live.current_player_id = None
     msg = await update.message.reply_text(
         f"⏭ *{pr['name']}* passed (UNSOLD).",
         parse_mode=ParseMode.MARKDOWN,
         reply_markup=reauction_keyboard(),
     )
     live.reauction_msg_id = msg.message_id
-    await _try_auto_next(context)
+    asyncio.create_task(_plain_sold_cleanup(context))
 
 
 async def cmd_sold(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2863,7 +2900,7 @@ async def cmd_auto_next(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Auto-next disabled.")
     else:
         try:
-            live.auto_next_secs = int(v) if v not in ("enable",) else (live.auto_next_secs or 5)
+            live.auto_next_secs = int(v) if v != "enable" else (live.auto_next_secs or 5)
             live.auto_next_on   = True
             await update.message.reply_text(f"Auto-next: *{live.auto_next_secs}s*",
                                             parse_mode=ParseMode.MARKDOWN)
@@ -2871,7 +2908,110 @@ async def cmd_auto_next(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("Invalid.")
 
 
-# ── PLAYER MANAGEMENT ────────────────────────────────────
+async def cmd_dtime(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /dtime <seconds> — Set ALL timers to the same value at once.
+    Example: /dtime 10  sets bid, RTM window, RTM counter, RTM decision all to 10s.
+    /dtime show — display current timer settings.
+    """
+    await _reg(update.effective_user)
+    if not db.is_admin(update.effective_user.id):
+        await update.message.reply_text("Admin only.")
+        return
+
+    if not context.args or context.args[0].lower() == "show":
+        bid   = live.auto_sell_secs or Config.BID_TIMER
+        rtmw  = Config.RTM_OFFER_TIMER
+        rtmc  = Config.RTM_COUNTER_TIMER
+        rtmd  = Config.RTM_DECISION_TIMER
+        await update.message.reply_text(
+            f"⏱ *Current Timer Settings*\n{'─'*24}\n"
+            f"🔨 Bid Timer: *{bid}s*\n"
+            f"🎴 RTM Window (post-sold): *{rtmw}s*\n"
+            f"⬆️ RTM Counter (raise window): *{rtmc}s*\n"
+            f"✅ RTM Decision (YES/NO): *{rtmd}s*\n\n"
+            f"Use /dtime <secs> to set all timers at once.\n"
+            f"Or set individually:\n"
+            f"  /settimer bid <secs>\n"
+            f"  /settimer rtmwindow <secs>\n"
+            f"  /settimer rtmcounter <secs>\n"
+            f"  /settimer rtmdecision <secs>",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+
+    raw = context.args[0].lower().rstrip("s")
+    try:
+        secs = int(raw)
+    except ValueError:
+        await update.message.reply_text("Usage: /dtime <seconds>  e.g. /dtime 10")
+        return
+
+    live.auto_sell_secs = secs
+    Config.BID_TIMER          = secs
+    Config.RTM_OFFER_TIMER    = secs
+    Config.RTM_COUNTER_TIMER  = secs
+    Config.RTM_DECISION_TIMER = secs
+
+    await update.message.reply_text(
+        f"✅ *All timers set to {secs}s*\n"
+        f"🔨 Bid timer: {secs}s\n"
+        f"🎴 RTM window: {secs}s\n"
+        f"⬆️ RTM counter: {secs}s\n"
+        f"✅ RTM decision: {secs}s",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+
+
+async def cmd_set_timer(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /settimer <type> <seconds> — Set a specific timer.
+    Types: bid, rtmwindow, rtmcounter, rtmdecision
+    Example: /settimer bid 30
+    """
+    await _reg(update.effective_user)
+    if not db.is_admin(update.effective_user.id):
+        await update.message.reply_text("Admin only.")
+        return
+    if len(context.args) < 2:
+        await update.message.reply_text(
+            "Usage: /settimer <type> <seconds>\n"
+            "Types: bid | rtmwindow | rtmcounter | rtmdecision\n"
+            "Example: /settimer bid 30"
+        )
+        return
+
+    timer_type = context.args[0].lower()
+    raw        = context.args[1].lower().rstrip("s")
+    try:
+        secs = int(raw)
+        if secs < 5:
+            await update.message.reply_text("Minimum timer is 5 seconds.")
+            return
+    except ValueError:
+        await update.message.reply_text("Invalid seconds value.")
+        return
+
+    label_map = {
+        "bid":         ("Bid Timer",              "BID_TIMER"),
+        "rtmwindow":   ("RTM Window (post-sold)", "RTM_OFFER_TIMER"),
+        "rtmcounter":  ("RTM Counter (raise)",    "RTM_COUNTER_TIMER"),
+        "rtmdecision": ("RTM Decision (YES/NO)",  "RTM_DECISION_TIMER"),
+    }
+    if timer_type not in label_map:
+        await update.message.reply_text(
+            "Unknown timer type. Use: bid | rtmwindow | rtmcounter | rtmdecision"
+        )
+        return
+
+    label, attr = label_map[timer_type]
+    setattr(Config, attr, secs)
+    if timer_type == "bid":
+        live.auto_sell_secs = secs
+
+    await update.message.reply_text(
+        f"✅ *{label}* set to *{secs}s*", parse_mode=ParseMode.MARKDOWN
+    )
 
 async def cmd_add_player(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _reg(update.effective_user)
@@ -3437,6 +3577,9 @@ DOT_MAP = {
     "pauseauction": cmd_pause, "resumeauction": cmd_resume,
     "endauction": cmd_end_auction, "endsauction": cmd_end_auction,
     "autosell": cmd_auto_sell, "autonext": cmd_auto_next,
+    "dtime": cmd_dtime, "defaulttimer": cmd_dtime,
+    "settimer": cmd_set_timer, "timer": cmd_set_timer,
+    "teamowners": cmd_auction_owners,
     "leaderboard": cmd_leaderboard, "help": cmd_help,
     "mute": cmd_mute, "unmute": cmd_unmute,
     "setrtm": cmd_set_rtm,
@@ -3534,6 +3677,9 @@ def build_app() -> Application:
     app.add_handler(CommandHandler(["endauction","endsauction"], cmd_end_auction))
     app.add_handler(CommandHandler("autosell", cmd_auto_sell))
     app.add_handler(CommandHandler("autonext", cmd_auto_next))
+    app.add_handler(CommandHandler(["dtime","defaulttimer"], cmd_dtime))
+    app.add_handler(CommandHandler(["settimer","timer"], cmd_set_timer))
+    app.add_handler(CommandHandler(["teamowners","auctionowners","auction_owners"], cmd_auction_owners))
 
     # Admin: queue
     app.add_handler(CommandHandler(["addtoqueue","atq"], cmd_add_to_queue))
