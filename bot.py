@@ -84,6 +84,10 @@ class LiveState:
     auto_next_secs: Optional[int]     = None
     auto_next_on: bool         = False
 
+    # Dynamic timer reduction tracking
+    current_timer_duration: int = 0  # Current timer duration in seconds (reduces with each bid)
+    original_bid_timer: int     = 0  # Original bid timer value
+
     # Queue
     player_queue: list         = field(default_factory=list)
     set_number: int            = 1
@@ -764,19 +768,24 @@ def rtm_check_text(player_row, eligible: list) -> str:
 def rtm_activated_text(player_row) -> str:
     ipl = player_row["ipl_team"] or "N/A"
     return (
-        f"🎴 *RTM CARD ACTIVATED\\!*\n"
-        f"{'═'*20}\n\n"
-        f"🏏 *{player_row['name']}*\n"
-        f"💰 Original Bid: *₹{_cr(live.rtm_orig_bid)}*\n"
-        f"👤 Original Winner: *{live.rtm_orig_bidder_name}*\n\n"
-        f"🎯 *{live.rtm_team_name}* has used RTM Card for *{ipl}*\\!\n\n"
-        f"📋 *WHAT HAPPENS NOW?*\n"
-        f"1️⃣ {live.rtm_orig_bidder_name} can raise the bid "
-        f"\\(use `/bid {player_row['name']} <amount>`\\)\n"
-        f"2️⃣ If raised, {live.rtm_team_name} must Accept or Reject the new amount\n"
-        f"3️⃣ If no raise in {Config.RTM_COUNTER_TIMER}s, "
-        f"{live.rtm_team_name} gets player for ₹{_cr(live.rtm_orig_bid)}\n\n"
-        f"⏱️ *{Config.RTM_COUNTER_TIMER} seconds* for {live.rtm_orig_bidder_name} to raise\\.\\.\\."
+        f"🎴 *RTM CARD ACTIVATED!*
+"
+        f"════════════════════
+
+"
+        f"🏏 *{player_row['name']}*
+"
+        f"💰 Original Bid: *₹{_cr(live.rtm_orig_bid)}Cr*
+"
+        f"👤 Original Winner: *{live.rtm_orig_bidder_name}*
+
+"
+        f"🎯 *{live.rtm_team_name}* has used RTM Card for *{ipl}*!
+
+"
+        f"📋 *WHAT HAPPENS NOW?*
+"
+        f"1️⃣ {live.rtm_orig_bidder_name} can raise the bid (use `/bid {player_row['name']} <amount>` or /bid amount )"
     )
 
 
@@ -784,19 +793,34 @@ def rtm_activated_text(player_row) -> str:
 def rtm_bid_raised_text(player_row, new_bid: int) -> str:
     diff = new_bid - live.rtm_orig_bid
     return (
-        f"⬆️ *BID RAISED\\!*\n"
-        f"{'═'*20}\n\n"
-        f"🏏 *{player_row['name']}*\n\n"
-        f"💵 New Bid: *₹{_cr(new_bid)}* ⬆️\n"
-        f"👤 Raised By: *{live.rtm_orig_bidder_name}*\n"
-        f"📈 Increase: \\+₹{_cr(diff)}\n\n"
-        f"🎴 *RTM DECISION REQUIRED*\n"
-        f"{live.rtm_team_name}, do you match this new bid?\n\n"
-        f"💭 *Your Options:*\n"
-        f"✅ *YES* → Buy player for ₹{_cr(new_bid)} \\(Deducted from purse\\)\n"
-        f"❌ *NO* → Lose player to {live.rtm_orig_bidder_name} for ₹{_cr(live.rtm_orig_bid)}\n\n"
-        f"⏱️ *{Config.RTM_DECISION_TIMER} seconds* to decide\\!\n\n"
-        f"_Only {live.rtm_team_name} or Admin can click_"
+        f"⬆️ *BID RAISED!*
+"
+        f"════════════════════
+
+"
+        f"🏏 *{player_row['name']}*
+
+"
+        f"💵 New Bid: *₹{_cr(new_bid)}Cr* ⬆️
+"
+        f"👤 Raised By: *{live.rtm_orig_bidder_name}*
+"
+        f"📈 Increase: +₹{_cr(diff)}Cr
+
+"
+        f"💭 *Your Options:* ( Buttons )
+"
+        f"✅ *YES* → Buy player for ₹{_cr(new_bid)}Cr (Deducted from purse)
+"
+        f"❌ *NO* → Lose player to {live.rtm_orig_bidder_name} for ₹{_cr(live.rtm_orig_bid)}Cr
+
+"
+        f"⏱️ *{Config.RTM_DECISION_TIMER} seconds* to decide!
+
+"
+        f"[✅ YES] [❌ NO]
+"
+        f"*Only {live.rtm_team_name} or Admin can click*"
     )
 
 
@@ -807,17 +831,33 @@ def rtm_accepted_text(player_row, final_price: int, winner_name: str,
     ts  = ist_now()
     ipl = player_row["ipl_team"] or "N/A"
     return (
-        f"✅ *RTM ACCEPTED \\- PLAYER SOLD\\!*\n"
-        f"{'═'*20}\n\n"
-        f"🏏 *{flag(player_row['nationality'])} {player_row['name']}* \\({ipl}\\)\n"
-        f"🎯 {player_row['role']} \\| {player_row['nationality']}\n\n"
-        f"💰 *Final Price:* ₹{_cr(final_price)}\n"
-        f"🏆 *Winner:* *{winner_name}* 🎴 \\(via RTM\\)\n\n"
-        f"📊 *Transaction:*\n"
-        f"• Deducted: ₹{_cr(final_price)} from {winner_name}\n"
-        f"• Remaining Purse: ₹{_cr(remaining_purse)}\n"
-        f"• Squad: {squad_count} players\n\n"
-        f"❌ {original_team} loses the bid\n\n"
+        f"✅ *RTM ACCEPTED - PLAYER SOLD!*
+"
+        f"════════════════════
+
+"
+        f"🏏 *{flag(player_row['nationality'])} {player_row['name']}* ({ipl})
+"
+        f"🎯 {player_row['role']} | {player_row['nationality']}
+
+"
+        f"💰 *Final Price:* ₹{_cr(final_price)}Cr
+"
+        f"🏆 *Winner:* *{winner_name}* 🎴 (via RTM)
+
+"
+        f"📊 *Transaction:*
+"
+        f"• Deducted: ₹{_cr(final_price)}Cr from {winner_name}
+"
+        f"• Remaining Purse: ₹{_cr(remaining_purse)}Cr
+"
+        f"• Squad: {squad_count}/25 players
+
+"
+        f"❌ {original_team} loses the bid
+
+"
         f"⏰ Sold at: {ts}"
     )
 
@@ -829,18 +869,36 @@ def rtm_declined_text(player_row, original_bid: int, original_team: str,
     ts  = ist_now()
     ipl = player_row["ipl_team"] or "N/A"
     return (
-        f"❌ *RTM DECLINED \\- ORIGINAL SALE\\!*\n"
-        f"{'═'*20}\n\n"
-        f"🏏 *{flag(player_row['nationality'])} {player_row['name']}* \\({ipl}\\)\n"
-        f"🎯 {player_row['role']} \\| {player_row['nationality']}\n\n"
-        f"💰 *Final Price:* ₹{_cr(original_bid)} \\(Original bid\\)\n"
-        f"🏆 *Winner:* *{original_team}*\n\n"
-        f"🎴 {rtm_team} declined to match the raised bid\n\n"
-        f"📊 *Transaction:*\n"
-        f"• Deducted: ₹{_cr(original_bid)} from {original_team}\n"
-        f"• Remaining Purse: ₹{_cr(remaining_purse)}\n"
-        f"• Squad: {squad_count} players\n\n"
-        f"✅ {original_team} wins the player\\!\n\n"
+        f"❌ *RTM DECLINED - ORIGINAL SALE!*
+"
+        f"════════════════════
+
+"
+        f"🏏 *{flag(player_row['nationality'])} {player_row['name']}* ({ipl})
+"
+        f"🎯 {player_row['role']} | {player_row['nationality']}
+
+"
+        f"💰 *Final Price:* ₹{_cr(original_bid)}Cr (Original bid)
+"
+        f"🏆 *Winner:* *{original_team}*
+
+"
+        f"🎴 {rtm_team} declined to match the raised bid
+
+"
+        f"📊 *Transaction:*
+"
+        f"• Deducted: ₹{_cr(original_bid)}Cr from {original_team}
+"
+        f"• Remaining Purse: ₹{_cr(remaining_purse)}Cr
+"
+        f"• Squad: {squad_count}/25 players
+
+"
+        f"✅ {original_team} wins the player!
+
+"
         f"⏰ Sold at: {ts}"
     )
 
@@ -952,18 +1010,48 @@ def reauction_confirm_keyboard() -> InlineKeyboardMarkup:
 # TIMER & AUCTION CORE
 # ─────────────────────────────────────────────────────────
 async def bid_timer(context: ContextTypes.DEFAULT_TYPE):
-    duration = live.auto_sell_secs or Config.BID_TIMER
+    """
+    Dynamic bid timer with countdown messages.
+    - Timer reduces by BidTime/2 (10 seconds) on each new bid
+    - Sends countdown messages at 3, 2, 1 seconds
+    """
+    # Use the tracked current timer duration, or initialize it
+    if live.current_timer_duration <= 0:
+        live.current_timer_duration = live.auto_sell_secs or Config.BID_TIMER
+        live.original_bid_timer = live.current_timer_duration
+
+    duration = live.current_timer_duration
     end = _time.time() + duration
     live.timer_ends_at = end
 
+    # Track if we've sent countdown messages
+    countdown_sent = {3: False, 2: False, 1: False}
+
     while True:
-        await asyncio.sleep(5)
+        await asyncio.sleep(0.5)  # Check more frequently for accurate countdown
         if not live.active or live.paused or not live.current_player_id:
             return
         remaining = max(0, int(live.timer_ends_at - _time.time()))
+
+        # Send countdown messages at 3, 2, 1 seconds
+        if remaining in countdown_sent and not countdown_sent[remaining]:
+            countdown_sent[remaining] = True
+            pr = db.get_player(live.current_player_id)
+            if pr and live.chat_id:
+                try:
+                    await context.bot.send_message(
+                        chat_id=live.chat_id,
+                        text=f"⏱️ *{remaining} Second{'s' if remaining > 1 else ''} Left* to bid!",
+                        parse_mode=ParseMode.MARKDOWN,
+                    )
+                except Exception:
+                    pass
+
         if remaining <= 0:
             break
-        if live.last_bid_msg_id:
+
+        # Update bid status message every 5 seconds (not on countdown seconds)
+        if remaining > 3 and remaining % 5 == 0 and live.last_bid_msg_id:
             pr = db.get_player(live.current_player_id)
             if pr:
                 try:
@@ -984,6 +1072,21 @@ async def bid_timer(context: ContextTypes.DEFAULT_TYPE):
     pr = db.get_player(live.current_player_id)
     if not pr:
         return
+
+    # Send "Sold" or "Time Expired" message
+    if live.chat_id:
+        if live.current_bid > 0:
+            await context.bot.send_message(
+                chat_id=live.chat_id,
+                text="🔨 *SOLD!*",
+                parse_mode=ParseMode.MARKDOWN,
+            )
+        else:
+            await context.bot.send_message(
+                chat_id=live.chat_id,
+                text="⏰ *Time Expired!* (No bids received)",
+                parse_mode=ParseMode.MARKDOWN,
+            )
 
     if live.current_bid == 0:
         await _mark_unsold(context, pr)
@@ -1446,6 +1549,10 @@ async def _do_next(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
     live.rtm_state           = RTM_NONE
     live.rtm_team_id         = None
 
+    # Reset timer duration for new player
+    live.current_timer_duration = live.auto_sell_secs or Config.BID_TIMER
+    live.original_bid_timer = live.current_timer_duration
+
     queued = len(live.player_queue)
     msg = await context.bot.send_message(
         chat_id=chat_id,
@@ -1576,8 +1683,28 @@ async def process_bid(update, context: ContextTypes.DEFAULT_TYPE,
 
     db.record_bid(aid, uid, pr["player_id"], pr["name"], bid_l, won=False)
 
-    if live.timer_task is None or live.timer_task.done():
-        live.timer_task = asyncio.create_task(bid_timer(context))
+    # Calculate timer reduction: BidTime/2 = 10 seconds (default)
+    timer_reduction = (live.original_bid_timer or Config.BID_TIMER) // 2
+    if timer_reduction < 5:
+        timer_reduction = 5  # Minimum reduction of 5 seconds
+
+    # Reduce timer duration for next bid
+    if live.current_timer_duration <= 0:
+        live.current_timer_duration = live.auto_sell_secs or Config.BID_TIMER
+        live.original_bid_timer = live.current_timer_duration
+
+    new_duration = max(10, live.current_timer_duration - timer_reduction)  # Minimum 10 seconds
+    live.current_timer_duration = new_duration
+
+    # Cancel existing timer and restart with reduced time
+    if live.timer_task and not live.timer_task.done():
+        live.timer_task.cancel()
+        try:
+            await live.timer_task
+        except asyncio.CancelledError:
+            pass
+
+    live.timer_task = asyncio.create_task(bid_timer(context))
 
     duration = live.auto_sell_secs or Config.BID_TIMER
     outbid   = f"⬆️ Outbids: {prev_name}" if prev_name and prev_name != bid_display(part) else "🎯 Opening bid!"
@@ -2192,6 +2319,10 @@ async def cmd_force_auction(update: Update, context: ContextTypes.DEFAULT_TYPE):
     live.timer_task          = None
     live.timer_ends_at       = None
     live.rtm_state           = RTM_NONE
+
+    # Reset timer duration for forced auction
+    live.current_timer_duration = live.auto_sell_secs or Config.BID_TIMER
+    live.original_bid_timer = live.current_timer_duration
 
     chat_id = update.effective_chat.id
     msg = await context.bot.send_message(
