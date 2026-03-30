@@ -545,6 +545,85 @@ db = DB()
 
 
 # ─────────────────────────────────────────────────────────
+# STATE PERSISTENCE — survives restarts up to 5 days
+# ─────────────────────────────────────────────────────────
+def save_live_state():
+    """Persist critical live state to DB so restarts don't lose the auction."""
+    import json as _json
+    state = {
+        "auction_id":       live.auction_id,
+        "auction_name":     live.auction_name,
+        "chat_id":          live.chat_id,
+        "active":           live.active,
+        "paused":           live.paused,
+        "sold_count":       live.sold_count,
+        "unsold_count":     live.unsold_count,
+        "set_number":       live.set_number,
+        "auto_sell_secs":   live.auto_sell_secs,
+        "auto_next_secs":   live.auto_next_secs,
+        "auto_next_on":     live.auto_next_on,
+        # Queue: store player_ids only
+        "player_queue": [
+            (r["player_id"] if hasattr(r, "keys") else r)
+            for r in live.player_queue
+        ],
+    }
+    db.set_setting("live_state", _json.dumps(state))
+
+
+def restore_live_state():
+    """Restore live state from DB after restart. Call once at startup."""
+    import json as _json
+    raw = db.get_setting("live_state")
+    if not raw:
+        return False
+    try:
+        state = _json.loads(raw)
+        aid = state.get("auction_id")
+        if not aid:
+            return False
+        # Verify auction still exists and is active in DB
+        ar = db.get_auction(aid)
+        if not ar or ar["status"] not in ("active", "registration"):
+            return False
+
+        live.auction_id   = aid
+        live.auction_name = state.get("auction_name", ar["name"])
+        live.chat_id      = state.get("chat_id")
+        live.active       = state.get("active", False)
+        live.paused       = state.get("paused", False)
+        live.sold_count   = state.get("sold_count", 0)
+        live.unsold_count = state.get("unsold_count", 0)
+        live.set_number   = state.get("set_number", 1)
+        live.auto_sell_secs  = state.get("auto_sell_secs")
+        live.auto_next_secs  = state.get("auto_next_secs")
+        live.auto_next_on    = state.get("auto_next_on", False)
+
+        # Restore player queue from stored player_ids
+        pids = state.get("player_queue", [])
+        live.player_queue = []
+        for pid in pids:
+            row = db.get_player(int(pid))
+            if row and row["status"] == "available":
+                live.player_queue.append(row)
+
+        # If queue is empty, rebuild from available players
+        if not live.player_queue and live.active:
+            available = db.get_available(aid)
+            live.player_queue = list(available)
+
+        logger.info(
+            f"State restored: auction={live.auction_name}, "
+            f"active={live.active}, queue={len(live.player_queue)}, "
+            f"sold={live.sold_count}"
+        )
+        return True
+    except Exception as e:
+        logger.error(f"restore_live_state failed: {e}", exc_info=True)
+        return False
+
+
+# ─────────────────────────────────────────────────────────
 # HELPERS
 # ─────────────────────────────────────────────────────────
 def cur(aid: Optional[int] = None) -> str:
@@ -1078,6 +1157,7 @@ async def _mark_unsold(context: ContextTypes.DEFAULT_TYPE, pr):
     live.unsold_count += 1
     _set_last_sold(pr["player_id"], pr["name"], None, "", 0)
     live.current_player_id = None
+    save_live_state()
 
     msg = await context.bot.send_message(
         chat_id=live.chat_id,
@@ -1266,6 +1346,8 @@ async def _finalize(context: ContextTypes.DEFAULT_TYPE, pr,
     sq_count     = len(json.loads(winner_row["squad"])) if winner_row else 0
     total_spent  = winner_row["total_spent"] if winner_row else 0
     ts           = ist_now()
+    ar           = db.get_auction(aid)
+    max_sq       = ar["max_players"] if ar else 25
 
     if rtm_accepted:
         sold_text = rtm_accepted_text(
@@ -1288,7 +1370,7 @@ async def _finalize(context: ContextTypes.DEFAULT_TYPE, pr,
             f"🏆 *{md_safe(winner_name)}* {md_safe(winner_at)}\n\n"
             f"📊 Stats:\n"
             f"• Purse Remaining: {md_safe(fmt(remaining, aid))}\n"
-            f"• Players Bought: {sq_count}/25\n"
+            f"• Players Bought: {sq_count}/{max_sq}\n"
             f"• Total Spent: {md_safe(fmt(total_spent, aid))}\n\n"
             f"⏰ Sold at: {ts}"
         )
@@ -1362,7 +1444,7 @@ async def _finalize(context: ContextTypes.DEFAULT_TYPE, pr,
     live.rtm_state           = RTM_NONE
     live.rtm_team_id         = None
     live.rtm_counter_bid     = 0
-
+    save_live_state()
     await _try_auto_next(context)
 
 
@@ -1430,6 +1512,7 @@ async def _do_next(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
     live.timer_ends_at       = None
     live.rtm_state           = RTM_NONE
     live.rtm_team_id         = None
+    save_live_state()  # queue shrunk by 1 — persist immediately
 
     queued = len(live.player_queue)
     msg = await context.bot.send_message(
@@ -1871,16 +1954,54 @@ async def cmd_squad(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _reg(update.effective_user)
-    if not live.active:
-        await update.message.reply_text("No auction running right now.")
+
+    if not live.auction_id:
+        await update.message.reply_text("No auction session. Use /create\\_auction to start.",
+                                        parse_mode=ParseMode.MARKDOWN)
         return
 
     aid = live.auction_id
+    ar  = db.get_auction(aid)
+
+    # Auction exists but bot may have restarted — show state + guidance
+    if not live.active:
+        ar_status = ar["status"] if ar else "unknown"
+        if ar_status == "active":
+            # Was active when bot restarted — guide admin to resume
+            await update.message.reply_text(
+                f"⏸ *{md_safe(live.auction_name)}* — PAUSED / BOT RESTARTED\n{'─'*28}\n\n"
+                f"The auction was active but the bot restarted.\n\n"
+                f"✅ State has been restored:\n"
+                f"  Sold: {live.sold_count} | Unsold: {live.unsold_count}\n"
+                f"  Queue: {len(live.player_queue)} players remaining\n\n"
+                f"👉 Use /resumeauction to continue.\n"
+                f"   Then /next for the next player.",
+                parse_mode=ParseMode.MARKDOWN,
+            )
+        else:
+            await update.message.reply_text(
+                f"No active auction.\n"
+                f"Auction *{md_safe(live.auction_name)}* — status: {ar_status}\n"
+                f"Use /startauction to begin.",
+                parse_mode=ParseMode.MARKDOWN,
+            )
+        return
+
+    if live.paused:
+        await update.message.reply_text(
+            f"⏸ *{md_safe(live.auction_name)}* — PAUSED\n{'─'*28}\n"
+            f"Sold: {live.sold_count} | Unsold: {live.unsold_count} | Queue: {len(live.player_queue)}\n\n"
+            f"Use /resumeauction to continue.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+
     if not live.current_player_id:
         await update.message.reply_text(
-            f"*{live.auction_name}*\nWaiting for next player.\n"
-            f"Sold: {live.sold_count} | Unsold: {live.unsold_count} "
-            f"| Queue: {len(live.player_queue)}",
+            f"🏏 *{md_safe(live.auction_name)}* — RUNNING\n{'─'*28}\n"
+            f"Waiting for next player.\n"
+            f"Sold: {live.sold_count} | Unsold: {live.unsold_count} | Queue: {len(live.player_queue)}\n\n"
+            f"Use /next to continue.",
             parse_mode=ParseMode.MARKDOWN,
         )
         return
@@ -1889,9 +2010,9 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     rem = max(0, int(live.timer_ends_at - _time.time())) if live.timer_ends_at else None
 
     rtm_note = {
-        RTM_OFFERED: f"\n🎴 RTM window open — teams with cards can use RTM",
-        RTM_ACTIVE:  f"\n🎴 RTM active — waiting for {live.rtm_orig_bidder_name} to counter",
-        RTM_COUNTER: f"\n🎴 Counter bid — waiting for {live.rtm_team_name} to accept/decline",
+        RTM_OFFERED: f"\n🎴 RTM window open — teams with cards can use /rtm",
+        RTM_ACTIVE:  f"\n🎴 RTM active — waiting for {md_safe(live.rtm_orig_bidder_name)} to counter",
+        RTM_COUNTER: f"\n🎴 Counter bid — waiting for {md_safe(live.rtm_team_name)} to accept/decline",
     }.get(live.rtm_state, "")
 
     await update.message.reply_text(
@@ -2034,31 +2155,38 @@ async def cmd_auction_owners(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return
 
     def _uname(uid: int) -> str:
-        """Return @username if available, else first_name, else 'Unknown'."""
         u = db.get_user(uid)
         if not u:
-            return "Unknown"
+            return f"ID:{uid}"
         if u["username"]:
-            return f"@{u['username']}"
-        return u["first_name"] or "Unknown"
+            return md_safe(f"@{u['username']}")
+        return md_safe(u["first_name"] or f"ID:{uid}")
 
-    lines = [f"👥 *Auction Owners — {live.auction_name}*\n{'─'*28}"]
+    lines = [f"👥 *Auction Owners — {md_safe(live.auction_name)}*\n{'─'*28}"]
     for i, r in enumerate(parts, 1):
         main_uname = _uname(r["user_id"])
         co = db.get_co_owners(aid, r["user_id"])
         if co:
             co_names = [_uname(c["linked_user_id"]) for c in co]
-            co_str = "  _(+co: " + ", ".join(co_names) + ")_"
+            co_str   = ", " + ", ".join(co_names)
         else:
             co_str = ""
         rtm_info = (
-            f"  🎴 RTM: {r['rtm_team']} ×{r['rtm_cards']}"
+            f"  🎴 RTM: {md_safe(r['rtm_team'])} ×{r['rtm_cards']}"
             if r["rtm_cards"] > 0 and r["rtm_team"]
             else ""
         )
-        lines.append(f"{i}. *{r['team_name']}* — {main_uname}{co_str}{rtm_info}")
+        lines.append(
+            f"{i}. *{md_safe(r['team_name'])}* — {main_uname}{co_str}{rtm_info}"
+        )
 
-    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
+    text = "\n".join(lines)
+    try:
+        await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
+    except Exception:
+        # Fallback: strip all markdown if still fails
+        plain = text.replace("*", "").replace("_", "").replace("\\", "")
+        await update.message.reply_text(plain)
 
 
 async def cmd_unsold_players(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2636,6 +2764,7 @@ async def cmd_start_auction(update: Update, context: ContextTypes.DEFAULT_TYPE):
     live.set_number   = 1
     live.chat_id      = update.effective_chat.id
     db.set_auction_status(live.auction_id, "active")
+    save_live_state()
 
     ar = db.get_auction(live.auction_id)
     await update.message.reply_text(
@@ -2674,6 +2803,7 @@ async def cmd_pass(update: Update, context: ContextTypes.DEFAULT_TYPE):
     live.unsold_count    += 1
     _set_last_sold(pr["player_id"], pr["name"], None, "", 0)
     live.current_player_id= None
+    save_live_state()
     msg = await update.message.reply_text(
         f"⏭ *{pr['name']}* passed (UNSOLD).",
         parse_mode=ParseMode.MARKDOWN,
@@ -2718,15 +2848,31 @@ async def cmd_force_sold(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_pause(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _reg(update.effective_user)
     if not db.is_admin(update.effective_user.id): return
+    if live.timer_task and not live.timer_task.done():
+        live.timer_task.cancel()
     live.paused = True
-    await update.message.reply_text("⏸ Auction PAUSED.")
+    save_live_state()
+    await update.message.reply_text("⏸ *Auction PAUSED.* Use /resumeauction to continue.",
+                                    parse_mode=ParseMode.MARKDOWN)
 
 
 async def cmd_resume(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _reg(update.effective_user)
     if not db.is_admin(update.effective_user.id): return
+    if not live.auction_id:
+        await update.message.reply_text("No active auction to resume.")
+        return
     live.paused = False
-    await update.message.reply_text("▶️ Auction RESUMED!")
+    live.active = True
+    live.chat_id = update.effective_chat.id
+    save_live_state()
+    queued = len(live.player_queue)
+    await update.message.reply_text(
+        f"▶️ *Auction RESUMED!*\n"
+        f"Sold: {live.sold_count} | Unsold: {live.unsold_count} | Queue: {queued}\n"
+        f"Use /next to continue.",
+        parse_mode=ParseMode.MARKDOWN,
+    )
 
 
 async def cmd_auction_summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -3328,6 +3474,8 @@ async def _handle_callback_inner(update, context, query, data, uid):
             rem     = rtm_row["purse"] if rtm_row else 0
             sq      = len(json.loads(rtm_row["squad"])) if rtm_row else 0
             ts      = ist_now()
+            _ar     = db.get_auction(aid)
+            max_sq  = _ar["max_players"] if _ar else 25
 
             p_name   = md_safe(pr['name'])
             s_ipl    = md_safe(ipl)
@@ -3348,7 +3496,7 @@ async def _handle_callback_inner(update, context, query, data, uid):
                 f"📊 *Transaction:*\n"
                 f"• Deducted: {s_price} from {s_rtm}\n"
                 f"• Remaining Purse: {s_rem}\n"
-                f"• Squad: {sq}/25 players\n\n"
+                f"• Squad: {sq}/{max_sq} players\n\n"
                 f"❌ {s_orig} loses the bid\n\n"
                 f"⏰ Sold at: {ts}"
             )
@@ -3375,6 +3523,7 @@ async def _handle_callback_inner(update, context, query, data, uid):
             live.highest_bidder_name = ""
             live.rtm_team_id         = None
             live.rtm_counter_bid     = 0
+            save_live_state()
             await _try_auto_next(context)
 
         except Exception as e:
@@ -3441,6 +3590,8 @@ async def _handle_callback_inner(update, context, query, data, uid):
             rem      = orig_row["purse"] if orig_row else 0
             sq       = len(json.loads(orig_row["squad"])) if orig_row else 0
             ts       = ist_now()
+            _ar2     = db.get_auction(aid)
+            max_sq   = _ar2["max_players"] if _ar2 else 25
 
             p_name  = md_safe(pr['name'])
             s_ipl   = md_safe(ipl)
@@ -3462,7 +3613,7 @@ async def _handle_callback_inner(update, context, query, data, uid):
                 f"📊 *Transaction:*\n"
                 f"• Deducted: {s_price} from {s_orig}\n"
                 f"• Remaining Purse: {s_rem}\n"
-                f"• Squad: {sq}/25 players\n\n"
+                f"• Squad: {sq}/{max_sq} players\n\n"
                 f"✅ {s_orig} wins the player!\n\n"
                 f"⏰ Sold at: {ts}"
             )
@@ -3489,6 +3640,7 @@ async def _handle_callback_inner(update, context, query, data, uid):
             live.highest_bidder_name = ""
             live.rtm_team_id         = None
             live.rtm_counter_bid     = 0
+            save_live_state()
             await _try_auto_next(context)
 
         except Exception as e:
@@ -3793,6 +3945,18 @@ def main():
         raise ValueError("SUPER_ADMIN_ID not set!")
 
     logger.info("Starting IPL Auction Bot v4.0...")
+
+    # Restore auction state from last run (survives restarts up to 5 days)
+    restored = restore_live_state()
+    if restored:
+        logger.info(
+            f"✅ Auction state restored: '{live.auction_name}' "
+            f"active={live.active} paused={live.paused} "
+            f"sold={live.sold_count} queue={len(live.player_queue)}"
+        )
+    else:
+        logger.info("No prior state to restore — starting fresh.")
+
     ptb = build_app()
 
     if Config.WEBHOOK_URL:
