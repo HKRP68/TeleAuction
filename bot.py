@@ -726,16 +726,16 @@ def rtm_check_text(player_row, eligible: list) -> str:
     ipl   = player_row["ipl_team"] or "N/A"
     names = "\n".join(f"  • *{team_display(r)}*" for r in eligible)
     return (
-        f"⏰ *AUCTION PAUSED \\- RTM CHECK*\n"
+        f"⏰ *AUCTION PAUSED - RTM CHECK*\n"
         f"{'═'*20}\n\n"
-        f"🏏 *{flag(player_row['nationality'])} {player_row['name']}* \\({ipl}\\)\n"
-        f"🎯 {player_row['role']} \\| {player_row['nationality']}\n\n"
+        f"🏏 *{flag(player_row['nationality'])} {player_row['name']}* ({ipl})\n"
+        f"🎯 {player_row['role']} | {player_row['nationality']}\n\n"
         f"💵 *Final Bid:* ₹{_cr(live.current_bid)}\n"
         f"👤 *Leading Team:* {live.highest_bidder_name}\n\n"
         f"🎴 *RTM ALERT*\n"
-        f"Team\\(s\\) with *{ipl}* RTM card:\n"
+        f"Team(s) with *{ipl}* RTM card:\n"
         f"{names}\n\n"
-        f"⏱️ *{Config.RTM_OFFER_TIMER} seconds* to use RTM\\!\n"
+        f"⏱️ *{Config.RTM_OFFER_TIMER} seconds* to use RTM!\n"
         f"Use: `/rtm {player_row['name']}` or `/right_to_match {player_row['name']}`"
     )
 
@@ -744,19 +744,19 @@ def rtm_check_text(player_row, eligible: list) -> str:
 def rtm_activated_text(player_row) -> str:
     ipl = player_row["ipl_team"] or "N/A"
     return (
-        f"🎴 *RTM CARD ACTIVATED\\!*\n"
+        f"🎴 *RTM CARD ACTIVATED!*\n"
         f"{'═'*20}\n\n"
         f"🏏 *{player_row['name']}*\n"
         f"💰 Original Bid: *₹{_cr(live.rtm_orig_bid)}*\n"
         f"👤 Original Winner: *{live.rtm_orig_bidder_name}*\n\n"
-        f"🎯 *{live.rtm_team_name}* has used RTM Card for *{ipl}*\\!\n\n"
+        f"🎯 *{live.rtm_team_name}* has used RTM Card for *{ipl}*!\n\n"
         f"📋 *WHAT HAPPENS NOW?*\n"
         f"1️⃣ {live.rtm_orig_bidder_name} can raise the bid "
-        f"\\(use `/bid {player_row['name']} <amount>`\\)\n"
+        f"(use `/bid {player_row['name']} <amount>`)\n"
         f"2️⃣ If raised, {live.rtm_team_name} must Accept or Reject the new amount\n"
         f"3️⃣ If no raise in {Config.RTM_COUNTER_TIMER}s, "
         f"{live.rtm_team_name} gets player for ₹{_cr(live.rtm_orig_bid)}\n\n"
-        f"⏱️ *{Config.RTM_COUNTER_TIMER} seconds* for {live.rtm_orig_bidder_name} to raise\\.\\.\\."
+        f"⏱️ *{Config.RTM_COUNTER_TIMER} seconds* for {live.rtm_orig_bidder_name} to raise..."
     )
 
 
@@ -764,18 +764,18 @@ def rtm_activated_text(player_row) -> str:
 def rtm_bid_raised_text(player_row, new_bid: int) -> str:
     diff = new_bid - live.rtm_orig_bid
     return (
-        f"⬆️ *BID RAISED\\!*\n"
+        f"⬆️ *BID RAISED!*\n"
         f"{'═'*20}\n\n"
         f"🏏 *{player_row['name']}*\n\n"
         f"💵 New Bid: *₹{_cr(new_bid)}* ⬆️\n"
         f"👤 Raised By: *{live.rtm_orig_bidder_name}*\n"
-        f"📈 Increase: \\+₹{_cr(diff)}\n\n"
+        f"📈 Increase: +₹{_cr(diff)}\n\n"
         f"🎴 *RTM DECISION REQUIRED*\n"
         f"{live.rtm_team_name}, do you match this new bid?\n\n"
         f"💭 *Your Options:*\n"
-        f"✅ *YES* → Buy player for ₹{_cr(new_bid)} \\(Deducted from purse\\)\n"
+        f"✅ *YES* → Buy player for ₹{_cr(new_bid)} (Deducted from purse)\n"
         f"❌ *NO* → Lose player to {live.rtm_orig_bidder_name} for ₹{_cr(live.rtm_orig_bid)}\n\n"
-        f"⏱️ *{Config.RTM_DECISION_TIMER} seconds* to decide\\!\n\n"
+        f"⏱️ *{Config.RTM_DECISION_TIMER} seconds* to decide!\n\n"
         f"_Only {live.rtm_team_name} or Admin can click_"
     )
 
@@ -788,12 +788,12 @@ def rtm_accepted_text(player_row, final_price: int, winner_name: str,
     ts  = datetime.datetime.now().strftime("%H:%M:%S")
     ipl = player_row["ipl_team"] or "N/A"
     return (
-        f"✅ *RTM ACCEPTED \\- PLAYER SOLD\\!*\n"
+        f"✅ *RTM ACCEPTED - PLAYER SOLD!*\n"
         f"{'═'*20}\n\n"
-        f"🏏 *{flag(player_row['nationality'])} {player_row['name']}* \\({ipl}\\)\n"
-        f"🎯 {player_row['role']} \\| {player_row['nationality']}\n\n"
+        f"🏏 *{flag(player_row['nationality'])} {player_row['name']}* ({ipl})\n"
+        f"🎯 {player_row['role']} | {player_row['nationality']}\n\n"
         f"💰 *Final Price:* ₹{_cr(final_price)}\n"
-        f"🏆 *Winner:* *{winner_name}* 🎴 \\(via RTM\\)\n\n"
+        f"🏆 *Winner:* *{winner_name}* 🎴 (via RTM)\n\n"
         f"📊 *Transaction:*\n"
         f"• Deducted: ₹{_cr(final_price)} from {winner_name}\n"
         f"• Remaining Purse: ₹{_cr(remaining_purse)}\n"
@@ -811,18 +811,18 @@ def rtm_declined_text(player_row, original_bid: int, original_team: str,
     ts  = datetime.datetime.now().strftime("%H:%M:%S")
     ipl = player_row["ipl_team"] or "N/A"
     return (
-        f"❌ *RTM DECLINED \\- ORIGINAL SALE\\!*\n"
+        f"❌ *RTM DECLINED - ORIGINAL SALE!*\n"
         f"{'═'*20}\n\n"
-        f"🏏 *{flag(player_row['nationality'])} {player_row['name']}* \\({ipl}\\)\n"
-        f"🎯 {player_row['role']} \\| {player_row['nationality']}\n\n"
-        f"💰 *Final Price:* ₹{_cr(original_bid)} \\(Original bid\\)\n"
+        f"🏏 *{flag(player_row['nationality'])} {player_row['name']}* ({ipl})\n"
+        f"🎯 {player_row['role']} | {player_row['nationality']}\n\n"
+        f"💰 *Final Price:* ₹{_cr(original_bid)} (Original bid)\n"
         f"🏆 *Winner:* *{original_team}*\n\n"
         f"🎴 {rtm_team} declined to match the raised bid\n\n"
         f"📊 *Transaction:*\n"
         f"• Deducted: ₹{_cr(original_bid)} from {original_team}\n"
         f"• Remaining Purse: ₹{_cr(remaining_purse)}\n"
         f"• Squad: {squad_count} players\n\n"
-        f"✅ {original_team} wins the player\\!\n\n"
+        f"✅ {original_team} wins the player!\n\n"
         f"⏰ Sold at: {ts}"
     )
 
@@ -832,17 +832,17 @@ def rtm_no_raise_text(player_row, orig_bid: int, rtm_team: str,
                       rtm_cards_left: int, squad_count: int,
                       original_team: str) -> str:
     return (
-        f"🎴 *RTM SUCCESSFUL \\- NO RAISE\\!*\n"
+        f"🎴 *RTM SUCCESSFUL - NO RAISE!*\n"
         f"{'═'*20}\n\n"
         f"🏏 *{flag(player_row['nationality'])} {player_row['name']}*\n\n"
         f"⏱️ {original_team} did not raise the bid\n\n"
-        f"💰 *Final Price:* ₹{_cr(orig_bid)} \\(Original amount\\)\n"
-        f"🏆 *Winner:* *{rtm_team}* 🎴 \\(via RTM\\)\n\n"
+        f"💰 *Final Price:* ₹{_cr(orig_bid)} (Original amount)\n"
+        f"🏆 *Winner:* *{rtm_team}* 🎴 (via RTM)\n\n"
         f"📊 *Transaction:*\n"
         f"• Deducted: ₹{_cr(orig_bid)} from {rtm_team}\n"
         f"• RTM Cards Remaining: {rtm_cards_left}\n"
         f"• Squad: {squad_count} players\n\n"
-        f"✅ Player acquired using RTM card\\!"
+        f"✅ Player acquired using RTM card!"
     )
 
 
@@ -863,12 +863,12 @@ def rtm_summary_text(player_row, base_price: int, original_bid: int,
     else:
         steps += f"4️⃣ No raise — {team_a} wins at original bid"
     return (
-        f"📋 *RTM SUMMARY \\- {player_row['name']}*\n"
+        f"📋 *RTM SUMMARY - {player_row['name']}*\n"
         f"{'═'*20}\n\n"
         f"🔨 Auction Flow:\n{steps}\n\n"
         f"🏆 Winner: *{winner_team}*\n"
         f"💰 Paid: ₹{_cr(final_amount)}\n\n"
-        f"📊 RTM Cards Left:\n{team_a}: {rtm_cards_left} card\\(s\\)"
+        f"📊 RTM Cards Left:\n{team_a}: {rtm_cards_left} card(s)"
     )
 
 
@@ -877,7 +877,7 @@ def rtm_error_text(player_name: str, ipl_team: str, reason: str) -> str:
     return (
         f"❌ *RTM ERROR*\n"
         f"{'═'*20}\n\n"
-        f"You cannot use RTM for {player_name}\\!\n\n"
+        f"You cannot use RTM for {player_name}!\n\n"
         f"Reason: {reason}\n\n"
         f"💡 Check: `/myrtm` to see your available RTM cards"
     )
@@ -888,9 +888,9 @@ def rtm_raise_error_text(original_team: str, your_team: str) -> str:
     return (
         f"❌ *RAISE BID ERROR*\n"
         f"{'═'*20}\n\n"
-        f"Only *{original_team}* \\(current highest bidder\\) can raise the bid\\!\n\n"
+        f"Only *{original_team}* (current highest bidder) can raise the bid!\n\n"
         f"You are: {your_team}\n\n"
-        f"💡 Wait for {original_team} to decide or let the RTM team win\\."
+        f"💡 Wait for {original_team} to decide or let the RTM team win."
     )
 
 
@@ -900,13 +900,13 @@ def rtm_wait_decision_text(rtm_team: str, new_bid: int, original_bid: int,
     return (
         f"❌ *WAIT FOR DECISION*\n"
         f"{'═'*20}\n\n"
-        f"{rtm_team}, you must click the buttons\\!\n\n"
-        f"The original bidder has raised to ₹{_cr(new_bid)}\\.\n\n"
+        f"{rtm_team}, you must click the buttons!\n\n"
+        f"The original bidder has raised to ₹{_cr(new_bid)}.\n\n"
         f"Click:\n"
         f"✅ *YES* to buy for ₹{_cr(new_bid)}\n"
         f"❌ *NO* to give up "
-        f"\\(player goes to {original_team} for ₹{_cr(original_bid)}\\)\n\n"
-        f"⏱️ {secs_left}s remaining\\.\\.\\."
+        f"(player goes to {original_team} for ₹{_cr(original_bid)})\n\n"
+        f"⏱️ {secs_left}s remaining..."
     )
 
 
@@ -1078,7 +1078,7 @@ async def _check_rtm(context: ContextTypes.DEFAULT_TYPE, pr):
     If found → sends RTM CHECK message and opens 30s offer window.
     If none  → finalizes immediately.
     """
-    ipl_team = pr.get("ipl_team", "") or ""
+    ipl_team = (pr["ipl_team"] or "") if pr["ipl_team"] is not None else ""
     eligible = get_rtm_eligible(live.auction_id, live.highest_bidder_id, ipl_team)
 
     if not eligible:
@@ -1107,8 +1107,8 @@ async def _rtm_offer_timer(context: ContextTypes.DEFAULT_TYPE):
         await context.bot.send_message(
             chat_id=live.chat_id,
             text=(
-                f"⏰ RTM window expired\\. "
-                f"*{live.highest_bidder_name}* wins the player\\!"
+                f"⏰ RTM window expired. "
+                f"*{live.highest_bidder_name}* wins the player!"
             ),
             parse_mode=ParseMode.MARKDOWN,
         )
@@ -1542,7 +1542,7 @@ async def process_bid(update, context: ContextTypes.DEFAULT_TYPE,
         else:
             await update.message.reply_text(
                 f"⬆️ Bid raised to *₹{_cr(bid_l)}Cr* — "
-                f"waiting for *{live.rtm_team_name}* to decide\\!",
+                f"waiting for *{live.rtm_team_name}* to decide!",
                 parse_mode=ParseMode.MARKDOWN,
             )
         return
@@ -1909,7 +1909,7 @@ async def cmd_my_rtm(update: Update, context: ContextTypes.DEFAULT_TYPE):
         txt = (
             f"🎴 *No RTM Cards Remaining*\n{'─'*24}\n\n"
             f"Your assigned IPL team was: *{team}*\n"
-            f"All RTM cards have been used or none were assigned\\."
+            f"All RTM cards have been used or none were assigned."
         )
     else:
         txt = (
@@ -1917,7 +1917,7 @@ async def cmd_my_rtm(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"Cards remaining: *{cards}*\n"
             f"Assigned IPL team: *{team}*\n\n"
             f"When a *{team}* player is auctioned and the bid timer expires,\n"
-            f"you will be notified\\. Then use `/rtm` to activate your card\\!"
+            f"you will be notified. Then use `/rtm` to activate your card!"
         )
     await update.message.reply_text(txt, parse_mode=ParseMode.MARKDOWN)
 
@@ -2938,7 +2938,7 @@ async def cmd_add_player_list(update: Update, context: ContextTypes.DEFAULT_TYPE
     lines  = update.message.text.strip().split("\n")[1:]
     added, failed = [], []
     for line in lines:
-        line = re.sub(r"^\d+[\.\)\s]\s*", "", line.strip())
+        line = re.sub(r"^\d+[.)\s]\s*", "", line.strip())
         if not line: continue
         parts = [p.strip() for p in line.split(",")]
         if len(parts) < 5:
@@ -3054,7 +3054,7 @@ async def _handle_rtm_use(update, context: ContextTypes.DEFAULT_TYPE, uid: int):
         await err("Player not found.")
         return
 
-    ipl_team = pr.get("ipl_team", "") or ""
+    ipl_team = (pr["ipl_team"] or "") if pr["ipl_team"] is not None else ""
     if not ipl_team.strip():
         await err("This player has no previous IPL team — RTM is not applicable.")
         return
@@ -3563,7 +3563,7 @@ def build_app() -> Application:
     app.add_handler(CommandHandler(["queue","q"], cmd_view_queue))
 
     app.add_handler(CallbackQueryHandler(handle_callback))
-    app.add_handler(MessageHandler(filters.TEXT & filters.Regex(r"^\."), dot_handler))
+    app.add_handler(MessageHandler(filters.TEXT & filters.Regex(r"^."), dot_handler))
 
     return app
 
