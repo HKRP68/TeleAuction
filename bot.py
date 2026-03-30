@@ -554,6 +554,19 @@ def cur(aid: Optional[int] = None) -> str:
     return db.get_setting("currency", "Rs.")
 
 
+def md_safe(s: str) -> str:
+    """Escape Markdown special characters in dynamic user-supplied values.
+    Only escapes _ ` [ — these are the chars that appear in usernames/team names.
+    We leave * alone since names don't use bold and escaping * can break display.
+    """
+    if not s:
+        return str(s)
+    s = str(s)
+    for ch in ('_', '`', '['):
+        s = s.replace(ch, f'\\{ch}')
+    return s
+
+
 def fmt(lakhs: int, aid: Optional[int] = None) -> str:
     s = cur(aid)
     if lakhs >= 100:
@@ -578,6 +591,11 @@ def ist_now() -> str:
     utc = datetime.datetime.utcnow()
     ist = utc + datetime.timedelta(hours=5, minutes=30)
     return ist.strftime("%I:%M:%S %p IST")
+
+
+def _esc(s: str) -> str:
+    """Escape Markdown special chars in dynamic values (names, usernames)."""
+    return str(s).replace("_", "\\_").replace("*", "\\*").replace("`", "\\`").replace("[", "\\[")
 
 
 def flag(nat: str) -> str:
@@ -1264,14 +1282,14 @@ async def _finalize(context: ContextTypes.DEFAULT_TYPE, pr,
         sold_text = (
             f"✅ *SOLD!* ✅\n"
             f"{'═'*20}\n\n"
-            f"🏏 *{flag(pr['nationality'])} {pr['name']}*\n"
-            f"🎯 {pr['role']} | {pr['nationality']}\n\n"
-            f"💰 *{fmt(final_price, aid)}*\n"
-            f"🏆 *{winner_name}* {winner_at}\n\n"
+            f"🏏 *{flag(pr['nationality'])} {md_safe(pr['name'])}*\n"
+            f"🎯 {md_safe(pr['role'])} | {md_safe(pr['nationality'])}\n\n"
+            f"💰 *{md_safe(fmt(final_price, aid))}*\n"
+            f"🏆 *{md_safe(winner_name)}* {md_safe(winner_at)}\n\n"
             f"📊 Stats:\n"
-            f"• Purse Remaining: {fmt(remaining, aid)}\n"
+            f"• Purse Remaining: {md_safe(fmt(remaining, aid))}\n"
             f"• Players Bought: {sq_count}/25\n"
-            f"• Total Spent: {fmt(total_spent, aid)}\n\n"
+            f"• Total Spent: {md_safe(fmt(total_spent, aid))}\n\n"
             f"⏰ Sold at: {ts}"
         )
 
@@ -3311,27 +3329,43 @@ async def _handle_callback_inner(update, context, query, data, uid):
             sq      = len(json.loads(rtm_row["squad"])) if rtm_row else 0
             ts      = ist_now()
 
+            p_name   = md_safe(pr['name'])
+            s_ipl    = md_safe(ipl)
+            s_role   = md_safe(pr['role'])
+            s_nat    = md_safe(pr['nationality'])
+            s_rtm    = md_safe(rtm_name)
+            s_orig   = md_safe(orig_name)
+            s_price  = md_safe(fmt(final_price, aid))
+            s_rem    = md_safe(fmt(rem, aid))
+
             text = (
                 f"✅ *RTM ACCEPTED - PLAYER SOLD!*\n"
                 f"{'═'*20}\n\n"
-                f"🏏 *{flag(pr['nationality'])} {pr['name']}* ({ipl})\n"
-                f"🎯 {pr['role']} | {pr['nationality']}\n\n"
-                f"💰 *Final Price:* {fmt(final_price, aid)}\n"
-                f"🏆 *Winner:* *{rtm_name}* 🎴 (via RTM)\n\n"
+                f"🏏 *{flag(pr['nationality'])} {p_name}* ({s_ipl})\n"
+                f"🎯 {s_role} | {s_nat}\n\n"
+                f"💰 *Final Price:* {s_price}\n"
+                f"🏆 *Winner:* *{s_rtm}* 🎴 (via RTM)\n\n"
                 f"📊 *Transaction:*\n"
-                f"• Deducted: {fmt(final_price, aid)} from {rtm_name}\n"
-                f"• Remaining Purse: {fmt(rem, aid)}\n"
+                f"• Deducted: {s_price} from {s_rtm}\n"
+                f"• Remaining Purse: {s_rem}\n"
                 f"• Squad: {sq}/25 players\n\n"
-                f"❌ {orig_name} loses the bid\n\n"
+                f"❌ {s_orig} loses the bid\n\n"
                 f"⏰ Sold at: {ts}"
             )
 
-            try:
-                await query.edit_message_text(text, parse_mode=ParseMode.MARKDOWN)
-            except Exception:
-                await context.bot.send_message(
-                    query.message.chat_id, text,
-                    parse_mode=ParseMode.MARKDOWN, reply_markup=reauction_keyboard())
+            for _pm in (ParseMode.MARKDOWN, None):
+                try:
+                    await query.edit_message_text(
+                        text, parse_mode=_pm,
+                        reply_markup=reauction_keyboard() if _pm is None else None)
+                    break
+                except Exception as _e:
+                    if _pm is None:
+                        logger.error(f"ry send failed completely: {_e}")
+                        await context.bot.send_message(
+                            query.message.chat_id,
+                            "✅ RTM Accepted! Sale recorded.")
+                    continue
 
             live.sold_count         += 1
             _set_last_sold(pr["player_id"], pr["name"], rtm_uid, rtm_name, final_price)
@@ -3408,28 +3442,44 @@ async def _handle_callback_inner(update, context, query, data, uid):
             sq       = len(json.loads(orig_row["squad"])) if orig_row else 0
             ts       = ist_now()
 
+            p_name  = md_safe(pr['name'])
+            s_ipl   = md_safe(ipl)
+            s_role  = md_safe(pr['role'])
+            s_nat   = md_safe(pr['nationality'])
+            s_orig  = md_safe(orig_name)
+            s_rtm   = md_safe(rtm_name)
+            s_price = md_safe(fmt(orig_price, aid))
+            s_rem   = md_safe(fmt(rem, aid))
+
             text = (
                 f"❌ *RTM DECLINED - ORIGINAL SALE!*\n"
                 f"{'═'*20}\n\n"
-                f"🏏 *{flag(pr['nationality'])} {pr['name']}* ({ipl})\n"
-                f"🎯 {pr['role']} | {pr['nationality']}\n\n"
-                f"💰 *Final Price:* {fmt(orig_price, aid)} (Original bid)\n"
-                f"🏆 *Winner:* *{orig_name}*\n\n"
-                f"🎴 {rtm_name} declined to match the raised bid\n\n"
+                f"🏏 *{flag(pr['nationality'])} {p_name}* ({s_ipl})\n"
+                f"🎯 {s_role} | {s_nat}\n\n"
+                f"💰 *Final Price:* {s_price} (Original bid)\n"
+                f"🏆 *Winner:* *{s_orig}*\n\n"
+                f"🎴 {s_rtm} declined to match the raised bid\n\n"
                 f"📊 *Transaction:*\n"
-                f"• Deducted: {fmt(orig_price, aid)} from {orig_name}\n"
-                f"• Remaining Purse: {fmt(rem, aid)}\n"
+                f"• Deducted: {s_price} from {s_orig}\n"
+                f"• Remaining Purse: {s_rem}\n"
                 f"• Squad: {sq}/25 players\n\n"
-                f"✅ {orig_name} wins the player!\n\n"
+                f"✅ {s_orig} wins the player!\n\n"
                 f"⏰ Sold at: {ts}"
             )
 
-            try:
-                await query.edit_message_text(text, parse_mode=ParseMode.MARKDOWN)
-            except Exception:
-                await context.bot.send_message(
-                    query.message.chat_id, text,
-                    parse_mode=ParseMode.MARKDOWN, reply_markup=reauction_keyboard())
+            for _pm in (ParseMode.MARKDOWN, None):
+                try:
+                    await query.edit_message_text(
+                        text, parse_mode=_pm,
+                        reply_markup=reauction_keyboard() if _pm is None else None)
+                    break
+                except Exception as _e:
+                    if _pm is None:
+                        logger.error(f"rn send failed completely: {_e}")
+                        await context.bot.send_message(
+                            query.message.chat_id,
+                            "❌ RTM Declined. Original sale stands.")
+                    continue
 
             live.sold_count         += 1
             _set_last_sold(pr["player_id"], pr["name"], orig_uid, orig_name, orig_price)
