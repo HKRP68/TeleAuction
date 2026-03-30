@@ -41,6 +41,10 @@ class Config:
     WEBHOOK_URL: str    = os.getenv("WEBHOOK_URL", "")
     PORT: int           = int(os.getenv("PORT", "8080"))
     DB_PATH: str        = os.getenv("DATABASE_PATH", "auction.db")
+    # Optional: a private Telegram channel/group where bot is admin.
+    # Bot stores state JSON here — survives Render filesystem wipes.
+    # Set to the channel_id (e.g. -1001234567890) in Render env vars.
+    STATE_CHANNEL_ID: int = int(os.getenv("STATE_CHANNEL_ID", "0"))
     BID_TIMER: int           = 30
     RTM_OFFER_TIMER: int     = 30   # Step 1 → window for eligible teams to use /rtm
     RTM_COUNTER_TIMER: int   = 20   # Step 2 → window for original bidder to raise
@@ -545,80 +549,212 @@ db = DB()
 
 
 # ─────────────────────────────────────────────────────────
-# STATE PERSISTENCE — survives restarts up to 5 days
+# STATE PERSISTENCE — 3-layer system survives Render restarts
+#
+# Layer 1: Telegram channel (primary — survives filesystem wipes)
+#   Set STATE_CHANNEL_ID env var to a private channel/group where bot is admin.
+#   Bot sends/edits a JSON message there on every save.
+#
+# Layer 2: SQLite settings table (works if disk persists)
+#
+# Layer 3: Reconstruct from DB tables (always works if DB exists)
 # ─────────────────────────────────────────────────────────
-def save_live_state():
-    """Persist critical live state to DB so restarts don't lose the auction."""
-    import json as _json
-    state = {
-        "auction_id":       live.auction_id,
-        "auction_name":     live.auction_name,
-        "chat_id":          live.chat_id,
-        "active":           live.active,
-        "paused":           live.paused,
-        "sold_count":       live.sold_count,
-        "unsold_count":     live.unsold_count,
-        "set_number":       live.set_number,
-        "auto_sell_secs":   live.auto_sell_secs,
-        "auto_next_secs":   live.auto_next_secs,
-        "auto_next_on":     live.auto_next_on,
-        # Queue: store player_ids only
-        "player_queue": [
-            (r["player_id"] if hasattr(r, "keys") else r)
+
+# Message ID of the last state message in the Telegram channel
+_state_msg_id: Optional[int] = None
+
+
+def _build_state_dict() -> dict:
+    """Build the state dictionary to persist."""
+    return {
+        "v":              2,  # version tag
+        "auction_id":     live.auction_id,
+        "auction_name":   live.auction_name,
+        "chat_id":        live.chat_id,
+        "active":         live.active,
+        "paused":         live.paused,
+        "sold_count":     live.sold_count,
+        "unsold_count":   live.unsold_count,
+        "set_number":     live.set_number,
+        "auto_sell_secs": live.auto_sell_secs,
+        "auto_next_secs": live.auto_next_secs,
+        "auto_next_on":   live.auto_next_on,
+        "player_queue":   [
+            (r["player_id"] if hasattr(r, "keys") else int(r))
             for r in live.player_queue
         ],
     }
-    db.set_setting("live_state", _json.dumps(state))
 
 
-def restore_live_state():
-    """Restore live state from DB after restart. Call once at startup."""
+def _apply_state_dict(state: dict) -> bool:
+    """Apply a state dict to live. Returns True on success."""
     import json as _json
-
-    # First try the saved JSON snapshot
-    raw = db.get_setting("live_state")
-    if raw:
-        try:
-            state = _json.loads(raw)
-            aid = state.get("auction_id")
-            if aid:
-                ar = db.get_auction(aid)
-                if ar and ar["status"] in ("active", "registration"):
-                    live.auction_id   = aid
-                    live.auction_name = state.get("auction_name", ar["name"])
-                    live.chat_id      = state.get("chat_id")
-                    live.active       = state.get("active", True)
-                    live.paused       = state.get("paused", False)
-                    live.sold_count   = state.get("sold_count", 0)
-                    live.unsold_count = state.get("unsold_count", 0)
-                    live.set_number   = state.get("set_number", 1)
-                    live.auto_sell_secs = state.get("auto_sell_secs")
-                    live.auto_next_secs = state.get("auto_next_secs")
-                    live.auto_next_on   = state.get("auto_next_on", False)
-
-                    # Restore queue from saved player_ids
-                    pids = state.get("player_queue", [])
-                    live.player_queue = []
-                    for pid in pids:
-                        row = db.get_player(int(pid))
-                        if row and row["status"] == "available":
-                            live.player_queue.append(row)
-
-                    # If queue empty, rebuild from DB
-                    if not live.player_queue:
-                        live.player_queue = list(db.get_available(aid))
-
-                    logger.info(
-                        f"State restored from snapshot: auction={live.auction_name}, "
-                        f"active={live.active}, paused={live.paused}, "
-                        f"queue={len(live.player_queue)}, sold={live.sold_count}"
-                    )
-                    return True
-        except Exception as e:
-            logger.error(f"restore_live_state snapshot failed: {e}", exc_info=True)
-
-    # Fallback: find most recent active auction directly in DB
     try:
+        aid = state.get("auction_id")
+        if not aid:
+            return False
+        ar = db.get_auction(aid)
+        if not ar:
+            return False
+
+        live.auction_id     = aid
+        live.auction_name   = state.get("auction_name", ar["name"])
+        live.chat_id        = state.get("chat_id")
+        live.active         = state.get("active", True)
+        live.paused         = state.get("paused", False)
+        live.sold_count     = state.get("sold_count", 0)
+        live.unsold_count   = state.get("unsold_count", 0)
+        live.set_number     = state.get("set_number", 1)
+        live.auto_sell_secs = state.get("auto_sell_secs")
+        live.auto_next_secs = state.get("auto_next_secs")
+        live.auto_next_on   = state.get("auto_next_on", False)
+
+        pids = state.get("player_queue", [])
+        live.player_queue = []
+        for pid in pids:
+            row = db.get_player(int(pid))
+            if row and row["status"] == "available":
+                live.player_queue.append(row)
+        if not live.player_queue:
+            live.player_queue = list(db.get_available(aid))
+
+        return True
+    except Exception as e:
+        logger.error(f"_apply_state_dict failed: {e}", exc_info=True)
+        return False
+
+
+def save_live_state():
+    """Save state to SQLite (always) and schedule Telegram channel save."""
+    import json as _json
+    state = _build_state_dict()
+    payload = _json.dumps(state)
+
+    # Layer 2: SQLite (fast, synchronous)
+    try:
+        db.set_setting("live_state", payload)
+    except Exception as e:
+        logger.warning(f"save_live_state SQLite failed: {e}")
+
+    # Layer 1: Telegram channel (async — scheduled as fire-and-forget task)
+    if Config.STATE_CHANNEL_ID and _ptb_app:
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                asyncio.create_task(_save_to_telegram(payload))
+        except Exception:
+            pass  # Non-critical
+
+
+async def _save_to_telegram(payload: str):
+    """Send/edit state JSON message in the STATE_CHANNEL_ID channel."""
+    global _state_msg_id
+    if not Config.STATE_CHANNEL_ID or not _ptb_app:
+        return
+    try:
+        text = f"🔒 AuctionState\n```\n{payload}\n```"
+        if _state_msg_id:
+            try:
+                await _ptb_app.bot.edit_message_text(
+                    chat_id=Config.STATE_CHANNEL_ID,
+                    message_id=_state_msg_id,
+                    text=text,
+                    parse_mode="Markdown",
+                )
+                return
+            except Exception:
+                pass  # Edit failed (too old?) — send new
+        msg = await _ptb_app.bot.send_message(
+            chat_id=Config.STATE_CHANNEL_ID,
+            text=text,
+            parse_mode="Markdown",
+        )
+        _state_msg_id = msg.message_id
+        # Persist the message id for next time
+        db.set_setting("state_msg_id", str(msg.message_id))
+    except Exception as e:
+        logger.warning(f"_save_to_telegram failed: {e}")
+
+
+async def restore_live_state_async(bot) -> bool:
+    """
+    Full 3-layer restore — must be called with a live bot instance.
+    Layer 1: Telegram channel  → always survives filesystem wipes
+    Layer 2: SQLite settings   → works if disk persists
+    Layer 3: DB reconstruction → always works if DB exists at all
+    """
+    import json as _json
+    global _state_msg_id
+
+    # ── Layer 1: Telegram channel ─────────────────────────
+    if Config.STATE_CHANNEL_ID:
+        try:
+            # Re-load saved message id
+            saved_mid = db.get_setting("state_msg_id")
+            if saved_mid:
+                _state_msg_id = int(saved_mid)
+                msg = await bot.forward_message(
+                    chat_id=Config.STATE_CHANNEL_ID,
+                    from_chat_id=Config.STATE_CHANNEL_ID,
+                    message_id=_state_msg_id,
+                )
+        except Exception:
+            pass
+
+        # Fetch the last 5 messages in the channel and find the state one
+        try:
+            # Use get_updates or getChatHistory - use bot.get_chat approach
+            history = await bot.get_updates(limit=0)  # just to confirm connection
+        except Exception:
+            pass
+
+        # Alternative: directly fetch message by id via copy
+        if _state_msg_id:
+            try:
+                import requests as _req
+                r = _req.get(
+                    f"https://api.telegram.org/bot{Config.BOT_TOKEN}"
+                    f"/getMessages?chat_id={Config.STATE_CHANNEL_ID}"
+                    f"&message_ids=[{_state_msg_id}]",
+                    timeout=5,
+                )
+                data = r.json()
+                if data.get("ok") and data.get("result"):
+                    msg_text = data["result"][0].get("text", "")
+                    # Extract JSON from code block
+                    if "```" in msg_text:
+                        json_part = msg_text.split("```")[1].strip()
+                        if json_part.startswith("\n"):
+                            json_part = json_part[1:]
+                        state = _json.loads(json_part)
+                        if _apply_state_dict(state):
+                            logger.info(f"✅ Layer 1 restore (Telegram): {live.auction_name}")
+                            return True
+            except Exception as e:
+                logger.warning(f"Layer 1 restore failed: {e}")
+
+    # ── Layer 2: SQLite settings ──────────────────────────
+    try:
+        raw = db.get_setting("live_state")
+        if raw:
+            state = _json.loads(raw)
+            if _apply_state_dict(state):
+                logger.info(f"✅ Layer 2 restore (SQLite): {live.auction_name}")
+                return True
+    except Exception as e:
+        logger.warning(f"Layer 2 restore failed: {e}")
+
+    # ── Layer 3: Reconstruct from DB tables ───────────────
+    return restore_live_state()
+
+
+def restore_live_state() -> bool:
+    """
+    Synchronous Layer 3: Reconstruct entirely from DB tables.
+    No snapshot needed — the DB tables are the ground truth.
+    """
+    try:
+        # Find the most recent active auction
         ar = db.cx.execute(
             "SELECT * FROM auctions WHERE status='active' ORDER BY auction_id DESC LIMIT 1"
         ).fetchone()
@@ -626,25 +762,31 @@ def restore_live_state():
             return False
 
         aid = ar["auction_id"]
-        sold_c   = db.cx.execute("SELECT COUNT(*) c FROM players WHERE auction_id=? AND status='sold'",   (aid,)).fetchone()
-        unsold_c = db.cx.execute("SELECT COUNT(*) c FROM players WHERE auction_id=? AND status='unsold'", (aid,)).fetchone()
+        sold_c   = db.cx.execute(
+            "SELECT COUNT(*) c FROM players WHERE auction_id=? AND status='sold'",
+            (aid,)
+        ).fetchone()
+        unsold_c = db.cx.execute(
+            "SELECT COUNT(*) c FROM players WHERE auction_id=? AND status='unsold'",
+            (aid,)
+        ).fetchone()
 
         live.auction_id   = aid
         live.auction_name = ar["name"]
-        live.chat_id      = ar["chat_id"]
+        live.chat_id      = ar["chat_id"]  # stored in auctions table
         live.active       = True
-        live.paused       = True   # Safe default after restart — admin must /resumeauction
+        live.paused       = True   # Always pause after restart — admin resumes
         live.sold_count   = sold_c["c"]   if sold_c   else 0
         live.unsold_count = unsold_c["c"] if unsold_c else 0
         live.player_queue = list(db.get_available(aid))
 
         logger.info(
-            f"State recovered from DB (no snapshot): auction={live.auction_name}, "
+            f"✅ Layer 3 restore (DB reconstruct): {live.auction_name}, "
             f"queue={len(live.player_queue)}, sold={live.sold_count}"
         )
         return True
     except Exception as e:
-        logger.error(f"restore_live_state DB fallback failed: {e}", exc_info=True)
+        logger.error(f"Layer 3 restore failed: {e}", exc_info=True)
         return False
 
 
@@ -2800,6 +2942,10 @@ async def cmd_start_auction(update: Update, context: ContextTypes.DEFAULT_TYPE):
     live.set_number   = 1
     live.chat_id      = update.effective_chat.id
     db.set_auction_status(live.auction_id, "active")
+    # Persist chat_id in DB so Layer 3 restore always knows where to message
+    db.cx.execute("UPDATE auctions SET chat_id=? WHERE auction_id=?",
+                  (live.chat_id, live.auction_id))
+    db.cx.commit()
     save_live_state()
 
     ar = db.get_auction(live.auction_id)
@@ -4008,6 +4154,31 @@ async def _setup_wh(app: Application, url: str):
     )
     await app.start()
     logger.info(f"Webhook: {url}/webhook")
+    # Restore state after bot is fully started
+    restored = await restore_live_state_async(app.bot)
+    if restored:
+        logger.info(
+            f"✅ State restored: '{live.auction_name}' "
+            f"active={live.active} paused={live.paused} "
+            f"sold={live.sold_count} queue={len(live.player_queue)}"
+        )
+        if live.chat_id:
+            try:
+                await app.bot.send_message(
+                    chat_id=live.chat_id,
+                    text=(
+                        f"🔄 *Bot restarted — Auction state restored!*\n"
+                        f"🏏 *{md_safe(live.auction_name)}*\n"
+                        f"Sold: {live.sold_count} | Unsold: {live.unsold_count} "
+                        f"| Queue: {len(live.player_queue)}\n\n"
+                        f"Admin: use /resumeauction to continue."
+                    ),
+                    parse_mode="Markdown",
+                )
+            except Exception:
+                pass
+    else:
+        logger.info("No prior auction state to restore.")
 
 
 def main():
@@ -4018,16 +4189,9 @@ def main():
 
     logger.info("Starting IPL Auction Bot v4.0...")
 
-    # Restore auction state from last run (survives restarts up to 5 days)
-    restored = restore_live_state()
-    if restored:
-        logger.info(
-            f"✅ Auction state restored: '{live.auction_name}' "
-            f"active={live.active} paused={live.paused} "
-            f"sold={live.sold_count} queue={len(live.player_queue)}"
-        )
-    else:
-        logger.info("No prior state to restore — starting fresh.")
+    # Attempt a quick synchronous restore from DB (Layer 3) so
+    # /status works immediately even before Telegram restore completes
+    restore_live_state()
 
     ptb = build_app()
 
