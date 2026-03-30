@@ -549,25 +549,22 @@ db = DB()
 
 
 # ─────────────────────────────────────────────────────────
-# STATE PERSISTENCE — 3-layer system survives Render restarts
+# STATE PERSISTENCE — Full DB backup to Telegram
 #
-# Layer 1: Telegram channel (primary — survives filesystem wipes)
-#   Set STATE_CHANNEL_ID env var to a private channel/group where bot is admin.
-#   Bot sends/edits a JSON message there on every save.
-#
-# Layer 2: SQLite settings table (works if disk persists)
-#
-# Layer 3: Reconstruct from DB tables (always works if DB exists)
+# On every save: upload auction.db as a document to STATE_CHANNEL_ID.
+# On restart: download it and replace the local file — full restoration.
+# This survives complete Render filesystem wipes because the DB itself
+# is stored in Telegram, not the local disk.
 # ─────────────────────────────────────────────────────────
 
-# Message ID of the last state message in the Telegram channel
-_state_msg_id: Optional[int] = None
+_db_backup_msg_id: Optional[int] = None   # Telegram msg_id of latest DB backup
 
 
-def _build_state_dict() -> dict:
-    """Build the state dictionary to persist."""
-    return {
-        "v":              2,  # version tag
+def save_live_state():
+    """Save live_state JSON to SQLite, then schedule async full-DB upload."""
+    import json as _json
+    state = {
+        "v":              3,
         "auction_id":     live.auction_id,
         "auction_name":   live.auction_name,
         "chat_id":        live.chat_id,
@@ -584,19 +581,79 @@ def _build_state_dict() -> dict:
             for r in live.player_queue
         ],
     }
+    try:
+        db.cx.execute(
+            "INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)",
+            ("live_state", _json.dumps(state))
+        )
+        db.cx.commit()
+    except Exception as e:
+        logger.warning(f"save_live_state SQLite: {e}")
+
+    if Config.STATE_CHANNEL_ID and _ptb_app:
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                asyncio.create_task(_backup_db_to_telegram())
+        except Exception:
+            pass
+
+
+async def _backup_db_to_telegram():
+    """Upload the full SQLite DB file as a document to STATE_CHANNEL_ID."""
+    global _db_backup_msg_id
+    if not Config.STATE_CHANNEL_ID or not _ptb_app:
+        return
+    try:
+        db.cx.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        db.cx.commit()
+    except Exception:
+        pass
+    caption = (
+        f"\U0001f512 DB Backup | {live.auction_name}\n"
+        f"Sold:{live.sold_count} Queue:{len(live.player_queue)} "
+        f"Active:{live.active} Paused:{live.paused}"
+    )
+    try:
+        with open(Config.DB_PATH, "rb") as f:
+            db_bytes = f.read()
+        msg = await _ptb_app.bot.send_document(
+            chat_id=Config.STATE_CHANNEL_ID,
+            document=db_bytes,
+            filename="auction_backup.db",
+            caption=caption,
+        )
+        if _db_backup_msg_id and _db_backup_msg_id != msg.message_id:
+            try:
+                await _ptb_app.bot.delete_message(
+                    chat_id=Config.STATE_CHANNEL_ID,
+                    message_id=_db_backup_msg_id,
+                )
+            except Exception:
+                pass
+        _db_backup_msg_id = msg.message_id
+        db.cx.execute(
+            "INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)",
+            ("db_backup_msg_id", str(msg.message_id))
+        )
+        db.cx.commit()
+        logger.info(f"DB backed up to Telegram msg={msg.message_id} ({len(db_bytes):,}B)")
+    except FileNotFoundError:
+        logger.warning("DB file missing — skipping Telegram backup")
+    except Exception as e:
+        logger.warning(f"_backup_db_to_telegram: {e}")
 
 
 def _apply_state_dict(state: dict) -> bool:
-    """Apply a state dict to live. Returns True on success."""
-    import json as _json
+    """Apply a saved state dict to live. Returns True on success."""
     try:
         aid = state.get("auction_id")
         if not aid:
             return False
         ar = db.get_auction(aid)
         if not ar:
+            logger.warning(f"_apply_state_dict: auction_id={aid} not in DB")
             return False
-
         live.auction_id     = aid
         live.auction_name   = state.get("auction_name", ar["name"])
         live.chat_id        = state.get("chat_id")
@@ -608,7 +665,6 @@ def _apply_state_dict(state: dict) -> bool:
         live.auto_sell_secs = state.get("auto_sell_secs")
         live.auto_next_secs = state.get("auto_next_secs")
         live.auto_next_on   = state.get("auto_next_on", False)
-
         pids = state.get("player_queue", [])
         live.player_queue = []
         for pid in pids:
@@ -617,178 +673,112 @@ def _apply_state_dict(state: dict) -> bool:
                 live.player_queue.append(row)
         if not live.player_queue:
             live.player_queue = list(db.get_available(aid))
-
         return True
     except Exception as e:
-        logger.error(f"_apply_state_dict failed: {e}", exc_info=True)
+        logger.error(f"_apply_state_dict: {e}", exc_info=True)
         return False
-
-
-def save_live_state():
-    """Save state to SQLite (always) and schedule Telegram channel save."""
-    import json as _json
-    state = _build_state_dict()
-    payload = _json.dumps(state)
-
-    # Layer 2: SQLite (fast, synchronous)
-    try:
-        db.set_setting("live_state", payload)
-    except Exception as e:
-        logger.warning(f"save_live_state SQLite failed: {e}")
-
-    # Layer 1: Telegram channel (async — scheduled as fire-and-forget task)
-    if Config.STATE_CHANNEL_ID and _ptb_app:
-        try:
-            loop = asyncio.get_event_loop()
-            if loop.is_running():
-                asyncio.create_task(_save_to_telegram(payload))
-        except Exception:
-            pass  # Non-critical
-
-
-async def _save_to_telegram(payload: str):
-    """Send/edit state JSON message in the STATE_CHANNEL_ID channel."""
-    global _state_msg_id
-    if not Config.STATE_CHANNEL_ID or not _ptb_app:
-        return
-    try:
-        text = f"🔒 AuctionState\n```\n{payload}\n```"
-        if _state_msg_id:
-            try:
-                await _ptb_app.bot.edit_message_text(
-                    chat_id=Config.STATE_CHANNEL_ID,
-                    message_id=_state_msg_id,
-                    text=text,
-                    parse_mode="Markdown",
-                )
-                return
-            except Exception:
-                pass  # Edit failed (too old?) — send new
-        msg = await _ptb_app.bot.send_message(
-            chat_id=Config.STATE_CHANNEL_ID,
-            text=text,
-            parse_mode="Markdown",
-        )
-        _state_msg_id = msg.message_id
-        # Persist the message id for next time
-        db.set_setting("state_msg_id", str(msg.message_id))
-    except Exception as e:
-        logger.warning(f"_save_to_telegram failed: {e}")
 
 
 async def restore_live_state_async(bot) -> bool:
     """
-    Full 3-layer restore — must be called with a live bot instance.
-    Layer 1: Telegram channel  → always survives filesystem wipes
-    Layer 2: SQLite settings   → works if disk persists
-    Layer 3: DB reconstruction → always works if DB exists at all
+    Restore on startup:
+    1. Download full DB from Telegram channel → replace local file
+    2. Read live_state JSON from restored DB
+    3. Fallback: reconstruct from whatever DB tables exist
     """
     import json as _json
-    global _state_msg_id
+    global _db_backup_msg_id
 
-    # ── Layer 1: Telegram channel ─────────────────────────
+    # ── Step 1: Download DB backup from Telegram ───────────
     if Config.STATE_CHANNEL_ID:
         try:
-            # Re-load saved message id
-            saved_mid = db.get_setting("state_msg_id")
-            if saved_mid:
-                _state_msg_id = int(saved_mid)
-                msg = await bot.forward_message(
-                    chat_id=Config.STATE_CHANNEL_ID,
-                    from_chat_id=Config.STATE_CHANNEL_ID,
-                    message_id=_state_msg_id,
-                )
-        except Exception:
-            pass
-
-        # Fetch the last 5 messages in the channel and find the state one
-        try:
-            # Use get_updates or getChatHistory - use bot.get_chat approach
-            history = await bot.get_updates(limit=0)  # just to confirm connection
-        except Exception:
-            pass
-
-        # Alternative: directly fetch message by id via copy
-        if _state_msg_id:
+            # Get message id from SQLite (may survive short restarts)
+            mid_str = None
             try:
-                import requests as _req
-                r = _req.get(
-                    f"https://api.telegram.org/bot{Config.BOT_TOKEN}"
-                    f"/getMessages?chat_id={Config.STATE_CHANNEL_ID}"
-                    f"&message_ids=[{_state_msg_id}]",
-                    timeout=5,
-                )
-                data = r.json()
-                if data.get("ok") and data.get("result"):
-                    msg_text = data["result"][0].get("text", "")
-                    # Extract JSON from code block
-                    if "```" in msg_text:
-                        json_part = msg_text.split("```")[1].strip()
-                        if json_part.startswith("\n"):
-                            json_part = json_part[1:]
-                        state = _json.loads(json_part)
-                        if _apply_state_dict(state):
-                            logger.info(f"✅ Layer 1 restore (Telegram): {live.auction_name}")
-                            return True
-            except Exception as e:
-                logger.warning(f"Layer 1 restore failed: {e}")
+                mid_str = db.get_setting("db_backup_msg_id")
+            except Exception:
+                pass
 
-    # ── Layer 2: SQLite settings ──────────────────────────
+            if mid_str:
+                _db_backup_msg_id = int(mid_str)
+                # Forward to admin's DM to get a downloadable copy
+                fwd = await bot.forward_message(
+                    chat_id=Config.SUPER_ADMIN_ID,
+                    from_chat_id=Config.STATE_CHANNEL_ID,
+                    message_id=_db_backup_msg_id,
+                )
+                if fwd and fwd.document:
+                    file_obj = await bot.get_file(fwd.document.file_id)
+                    db_bytes  = await file_obj.download_as_bytearray()
+                    with open(Config.DB_PATH, "wb") as f:
+                        f.write(bytes(db_bytes))
+                    logger.info(
+                        f"\u2705 DB downloaded from Telegram "
+                        f"({len(db_bytes):,} bytes) — reconnecting"
+                    )
+                    db._local.__dict__.clear()   # force SQLite reconnect
+                try:
+                    await bot.delete_message(
+                        chat_id=Config.SUPER_ADMIN_ID,
+                        message_id=fwd.message_id,
+                    )
+                except Exception:
+                    pass
+        except Exception as e:
+            logger.warning(f"Telegram DB restore: {e}")
+
+    # ── Step 2: Read live_state from (restored) DB ─────────
     try:
         raw = db.get_setting("live_state")
         if raw:
             state = _json.loads(raw)
             if _apply_state_dict(state):
-                logger.info(f"✅ Layer 2 restore (SQLite): {live.auction_name}")
+                logger.info(
+                    f"\u2705 State restored: {live.auction_name} "
+                    f"sold={live.sold_count} queue={len(live.player_queue)}"
+                )
                 return True
     except Exception as e:
-        logger.warning(f"Layer 2 restore failed: {e}")
+        logger.warning(f"live_state read: {e}")
 
-    # ── Layer 3: Reconstruct from DB tables ───────────────
-    return restore_live_state()
+    # ── Step 3: Fallback reconstruct ───────────────────────
+    result = restore_live_state()
+    if result:
+        logger.info(f"\u2705 Reconstructed from DB: {live.auction_name}")
+    return result
 
 
 def restore_live_state() -> bool:
-    """
-    Synchronous Layer 3: Reconstruct entirely from DB tables.
-    No snapshot needed — the DB tables are the ground truth.
-    """
+    """Synchronous fallback: reconstruct from DB tables without any snapshot."""
     try:
-        # Find the most recent active auction
         ar = db.cx.execute(
-            "SELECT * FROM auctions WHERE status='active' ORDER BY auction_id DESC LIMIT 1"
+            "SELECT * FROM auctions WHERE status=\'active\' ORDER BY auction_id DESC LIMIT 1"
         ).fetchone()
         if not ar:
             return False
-
         aid = ar["auction_id"]
-        sold_c   = db.cx.execute(
-            "SELECT COUNT(*) c FROM players WHERE auction_id=? AND status='sold'",
-            (aid,)
+        sc  = db.cx.execute(
+            "SELECT COUNT(*) c FROM players WHERE auction_id=? AND status=\'sold\'", (aid,)
         ).fetchone()
-        unsold_c = db.cx.execute(
-            "SELECT COUNT(*) c FROM players WHERE auction_id=? AND status='unsold'",
-            (aid,)
+        uc  = db.cx.execute(
+            "SELECT COUNT(*) c FROM players WHERE auction_id=? AND status=\'unsold\'", (aid,)
         ).fetchone()
-
         live.auction_id   = aid
         live.auction_name = ar["name"]
-        live.chat_id      = ar["chat_id"]  # stored in auctions table
+        live.chat_id      = ar["chat_id"]
         live.active       = True
-        live.paused       = True   # Always pause after restart — admin resumes
-        live.sold_count   = sold_c["c"]   if sold_c   else 0
-        live.unsold_count = unsold_c["c"] if unsold_c else 0
+        live.paused       = True
+        live.sold_count   = sc["c"] if sc else 0
+        live.unsold_count = uc["c"] if uc else 0
         live.player_queue = list(db.get_available(aid))
-
         logger.info(
-            f"✅ Layer 3 restore (DB reconstruct): {live.auction_name}, "
-            f"queue={len(live.player_queue)}, sold={live.sold_count}"
+            f"\u2705 Reconstructed: {live.auction_name} "
+            f"sold={live.sold_count} queue={len(live.player_queue)}"
         )
         return True
     except Exception as e:
-        logger.error(f"Layer 3 restore failed: {e}", exc_info=True)
+        logger.error(f"restore_live_state: {e}", exc_info=True)
         return False
-
 
 # ─────────────────────────────────────────────────────────
 # HELPERS
@@ -1441,11 +1431,24 @@ async def _rtm_decision_timer(context: ContextTypes.DEFAULT_TYPE):
             return
     if live.rtm_state != RTM_COUNTER:
         return
-    # Auto-decline
+    # Auto-decline — refund RTM card since team didn't accept
     live.rtm_state           = RTM_NONE
     live.current_bid         = live.rtm_orig_bid
     live.highest_bidder_id   = live.rtm_orig_bidder_id
     live.highest_bidder_name = live.rtm_orig_bidder_name
+
+    # Refund card
+    if live.rtm_team_id and live.auction_id:
+        try:
+            db.cx.execute(
+                "UPDATE participants SET rtm_cards=rtm_cards+1"
+                " WHERE auction_id=? AND user_id=?",
+                (live.auction_id, live.rtm_team_id)
+            )
+            db.cx.commit()
+            logger.info(f"RTM card refunded to uid={live.rtm_team_id} (auto-decline timeout)")
+        except Exception as e:
+            logger.warning(f"RTM card refund failed: {e}")
 
     pr = db.get_player(live.current_player_id)
     if not pr:
@@ -3043,46 +3046,58 @@ async def cmd_resume(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not db.is_admin(update.effective_user.id):
         return
 
-    # If live state is gone (e.g. bot restarted), try to restore it
+    # If live state is missing, try all restore layers
     if not live.auction_id:
-        restored = restore_live_state()
+        # Try async restore first (uses Telegram channel)
+        restored = await restore_live_state_async(update.get_bot())
         if not restored:
-            # Last resort: find the most recent active auction in DB
-            ar = db.cx.execute(
-                "SELECT * FROM auctions WHERE status='active' ORDER BY auction_id DESC LIMIT 1"
-            ).fetchone()
-            if ar:
-                live.auction_id   = ar["auction_id"]
-                live.auction_name = ar["name"]
-                live.active       = True
-                live.paused       = True
-                available = db.get_available(ar["auction_id"])
-                live.player_queue = list(available)
-                sold_c = db.cx.execute(
-                    "SELECT COUNT(*) c FROM players WHERE auction_id=? AND status='sold'",
-                    (ar["auction_id"],)
-                ).fetchone()
-                unsold_c = db.cx.execute(
-                    "SELECT COUNT(*) c FROM players WHERE auction_id=? AND status='unsold'",
-                    (ar["auction_id"],)
-                ).fetchone()
-                live.sold_count   = sold_c["c"] if sold_c else 0
-                live.unsold_count = unsold_c["c"] if unsold_c else 0
-                logger.info(f"Resume: recovered auction {ar['name']} from DB")
-            else:
-                await update.message.reply_text(
-                    "❌ No active auction found in database.\n"
-                    "Use /create\\_auction to start a new one.",
-                    parse_mode=ParseMode.MARKDOWN,
-                )
-                return
+            # Try sync DB layer
+            restored = restore_live_state()
+        if not restored:
+            await update.message.reply_text(
+                "❌ *No auction state found.*\n\n"
+                "The bot restarted and could not recover the auction.\n\n"
+                "📌 *What to do:*\n"
+                "• If you have STATE\\_CHANNEL\\_ID set, make sure the bot is "
+                "Admin with *Pin Messages* permission in that channel.\n"
+                "• Otherwise, the database was wiped by Render — "
+                "you need to recreate the auction with /create\\_auction.",
+                parse_mode=ParseMode.MARKDOWN,
+            )
+            return
+
+    # Check if DB is wiped (auction_id restored from Telegram but DB gone)
+    ar = db.get_auction(live.auction_id)
+    db_missing = (ar is None)
 
     live.paused  = False
     live.active  = True
     live.chat_id = update.effective_chat.id
-    save_live_state()
 
+    # Update the chat_id in DB only if DB exists
+    if ar:
+        db.cx.execute("UPDATE auctions SET chat_id=? WHERE auction_id=?",
+                      (live.chat_id, live.auction_id))
+        db.cx.commit()
+
+    save_live_state()
     queued = len(live.player_queue)
+
+    if db_missing:
+        await update.message.reply_text(
+            f"⚠️ *Partial restore from Telegram channel*\n{'─'*28}\n"
+            f"🏏 *{md_safe(live.auction_name)}*\n\n"
+            f"State info recovered:\n"
+            f"✅ Sold: {live.sold_count} | ❌ Unsold: {live.unsold_count}\n\n"
+            f"⚠️ *Database was wiped by Render restart.*\n"
+            f"Players and participant data is lost — "
+            f"you need to recreate the auction.\n\n"
+            f"To prevent this in future: add a Render persistent disk ($1/month) "
+            f"and set DATABASE\\_PATH to point to it.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+
     await update.message.reply_text(
         f"▶️ *Auction RESUMED!*\n{'─'*28}\n"
         f"🏏 *{md_safe(live.auction_name)}*\n\n"
@@ -3281,6 +3296,160 @@ async def cmd_auto_next(update: Update, context: ContextTypes.DEFAULT_TYPE):
                                             parse_mode=ParseMode.MARKDOWN)
         except ValueError:
             await update.message.reply_text("Invalid.")
+
+
+async def cmd_dtime(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /dtime <seconds> — Set ALL timers at once.
+    /dtime show      — Show all current timer values.
+    """
+    await _reg(update.effective_user)
+    if not db.is_admin(update.effective_user.id):
+        await update.message.reply_text("Admin only.")
+        return
+
+    arg = (context.args[0].lower() if context.args else "show").rstrip("s")
+
+    if arg == "show" or not arg:
+        bid   = live.auto_sell_secs or Config.BID_TIMER
+        await update.message.reply_text(
+            f"⏱ *All Timer Settings*\n{'─'*28}\n"
+            f"🔨 /bidtimer — Bid Timer: *{bid}s*\n"
+            f"🛡 /antisnipe — Anti-Snipe Extension: *{Config.ANTI_SNIPE}s*\n"
+            f"🎴 /rtmwindow — RTM Window (post-SOLD): *{Config.RTM_OFFER_TIMER}s*\n"
+            f"⬆️ /rtmcounter — RTM Counter (raise window): *{Config.RTM_COUNTER_TIMER}s*\n"
+            f"✅ /rtmdecision — RTM Decision (YES/NO): *{Config.RTM_DECISION_TIMER}s*\n"
+            f"⏭ /autonext — Auto-Next Delay: *{live.auto_next_secs or 'off'}*\n\n"
+            f"Use /dtime <seconds> to set all at once.\n"
+            f"Or use individual commands above.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+
+    try:
+        secs = int(arg)
+        if secs < 5:
+            await update.message.reply_text("Minimum is 5 seconds.")
+            return
+    except ValueError:
+        await update.message.reply_text("Usage: /dtime <seconds>  e.g. /dtime 30")
+        return
+
+    Config.BID_TIMER          = secs
+    Config.RTM_OFFER_TIMER    = secs
+    Config.RTM_COUNTER_TIMER  = secs
+    Config.RTM_DECISION_TIMER = secs
+    Config.RTM_TIMER          = secs
+    live.auto_sell_secs       = secs
+
+    await update.message.reply_text(
+        f"✅ *All timers set to {secs}s*\n{'─'*28}\n"
+        f"🔨 Bid Timer: {secs}s\n"
+        f"🎴 RTM Window: {secs}s\n"
+        f"⬆️ RTM Counter: {secs}s\n"
+        f"✅ RTM Decision: {secs}s",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+
+
+async def cmd_bid_timer(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Set bid countdown timer."""
+    await _reg(update.effective_user)
+    if not db.is_admin(update.effective_user.id): return
+    if not context.args:
+        bid = live.auto_sell_secs or Config.BID_TIMER
+        await update.message.reply_text(f"🔨 Bid Timer: *{bid}s*\nUsage: /bidtimer <secs>",
+                                        parse_mode=ParseMode.MARKDOWN)
+        return
+    try:
+        secs = int(context.args[0].rstrip("s"))
+        if secs < 5: raise ValueError
+        Config.BID_TIMER    = secs
+        live.auto_sell_secs = secs
+        await update.message.reply_text(f"✅ Bid Timer: *{secs}s*", parse_mode=ParseMode.MARKDOWN)
+    except ValueError:
+        await update.message.reply_text("Usage: /bidtimer <seconds>  (min 5)")
+
+
+async def cmd_antisnipe(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Set anti-snipe extension."""
+    await _reg(update.effective_user)
+    if not db.is_admin(update.effective_user.id): return
+    if not context.args:
+        await update.message.reply_text(
+            f"🛡 Anti-Snipe: *{Config.ANTI_SNIPE}s*\n"
+            f"If a bid arrives in the last N seconds, timer resets to N.\n"
+            f"Usage: /antisnipe <secs>",
+            parse_mode=ParseMode.MARKDOWN)
+        return
+    try:
+        secs = int(context.args[0].rstrip("s"))
+        if secs < 3: raise ValueError
+        Config.ANTI_SNIPE = secs
+        await update.message.reply_text(f"✅ Anti-Snipe: *{secs}s*", parse_mode=ParseMode.MARKDOWN)
+    except ValueError:
+        await update.message.reply_text("Usage: /antisnipe <seconds>  (min 3)")
+
+
+async def cmd_rtm_window(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Set RTM silent window after SOLD."""
+    await _reg(update.effective_user)
+    if not db.is_admin(update.effective_user.id): return
+    if not context.args:
+        await update.message.reply_text(
+            f"🎴 RTM Window: *{Config.RTM_OFFER_TIMER}s*\n"
+            f"Silent window after SOLD — use /rtm within this time.\n"
+            f"Usage: /rtmwindow <secs>",
+            parse_mode=ParseMode.MARKDOWN)
+        return
+    try:
+        secs = int(context.args[0].rstrip("s"))
+        if secs < 5: raise ValueError
+        Config.RTM_OFFER_TIMER = secs
+        Config.RTM_TIMER       = secs
+        await update.message.reply_text(f"✅ RTM Window: *{secs}s*", parse_mode=ParseMode.MARKDOWN)
+    except ValueError:
+        await update.message.reply_text("Usage: /rtmwindow <seconds>  (min 5)")
+
+
+async def cmd_rtm_counter(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Set RTM counter window (how long original bidder has to raise)."""
+    await _reg(update.effective_user)
+    if not db.is_admin(update.effective_user.id): return
+    if not context.args:
+        await update.message.reply_text(
+            f"⬆️ RTM Counter: *{Config.RTM_COUNTER_TIMER}s*\n"
+            f"How long original bidder has to raise after /rtm is used.\n"
+            f"Usage: /rtmcounter <secs>",
+            parse_mode=ParseMode.MARKDOWN)
+        return
+    try:
+        secs = int(context.args[0].rstrip("s"))
+        if secs < 5: raise ValueError
+        Config.RTM_COUNTER_TIMER = secs
+        await update.message.reply_text(f"✅ RTM Counter: *{secs}s*", parse_mode=ParseMode.MARKDOWN)
+    except ValueError:
+        await update.message.reply_text("Usage: /rtmcounter <seconds>  (min 5)")
+
+
+async def cmd_rtm_decision(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Set RTM decision window (how long RTM team has to click YES/NO)."""
+    await _reg(update.effective_user)
+    if not db.is_admin(update.effective_user.id): return
+    if not context.args:
+        await update.message.reply_text(
+            f"✅ RTM Decision: *{Config.RTM_DECISION_TIMER}s*\n"
+            f"How long RTM team has to click YES or NO.\n"
+            f"Usage: /rtmdecision <secs>",
+            parse_mode=ParseMode.MARKDOWN)
+        return
+    try:
+        secs = int(context.args[0].rstrip("s"))
+        if secs < 5: raise ValueError
+        Config.RTM_DECISION_TIMER = secs
+        await update.message.reply_text(f"✅ RTM Decision: *{secs}s*", parse_mode=ParseMode.MARKDOWN)
+    except ValueError:
+        await update.message.reply_text("Usage: /rtmdecision <seconds>  (min 5)")
 
 
 # ── PLAYER MANAGEMENT ────────────────────────────────────
@@ -3804,6 +3973,14 @@ async def _handle_callback_inner(update, context, query, data, uid):
             db.add_to_squad(aid, orig_uid, pr["player_id"])
             db.record_bid(aid, orig_uid, pr["player_id"], pr["name"], orig_price, won=True)
 
+            # ✅ Refund the RTM card — team declined, card not consumed
+            db.cx.execute(
+                "UPDATE participants SET rtm_cards=rtm_cards+1"
+                " WHERE auction_id=? AND user_id=?", (aid, rtm_uid)
+            )
+            db.cx.commit()
+            logger.info(f"RTM card refunded to uid={rtm_uid} (declined)")
+
             orig_row = db.get_part(aid, orig_uid)
             rem      = orig_row["purse"] if orig_row else 0
             sq       = len(json.loads(orig_row["squad"])) if orig_row else 0
@@ -4032,6 +4209,12 @@ DOT_MAP = {
     "pauseauction": cmd_pause, "resumeauction": cmd_resume,
     "endauction": cmd_end_auction, "endsauction": cmd_end_auction,
     "autosell": cmd_auto_sell, "autonext": cmd_auto_next,
+    "dtime": cmd_dtime, "timers": cmd_dtime,
+    "bidtimer": cmd_bid_timer, "bidduration": cmd_bid_timer,
+    "antisnipe": cmd_antisnipe,
+    "rtmwindow": cmd_rtm_window,
+    "rtmcounter": cmd_rtm_counter,
+    "rtmdecision": cmd_rtm_decision,
     "leaderboard": cmd_leaderboard, "help": cmd_help,
     "mute": cmd_mute, "unmute": cmd_unmute,
     "setrtm": cmd_set_rtm,
@@ -4129,6 +4312,12 @@ def build_app() -> Application:
     app.add_handler(CommandHandler(["endauction","endsauction"], cmd_end_auction))
     app.add_handler(CommandHandler("autosell", cmd_auto_sell))
     app.add_handler(CommandHandler("autonext", cmd_auto_next))
+    app.add_handler(CommandHandler(["dtime","timers"], cmd_dtime))
+    app.add_handler(CommandHandler(["bidtimer","bidduration"], cmd_bid_timer))
+    app.add_handler(CommandHandler("antisnipe", cmd_antisnipe))
+    app.add_handler(CommandHandler("rtmwindow", cmd_rtm_window))
+    app.add_handler(CommandHandler("rtmcounter", cmd_rtm_counter))
+    app.add_handler(CommandHandler("rtmdecision", cmd_rtm_decision))
 
     # Admin: queue
     app.add_handler(CommandHandler(["addtoqueue","atq"], cmd_add_to_queue))
