@@ -1468,19 +1468,16 @@ async def process_bid(update, context: ContextTypes.DEFAULT_TYPE,
         row_caller = db.get_part(aid, uid)
         your_name  = team_display(row_caller) if row_caller else str(uid)
         if uid == live.rtm_team_id:
-            secs_left = max(0, int((live.timer_ends_at or 0) - _time.time()))
-            await err(
-                rtm_wait_decision_text(
-                    live.rtm_team_name,
-                    live.rtm_counter_bid if live.rtm_counter_bid else live.rtm_orig_bid,
-                    live.rtm_orig_bid,
-                    live.rtm_orig_bidder_name,
-                    secs_left,
-                ),
-                md_v2=True,
-            )
+            secs_left = max(0, int((live.rtm_counter_ends_at or 0) - _time.time()))
+            await err(rtm_wait_decision_text(
+                live.rtm_team_name,
+                live.rtm_counter_bid if live.rtm_counter_bid else live.rtm_orig_bid,
+                live.rtm_orig_bid,
+                live.rtm_orig_bidder_name,
+                secs_left,
+            ))
         else:
-            await err(rtm_raise_error_text(live.rtm_orig_bidder_name, your_name), md_v2=True)
+            await err(rtm_raise_error_text(live.rtm_orig_bidder_name, your_name))
         return
 
     # In RTM_COUNTER — RTM team must use YES/NO buttons, not /bid
@@ -1488,16 +1485,13 @@ async def process_bid(update, context: ContextTypes.DEFAULT_TYPE,
         row_caller = db.get_part(aid, uid)
         your_name  = team_display(row_caller) if row_caller else str(uid)
         if uid == live.rtm_team_id:
-            secs_left = max(0, int((live.timer_ends_at or 0) - _time.time()))
-            await err(
-                rtm_wait_decision_text(
-                    live.rtm_team_name, live.rtm_counter_bid,
-                    live.rtm_orig_bid, live.rtm_orig_bidder_name, secs_left,
-                ),
-                md_v2=True,
-            )
+            secs_left = max(0, int((live.rtm_decision_ends_at or 0) - _time.time()))
+            await err(rtm_wait_decision_text(
+                live.rtm_team_name, live.rtm_counter_bid,
+                live.rtm_orig_bid, live.rtm_orig_bidder_name, secs_left,
+            ))
         else:
-            await err(rtm_raise_error_text(live.rtm_orig_bidder_name, your_name), md_v2=True)
+            await err(rtm_raise_error_text(live.rtm_orig_bidder_name, your_name))
         return
 
     pr = db.get_player(live.current_player_id)
@@ -1538,10 +1532,10 @@ async def process_bid(update, context: ContextTypes.DEFAULT_TYPE,
         live.timer_task = asyncio.create_task(_rtm_decision_timer(context))
 
         if update.callback_query:
-            await update.callback_query.answer(f"Bid raised to ₹{_cr(bid_l)}Cr!")
+            await update.callback_query.answer(f"Bid raised to {fmt(bid_l, aid)}!")
         else:
             await update.message.reply_text(
-                f"⬆️ Bid raised to *₹{_cr(bid_l)}Cr* — "
+                f"⬆️ Bid raised to *{fmt(bid_l, aid)}* — "
                 f"waiting for *{live.rtm_team_name}* to decide!",
                 parse_mode=ParseMode.MARKDOWN,
             )
@@ -1555,8 +1549,15 @@ async def process_bid(update, context: ContextTypes.DEFAULT_TYPE,
 
     db.record_bid(aid, uid, pr["player_id"], pr["name"], bid_l, won=False)
 
-    if live.timer_task is None or live.timer_task.done():
-        live.timer_task = asyncio.create_task(bid_timer(context))
+    # Cancel existing timer and start fresh — every bid resets to full duration
+    if live.timer_task and not live.timer_task.done():
+        live.timer_task.cancel()
+        try:
+            await asyncio.shield(asyncio.sleep(0))  # yield so cancel propagates
+        except Exception:
+            pass
+    live.timer_ends_at = None
+    live.timer_task = asyncio.create_task(bid_timer(context))
 
     duration = live.auto_sell_secs or Config.BID_TIMER
     outbid   = f"⬆️ Outbids: {prev_name}" if prev_name and prev_name != bid_display(part) else "🎯 Opening bid!"
