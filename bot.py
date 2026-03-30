@@ -574,52 +574,77 @@ def save_live_state():
 def restore_live_state():
     """Restore live state from DB after restart. Call once at startup."""
     import json as _json
+
+    # First try the saved JSON snapshot
     raw = db.get_setting("live_state")
-    if not raw:
-        return False
+    if raw:
+        try:
+            state = _json.loads(raw)
+            aid = state.get("auction_id")
+            if aid:
+                ar = db.get_auction(aid)
+                if ar and ar["status"] in ("active", "registration"):
+                    live.auction_id   = aid
+                    live.auction_name = state.get("auction_name", ar["name"])
+                    live.chat_id      = state.get("chat_id")
+                    live.active       = state.get("active", True)
+                    live.paused       = state.get("paused", False)
+                    live.sold_count   = state.get("sold_count", 0)
+                    live.unsold_count = state.get("unsold_count", 0)
+                    live.set_number   = state.get("set_number", 1)
+                    live.auto_sell_secs = state.get("auto_sell_secs")
+                    live.auto_next_secs = state.get("auto_next_secs")
+                    live.auto_next_on   = state.get("auto_next_on", False)
+
+                    # Restore queue from saved player_ids
+                    pids = state.get("player_queue", [])
+                    live.player_queue = []
+                    for pid in pids:
+                        row = db.get_player(int(pid))
+                        if row and row["status"] == "available":
+                            live.player_queue.append(row)
+
+                    # If queue empty, rebuild from DB
+                    if not live.player_queue:
+                        live.player_queue = list(db.get_available(aid))
+
+                    logger.info(
+                        f"State restored from snapshot: auction={live.auction_name}, "
+                        f"active={live.active}, paused={live.paused}, "
+                        f"queue={len(live.player_queue)}, sold={live.sold_count}"
+                    )
+                    return True
+        except Exception as e:
+            logger.error(f"restore_live_state snapshot failed: {e}", exc_info=True)
+
+    # Fallback: find most recent active auction directly in DB
     try:
-        state = _json.loads(raw)
-        aid = state.get("auction_id")
-        if not aid:
+        ar = db.cx.execute(
+            "SELECT * FROM auctions WHERE status='active' ORDER BY auction_id DESC LIMIT 1"
+        ).fetchone()
+        if not ar:
             return False
-        # Verify auction still exists and is active in DB
-        ar = db.get_auction(aid)
-        if not ar or ar["status"] not in ("active", "registration"):
-            return False
+
+        aid = ar["auction_id"]
+        sold_c   = db.cx.execute("SELECT COUNT(*) c FROM players WHERE auction_id=? AND status='sold'",   (aid,)).fetchone()
+        unsold_c = db.cx.execute("SELECT COUNT(*) c FROM players WHERE auction_id=? AND status='unsold'", (aid,)).fetchone()
 
         live.auction_id   = aid
-        live.auction_name = state.get("auction_name", ar["name"])
-        live.chat_id      = state.get("chat_id")
-        live.active       = state.get("active", False)
-        live.paused       = state.get("paused", False)
-        live.sold_count   = state.get("sold_count", 0)
-        live.unsold_count = state.get("unsold_count", 0)
-        live.set_number   = state.get("set_number", 1)
-        live.auto_sell_secs  = state.get("auto_sell_secs")
-        live.auto_next_secs  = state.get("auto_next_secs")
-        live.auto_next_on    = state.get("auto_next_on", False)
-
-        # Restore player queue from stored player_ids
-        pids = state.get("player_queue", [])
-        live.player_queue = []
-        for pid in pids:
-            row = db.get_player(int(pid))
-            if row and row["status"] == "available":
-                live.player_queue.append(row)
-
-        # If queue is empty, rebuild from available players
-        if not live.player_queue and live.active:
-            available = db.get_available(aid)
-            live.player_queue = list(available)
+        live.auction_name = ar["name"]
+        live.chat_id      = ar["chat_id"]
+        live.active       = True
+        live.paused       = True   # Safe default after restart — admin must /resumeauction
+        live.sold_count   = sold_c["c"]   if sold_c   else 0
+        live.unsold_count = unsold_c["c"] if unsold_c else 0
+        live.player_queue = list(db.get_available(aid))
 
         logger.info(
-            f"State restored: auction={live.auction_name}, "
-            f"active={live.active}, queue={len(live.player_queue)}, "
-            f"sold={live.sold_count}"
+            f"State recovered from DB (no snapshot): auction={live.auction_name}, "
+            f"queue={len(live.player_queue)}, sold={live.sold_count}"
         )
         return True
     except Exception as e:
-        logger.error(f"restore_live_state failed: {e}", exc_info=True)
+        logger.error(f"restore_live_state DB fallback failed: {e}", exc_info=True)
         return False
 
 
@@ -705,11 +730,14 @@ def norm_nat(n: str) -> str:
 
 
 def jump_link(chat_id: int, msg_id: int) -> str:
-    """Build a t.me jump link for group messages."""
-    if chat_id < 0:
-        cid = str(chat_id).replace("-100", "")
-        return f"https://t.me/c/{cid}/{msg_id}"
-    return f"https://t.me/c/{chat_id}/{msg_id}"
+    """Build a t.me/c jump link for group/supergroup messages."""
+    cid = str(chat_id)
+    # Supergroup IDs start with -100; strip the leading minus and '100'
+    if cid.startswith("-100"):
+        cid = cid[4:]
+    elif cid.startswith("-"):
+        cid = cid[1:]
+    return f"https://t.me/c/{cid}/{msg_id}"
 
 
 def team_display(row) -> str:
@@ -1955,6 +1983,10 @@ async def cmd_squad(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _reg(update.effective_user)
 
+    # Auto-restore if bot restarted and lost live state
+    if not live.auction_id:
+        restore_live_state()
+
     if not live.auction_id:
         await update.message.reply_text("No auction session. Use /create\\_auction to start.",
                                         parse_mode=ParseMode.MARKDOWN)
@@ -2229,43 +2261,47 @@ async def cmd_sold_players(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("No players sold yet.")
         return
 
-    lines = [f"✅ *Sold Players* ({len(sold)})\n{'─'*28}"]
-    for p in sold:
-        buyer = db.get_part(aid, p["sold_to"]) if p["sold_to"] else None
-        buyer_name = team_display(buyer) if buyer else "?"
-        price_str  = fmt(p["sold_price"], aid) if p["sold_price"] else "?"
+    header = f"✅ *Sold Players* ({len(sold)})\n{'─'*28}"
+    lines  = [header]
 
-        jump = ""
+    for i, p in enumerate(sold, 1):
+        buyer      = db.get_part(aid, p["sold_to"]) if p["sold_to"] else None
+        buyer_name = md_safe(team_display(buyer)) if buyer else "?"
+        price_str  = md_safe(fmt(p["sold_price"], aid)) if p["sold_price"] else "?"
+        pname      = md_safe(p["name"])
+
+        # Build jump link if we have the message reference
         if p["sold_msg_id"] and p["sold_chat_id"]:
             link = jump_link(p["sold_chat_id"], p["sold_msg_id"])
-            jump = f"  [↗️ Jump]({link})"
+            # Use plain URL in parentheses — works even if Markdown inline links fail
+            line = f"{i}. *{pname}* → {buyer_name} — *{price_str}*\n   [↗️ Jump to message]({link})"
+        else:
+            line = f"{i}. *{pname}* → {buyer_name} — *{price_str}*"
 
-        lines.append(
-            f"• *{p['name']}* → {buyer_name} — *{price_str}*{jump}"
-        )
+        lines.append(line)
 
-    # Telegram message limit: split if too long
-    text  = "\n".join(lines)
-    if len(text) > 3800:
-        chunk = lines[:1]
-        for line in lines[1:]:
-            if len("\n".join(chunk + [line])) > 3800:
-                await update.message.reply_text(
-                    "\n".join(chunk), parse_mode=ParseMode.MARKDOWN,
-                    disable_web_page_preview=True
-                )
-                chunk = [line]
-            else:
-                chunk.append(line)
-        if chunk:
+    async def _send_chunk(chunk_lines: list):
+        text = "\n".join(chunk_lines)
+        try:
             await update.message.reply_text(
-                "\n".join(chunk), parse_mode=ParseMode.MARKDOWN,
+                text, parse_mode=ParseMode.MARKDOWN,
                 disable_web_page_preview=True
             )
-    else:
-        await update.message.reply_text(
-            text, parse_mode=ParseMode.MARKDOWN, disable_web_page_preview=True
-        )
+        except Exception:
+            # Fallback: strip Markdown if parse fails
+            plain = text.replace("*", "").replace("_", "").replace("\\", "")
+            await update.message.reply_text(plain, disable_web_page_preview=True)
+
+    # Split into chunks ≤ 3500 chars
+    chunk: list = []
+    for line in lines:
+        if chunk and len("\n".join(chunk + [line])) > 3500:
+            await _send_chunk(chunk)
+            chunk = [line]
+        else:
+            chunk.append(line)
+    if chunk:
+        await _send_chunk(chunk)
 
 
 # ── FORCE AUCTION ─────────────────────────────────────────
@@ -2858,18 +2894,54 @@ async def cmd_pause(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_resume(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _reg(update.effective_user)
-    if not db.is_admin(update.effective_user.id): return
-    if not live.auction_id:
-        await update.message.reply_text("No active auction to resume.")
+    if not db.is_admin(update.effective_user.id):
         return
-    live.paused = False
-    live.active = True
+
+    # If live state is gone (e.g. bot restarted), try to restore it
+    if not live.auction_id:
+        restored = restore_live_state()
+        if not restored:
+            # Last resort: find the most recent active auction in DB
+            ar = db.cx.execute(
+                "SELECT * FROM auctions WHERE status='active' ORDER BY auction_id DESC LIMIT 1"
+            ).fetchone()
+            if ar:
+                live.auction_id   = ar["auction_id"]
+                live.auction_name = ar["name"]
+                live.active       = True
+                live.paused       = True
+                available = db.get_available(ar["auction_id"])
+                live.player_queue = list(available)
+                sold_c = db.cx.execute(
+                    "SELECT COUNT(*) c FROM players WHERE auction_id=? AND status='sold'",
+                    (ar["auction_id"],)
+                ).fetchone()
+                unsold_c = db.cx.execute(
+                    "SELECT COUNT(*) c FROM players WHERE auction_id=? AND status='unsold'",
+                    (ar["auction_id"],)
+                ).fetchone()
+                live.sold_count   = sold_c["c"] if sold_c else 0
+                live.unsold_count = unsold_c["c"] if unsold_c else 0
+                logger.info(f"Resume: recovered auction {ar['name']} from DB")
+            else:
+                await update.message.reply_text(
+                    "❌ No active auction found in database.\n"
+                    "Use /create\\_auction to start a new one.",
+                    parse_mode=ParseMode.MARKDOWN,
+                )
+                return
+
+    live.paused  = False
+    live.active  = True
     live.chat_id = update.effective_chat.id
     save_live_state()
+
     queued = len(live.player_queue)
     await update.message.reply_text(
-        f"▶️ *Auction RESUMED!*\n"
-        f"Sold: {live.sold_count} | Unsold: {live.unsold_count} | Queue: {queued}\n"
+        f"▶️ *Auction RESUMED!*\n{'─'*28}\n"
+        f"🏏 *{md_safe(live.auction_name)}*\n\n"
+        f"✅ Sold: {live.sold_count} | ❌ Unsold: {live.unsold_count}\n"
+        f"📋 Queue: {queued} players remaining\n\n"
         f"Use /next to continue.",
         parse_mode=ParseMode.MARKDOWN,
     )
