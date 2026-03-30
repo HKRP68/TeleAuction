@@ -99,17 +99,9 @@ class LiveState:
     rtm_orig_bid: int          = 0
     rtm_counter_bid: int       = 0
     rtm_msg_id: Optional[int]  = None
-    rtm_offer_msg_id: Optional[int] = None
-    rtm_counter_ends_at: Optional[float] = None
-    rtm_decision_ends_at: Optional[float] = None
-
-    # Post-SOLD RTM window: holds finalized sale data while 10s RTM window is open
-    rtm_window_task: Optional[asyncio.Task] = None
-    rtm_window_open: bool      = False       # True = 10s window is running
-    rtm_window_player_id: Optional[int] = None  # player that was just sold
-    rtm_window_winner_id: Optional[int] = None  # who won the normal sale
-    rtm_window_winner_name: str= ""
-    rtm_window_price: int      = 0
+    rtm_offer_msg_id: Optional[int] = None   # message with RTM check after timer
+    rtm_counter_ends_at: Optional[float] = None   # when counter window expires
+    rtm_decision_ends_at: Optional[float] = None  # when decision window expires
 
     # ReAuction (no expiry — cleared only when next player starts)
     last_sold_pid: Optional[int]   = None
@@ -571,30 +563,18 @@ def fmt(lakhs: int, aid: Optional[int] = None) -> str:
 
 
 def parse_price(s: str) -> Optional[int]:
-    """
-    Convert bid string to Lakhs integer.
-    Rules:
-      /bid 19    → 19 crore  → 1900 L
-      /bid 0.9   → 0.9 crore → 90 L
-      /bid 19cr  → 19 crore  → 1900 L
-      /bid 50l   → 50 lakhs  → 50 L
-      /bid 150   → 150 crore → 15000 L (bare integers = crore)
-    """
     s = s.strip().lower().replace(" ", "")
     try:
-        if s.endswith("cr"):
-            return int(round(float(s[:-2]) * 100))
-        if s.endswith("l"):
-            return int(round(float(s[:-1])))
-        # Bare number — treat as crore
-        val = float(s)
-        return int(round(val * 100))
+        if s.endswith("cr"): return int(float(s[:-2]) * 100)
+        if s.endswith("l"):  return int(float(s[:-1]))
+        return int(s)
     except ValueError:
         return None
 
 
 def ist_now() -> str:
-    """Return current time in IST (UTC+5:30) as HH:MM:SS string."""
+    """Current time in IST (UTC+5:30) formatted as 12-hour clock."""
+    import datetime
     utc = datetime.datetime.utcnow()
     ist = utc + datetime.timedelta(hours=5, minutes=30)
     return ist.strftime("%I:%M:%S %p IST")
@@ -804,7 +784,8 @@ def rtm_bid_raised_text(player_row, new_bid: int) -> str:
 def rtm_accepted_text(player_row, final_price: int, winner_name: str,
                       remaining_purse: int, squad_count: int,
                       original_team: str) -> str:
-    ts  = ist_now()
+    import datetime
+    ts  = datetime.datetime.now().strftime("%H:%M:%S")
     ipl = player_row["ipl_team"] or "N/A"
     return (
         f"✅ *RTM ACCEPTED \\- PLAYER SOLD\\!*\n"
@@ -826,7 +807,8 @@ def rtm_accepted_text(player_row, final_price: int, winner_name: str,
 def rtm_declined_text(player_row, original_bid: int, original_team: str,
                       remaining_purse: int, squad_count: int,
                       rtm_team: str) -> str:
-    ts  = ist_now()
+    import datetime
+    ts  = datetime.datetime.now().strftime("%H:%M:%S")
     ipl = player_row["ipl_team"] or "N/A"
     return (
         f"❌ *RTM DECLINED \\- ORIGINAL SALE\\!*\n"
@@ -953,19 +935,20 @@ def reauction_confirm_keyboard() -> InlineKeyboardMarkup:
 # ─────────────────────────────────────────────────────────
 async def bid_timer(context: ContextTypes.DEFAULT_TYPE):
     """
-    Smart countdown timer:
-    • Cancels + restarts on every new bid (full duration reset).
-    • At half-time (BidTimer/2) remaining → sends ⏱ Xs LEFT! warning.
-    • At 3s, 2s, 1s → sends one message per second with urgency text.
-    • Fires SOLD / UNSOLD on expiry.
+    Countdown timer — 1s ticks.
+    • Resets fully on every new bid (task cancelled + restarted in process_bid).
+    • Half-time: sends one warning message.
+    • Final 3-2-1: sends one new message per second.
+    • On expiry: calls _mark_unsold or _check_rtm.
+    • Fully wrapped in try/except — crashes are logged, SOLD still fires.
     """
     try:
         duration          = live.auto_sell_secs or Config.BID_TIMER
-        half              = max(3, duration // 2)   # warning threshold
+        half              = max(3, duration // 2)
         end               = _time.time() + duration
         live.timer_ends_at = end
 
-        half_sent = False   # send the half-time warning only once per run
+        half_sent = False
 
         while True:
             await asyncio.sleep(1)
@@ -983,42 +966,49 @@ async def bid_timer(context: ContextTypes.DEFAULT_TYPE):
             if not pr:
                 return
 
+            aid    = pr["auction_id"]
             pname  = pr["name"]
-            bid_s  = fmt(live.current_bid, live.auction_id) if live.current_bid > 0 else fmt(pr["base_price"], pr["auction_id"])
+            bid_s  = fmt(live.current_bid, aid) if live.current_bid > 0 else fmt(pr["base_price"], aid)
             leader = live.highest_bidder_name or "None"
 
-            # ── 3-2-1 countdown messages ──────────────────
+            # ── 3-2-1 countdown ───────────────────────────
             if remaining <= 3:
                 urgency = {3: "Hurry! Final bids!", 2: "Last chance!", 1: "CLOSING NOW!"}
-                await context.bot.send_message(
-                    chat_id=live.chat_id,
-                    text=(
-                        f"⏱️ *{remaining} SECOND{'S' if remaining > 1 else ''} LEFT!*\n"
-                        f"{'═'*20}\n\n"
-                        f"🏏 {pname}\n"
-                        f"💰 Current: *{bid_s}* — {leader}\n\n"
-                        f"_{urgency.get(remaining, '')}_"
-                    ),
-                    parse_mode=ParseMode.MARKDOWN,
-                )
+                try:
+                    await context.bot.send_message(
+                        chat_id=live.chat_id,
+                        text=(
+                            f"⏱️ *{remaining} SECOND{'S' if remaining > 1 else ''} LEFT!*\n"
+                            f"{'═'*20}\n\n"
+                            f"🏏 {pname}\n"
+                            f"💰 Current: *{bid_s}* — {leader}\n\n"
+                            f"_{urgency.get(remaining, '')}_"
+                        ),
+                        parse_mode=ParseMode.MARKDOWN,
+                    )
+                except Exception:
+                    pass
                 continue  # sleep 1s then next tick
 
-            # ── Half-time warning (sent once) ─────────────
+            # ── Half-time warning (once per run) ──────────
             if not half_sent and remaining <= half:
                 half_sent = True
-                await context.bot.send_message(
-                    chat_id=live.chat_id,
-                    text=(
-                        f"⏱️ *{remaining} SECONDS LEFT!*\n"
-                        f"{'═'*20}\n\n"
-                        f"🏏 {pname}\n"
-                        f"💰 Current: *{bid_s}* — {leader}\n\n"
-                        f"{'Raise your bid now!' if live.current_bid > 0 else 'No bids yet — open bidding!'}"
-                    ),
-                    parse_mode=ParseMode.MARKDOWN,
-                )
+                try:
+                    await context.bot.send_message(
+                        chat_id=live.chat_id,
+                        text=(
+                            f"⏱️ *{remaining} SECONDS LEFT!*\n"
+                            f"{'═'*20}\n\n"
+                            f"🏏 {pname}\n"
+                            f"💰 Current: *{bid_s}* — {leader}\n\n"
+                            f"{'Raise your bid now!' if live.current_bid > 0 else 'No bids yet — open bidding!'}"
+                        ),
+                        parse_mode=ParseMode.MARKDOWN,
+                    )
+                except Exception:
+                    pass
 
-            # ── Edit the live bid message every 5s ────────
+            # ── Edit bid message every 5s ──────────────────
             if remaining % 5 == 0 and live.last_bid_msg_id:
                 try:
                     await context.bot.edit_message_text(
@@ -1040,15 +1030,19 @@ async def bid_timer(context: ContextTypes.DEFAULT_TYPE):
         if not pr:
             return
 
+        # Small delay so last countdown message renders before SOLD
+        await asyncio.sleep(0.5)
+
         if live.current_bid == 0:
             await _mark_unsold(context, pr)
         else:
             await _check_rtm(context, pr)
 
     except asyncio.CancelledError:
-        raise   # Normal — new bid cancelled this task, it will restart fresh
+        raise   # Expected — new bid resets the timer
     except Exception as exc:
         logger.error(f"bid_timer CRASHED: {exc}", exc_info=True)
+        # Safety fallback — always try to finalize
         try:
             if live.current_player_id and live.active:
                 pr = db.get_player(live.current_player_id)
@@ -1074,167 +1068,69 @@ async def _mark_unsold(context: ContextTypes.DEFAULT_TYPE, pr):
         reply_markup=reauction_keyboard(),
     )
     live.reauction_msg_id = msg.message_id
-    asyncio.create_task(_plain_sold_cleanup(context))
+    await _try_auto_next(context)
 
 
 async def _check_rtm(context: ContextTypes.DEFAULT_TYPE, pr):
     """
-    Called when bid timer expires with a bid.
-    Finalizes the sale immediately (Team B wins), then opens a silent
-    10-second window. If any eligible RTM team uses /rtm within that
-    window, the sale is reversed and RTM flow begins.
-    If the window expires with no RTM → auto-next fires.
+    STEP 1 — After bid timer expires with a bid.
+    Checks for eligible RTM teams matching the player's ipl_team.
+    If found → sends RTM CHECK message and opens 30s offer window.
+    If none  → finalizes immediately.
     """
     ipl_team = pr.get("ipl_team", "") or ""
     eligible = get_rtm_eligible(live.auction_id, live.highest_bidder_id, ipl_team)
 
-    # ── Finalize the normal sale right now ────────────────
-    aid         = live.auction_id
-    winner_id   = live.highest_bidder_id
-    winner_name = live.highest_bidder_name
-    sale_price  = live.current_bid
-
-    db.set_player_status(pr["player_id"], "sold", winner_id, sale_price, None, live.chat_id)
-    db.deduct_purse(aid, winner_id, sale_price)
-    db.add_to_squad(aid, winner_id, pr["player_id"])
-    db.record_bid(aid, winner_id, pr["player_id"], pr["name"], sale_price, won=True)
-
-    winner_row   = db.get_part(aid, winner_id)
-    remaining    = winner_row["purse"] if winner_row else 0
-    sq_count     = len(json.loads(winner_row["squad"])) if winner_row else 0
-    total_spent  = winner_row["total_spent"] if winner_row else 0
-    winner_uname = winner_row["username"] if winner_row else ""
-    winner_at    = f"(@{winner_uname})" if winner_uname else ""
-
-    ts = ist_now()
-    sold_text = (
-        f"✅ *SOLD!* ✅\n"
-        f"{'═'*20}\n\n"
-        f"🏏 *{flag(pr['nationality'])} {pr['name']}*\n"
-        f"🎯 {pr['role']} | {pr['nationality']}\n\n"
-        f"💰 *{fmt(sale_price, aid)}*\n"
-        f"🏆 *{winner_name}* {winner_at}\n\n"
-        f"📊 Stats:\n"
-        f"• Purse Remaining: {fmt(remaining, aid)}\n"
-        f"• Players Bought: {sq_count}/25\n"
-        f"• Total Spent: {fmt(total_spent, aid)}\n\n"
-        f"⏰ Sold at: {ts}"
-    )
-
-    # Add RTM hint if eligible teams exist
-    if eligible:
-        names = ", ".join(f"*{team_display(r)}*" for r in eligible)
-        sold_text += f"\n\n🎴 RTM available for: {names}\n⏱ {Config.RTM_OFFER_TIMER}s window..."
-
-    msg = await context.bot.send_message(
-        chat_id=live.chat_id,
-        text=sold_text,
-        parse_mode=ParseMode.MARKDOWN,
-        reply_markup=reauction_keyboard(),
-    )
-
-    # Save sold msg id
-    db.cx.execute(
-        "UPDATE players SET sold_msg_id=?, sold_chat_id=? WHERE player_id=?",
-        (msg.message_id, live.chat_id, pr["player_id"]),
-    )
-    db.cx.commit()
-
-    live.sold_count        += 1
-    live.reauction_msg_id   = msg.message_id
-    _set_last_sold(pr["player_id"], pr["name"], winner_id, winner_name, sale_price)
-
-    # Reset main bidding state
-    live.current_player_id   = None
-    live.current_bid         = 0
-    live.highest_bidder_id   = None
-    live.highest_bidder_name = ""
-
     if not eligible:
-        # No RTM possible — schedule button removal after 10s then auto-next
-        asyncio.create_task(_plain_sold_cleanup(context))
+        await _finalize(context, pr)
         return
 
-    # ── Open 10s RTM window ───────────────────────────────
-    live.rtm_window_open        = True
-    live.rtm_window_player_id   = pr["player_id"]
-    live.rtm_window_winner_id   = winner_id
-    live.rtm_window_winner_name = winner_name
-    live.rtm_window_price       = sale_price
-    live.rtm_state              = RTM_OFFERED
-
-    live.rtm_window_task = asyncio.create_task(
-        _rtm_window_timer(context, pr["player_id"])
+    live.rtm_state = RTM_OFFERED
+    msg = await context.bot.send_message(
+        chat_id=live.chat_id,
+        text=rtm_check_text(pr, eligible),
+        parse_mode=ParseMode.MARKDOWN,
     )
-
-
-async def _plain_sold_cleanup(context: ContextTypes.DEFAULT_TYPE):
-    """
-    For normal sales with no RTM eligible teams:
-    wait 10s, remove the ReAuction button, then fire auto-next.
-    """
-    await asyncio.sleep(10)
-    await _remove_reauction_button(context)
-    await _try_auto_next(context)
-
-
-async def _rtm_window_timer(context: ContextTypes.DEFAULT_TYPE, player_id: int):
-    """
-    Silent 10-second window after SOLD.
-    If /rtm is used → task is cancelled by _handle_rtm_use.
-    If it runs out → close window, remove ReAuction button, fire auto-next.
-    """
-    try:
-        await asyncio.sleep(Config.RTM_OFFER_TIMER)
-    except asyncio.CancelledError:
-        return  # RTM was used — _handle_rtm_use takes over
-
-    # Window expired with no RTM
-    if live.rtm_state == RTM_OFFERED and live.rtm_window_open:
-        live.rtm_window_open       = False
-        live.rtm_state             = RTM_NONE
-        live.rtm_window_player_id  = None
-        live.rtm_window_winner_id  = None
-        live.rtm_window_winner_name= ""
-        live.rtm_window_price      = 0
-        # Remove the ReAuction button from the SOLD message
-        await _remove_reauction_button(context)
-        await _try_auto_next(context)
-
-
-async def _remove_reauction_button(context: ContextTypes.DEFAULT_TYPE):
-    """Remove the ReAuction inline button after the 10s window expires."""
-    if live.reauction_msg_id and live.chat_id:
-        try:
-            await context.bot.edit_message_reply_markup(
-                chat_id=live.chat_id,
-                message_id=live.reauction_msg_id,
-                reply_markup=None,
-            )
-        except Exception:
-            pass  # Message too old or already edited — fine
+    live.rtm_offer_msg_id = msg.message_id
+    live.timer_task = asyncio.create_task(_rtm_offer_timer(context))
 
 
 async def _rtm_offer_timer(context: ContextTypes.DEFAULT_TYPE):
-    """Legacy name — delegates to _rtm_window_timer. Kept for compatibility."""
-    pass
+    """Wait RTM_OFFER_TIMER (30s) for an eligible team to use /rtm, then finalize."""
+    end = _time.time() + Config.RTM_OFFER_TIMER
+    while _time.time() < end:
+        await asyncio.sleep(1)
+        if live.rtm_state != RTM_OFFERED:
+            return  # Someone acted on it
+    if live.rtm_state == RTM_OFFERED:
+        live.rtm_state = RTM_NONE
+        await context.bot.send_message(
+            chat_id=live.chat_id,
+            text=(
+                f"⏰ RTM window expired\\. "
+                f"*{live.highest_bidder_name}* wins the player\\!"
+            ),
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        pr = db.get_player(live.current_player_id) if live.current_player_id else None
+        if pr:
+            await _finalize(context, pr)
 
 
 async def _rtm_counter_timer(context: ContextTypes.DEFAULT_TYPE):
     """
-    Waits RTM_COUNTER_TIMER seconds for the original bidder to raise.
-    If no raise → RTM team wins at original price.
+    STEP 5 path — Wait RTM_COUNTER_TIMER (20s) for original bidder to raise.
+    If no raise → RTM team wins at original bid (STEP 5 message).
     """
     end = _time.time() + Config.RTM_COUNTER_TIMER
     live.rtm_counter_ends_at = end
     while _time.time() < end:
         await asyncio.sleep(1)
         if live.rtm_state != RTM_ACTIVE:
-            return
+            return  # Bidder countered — state moved on
     if live.rtm_state != RTM_ACTIVE:
         return
-
-    # No raise — RTM team wins at original bid
+    # No raise — RTM team wins
     live.rtm_state           = RTM_NONE
     live.current_bid         = live.rtm_orig_bid
     live.highest_bidder_id   = live.rtm_team_id
@@ -1244,32 +1140,30 @@ async def _rtm_counter_timer(context: ContextTypes.DEFAULT_TYPE):
     if not pr:
         return
 
-    rtm_row    = db.get_part(live.auction_id, live.rtm_team_id)
+    # Fetch RTM team cards remaining (already deducted when /rtm was used)
+    rtm_row   = db.get_part(live.auction_id, live.rtm_team_id)
     cards_left = rtm_row["rtm_cards"] if rtm_row else 0
-    sq_count   = len(json.loads(rtm_row["squad"])) + 1 if rtm_row else 0
+    sq_count   = len(json.loads(rtm_row["squad"])) + 1 if rtm_row else 0  # +1 after acquire
 
     await context.bot.send_message(
         chat_id=live.chat_id,
         text=rtm_no_raise_text(
             pr,
-            orig_bid       = live.rtm_orig_bid,
-            rtm_team       = live.rtm_team_name,
-            rtm_cards_left = cards_left,
-            squad_count    = sq_count,
-            original_team  = live.rtm_orig_bidder_name,
+            orig_bid      = live.rtm_orig_bid,
+            rtm_team      = live.rtm_team_name,
+            rtm_cards_left= cards_left,
+            squad_count   = sq_count,
+            original_team = live.rtm_orig_bidder_name,
         ),
         parse_mode=ParseMode.MARKDOWN,
     )
-    await _finalize_rtm(context, pr, winner_id=live.rtm_team_id,
-                        winner_name=live.rtm_team_name,
-                        final_price=live.rtm_orig_bid,
-                        rtm_accepted=True, rtm_no_raise=True)
+    await _finalize(context, pr, rtm_accepted=True, rtm_no_raise=True)
 
 
 async def _rtm_decision_timer(context: ContextTypes.DEFAULT_TYPE):
     """
-    Waits RTM_DECISION_TIMER seconds for RTM team to click YES/NO.
-    If no action → auto-decline: original bidder wins.
+    Auto-decline timer — waits RTM_DECISION_TIMER (15s) for RTM team YES/NO.
+    If no action → auto-decline: original bidder wins at original bid.
     """
     end = _time.time() + Config.RTM_DECISION_TIMER
     live.rtm_decision_ends_at = end
@@ -1279,9 +1173,11 @@ async def _rtm_decision_timer(context: ContextTypes.DEFAULT_TYPE):
             return
     if live.rtm_state != RTM_COUNTER:
         return
-
     # Auto-decline
-    live.rtm_state = RTM_NONE
+    live.rtm_state           = RTM_NONE
+    live.current_bid         = live.rtm_orig_bid
+    live.highest_bidder_id   = live.rtm_orig_bidder_id
+    live.highest_bidder_name = live.rtm_orig_bidder_name
 
     pr = db.get_player(live.current_player_id)
     if not pr:
@@ -1295,19 +1191,15 @@ async def _rtm_decision_timer(context: ContextTypes.DEFAULT_TYPE):
         chat_id=live.chat_id,
         text=rtm_declined_text(
             pr,
-            original_bid    = live.rtm_orig_bid,
-            original_team   = live.rtm_orig_bidder_name,
-            remaining_purse = remaining,
-            squad_count     = sq_count,
-            rtm_team        = live.rtm_team_name,
+            original_bid   = live.rtm_orig_bid,
+            original_team  = live.rtm_orig_bidder_name,
+            remaining_purse= remaining,
+            squad_count    = sq_count,
+            rtm_team       = live.rtm_team_name,
         ),
         parse_mode=ParseMode.MARKDOWN,
     )
-    await _finalize_rtm(context, pr,
-                        winner_id=live.rtm_orig_bidder_id,
-                        winner_name=live.rtm_orig_bidder_name,
-                        final_price=live.rtm_orig_bid,
-                        rtm_declined=True)
+    await _finalize(context, pr, rtm_declined=True)
 
 
 async def _finalize(context: ContextTypes.DEFAULT_TYPE, pr,
@@ -1316,51 +1208,126 @@ async def _finalize(context: ContextTypes.DEFAULT_TYPE, pr,
                     rtm_declined: bool = False,
                     rtm_accepted: bool = False):
     """
-    Normal (non-RTM) sale finalization.
-    Called directly for unsold/no-bid paths and forcesold.
-    RTM-path uses _finalize_rtm instead.
+    Persist the sale and send the appropriate SOLD message.
+    rtm_accepted  → STEP 4A message
+    rtm_declined  → STEP 4B message (already sent by timer or callback, skip duplicate)
+    rtm_no_raise  → STEP 5 message already sent by _rtm_counter_timer
+    else          → normal SOLD
     """
     if not live.highest_bidder_id:
         return
 
-    aid         = live.auction_id
-    winner_id   = live.highest_bidder_id
-    winner_name = live.highest_bidder_name
-    final_price = live.current_bid
+    aid          = live.auction_id
+    winner_id    = live.highest_bidder_id
+    winner_name  = live.highest_bidder_name
+    final_price  = live.current_bid
 
+    # Snapshot RTM fields before clearing live state
+    _rtm_team     = live.rtm_team_name
+    _rtm_team_id  = live.rtm_team_id
+    _orig_bidder  = live.rtm_orig_bidder_name
+    _orig_bid     = live.rtm_orig_bid
+    _counter_bid  = live.rtm_counter_bid
+
+    # Persist DB writes FIRST so remaining purse is correct
     db.set_player_status(pr["player_id"], "sold", winner_id, final_price, None, live.chat_id)
     db.deduct_purse(aid, winner_id, final_price)
     db.add_to_squad(aid, winner_id, pr["player_id"])
     db.record_bid(aid, winner_id, pr["player_id"], pr["name"], final_price, won=True)
 
-    winner_row    = db.get_part(aid, winner_id)
-    remaining     = winner_row["purse"] if winner_row else 0
-    sq_count      = len(json.loads(winner_row["squad"])) if winner_row else 0
-    total_spent   = winner_row["total_spent"] if winner_row else 0
-    winner_uname  = winner_row["username"] if winner_row else ""
-    winner_at     = f"(@{winner_uname})" if winner_uname else ""
+    winner_row   = db.get_part(aid, winner_id)
+    remaining    = winner_row["purse"] if winner_row else 0
+    sq_count     = len(json.loads(winner_row["squad"])) if winner_row else 0
 
-    ts = ist_now()
-    sold_text = (
-        f"✅ *SOLD!* ✅\n"
-        f"{'═'*20}\n\n"
-        f"🏏 *{flag(pr['nationality'])} {pr['name']}*\n"
-        f"🎯 {pr['role']} | {pr['nationality']}\n\n"
-        f"💰 *{fmt(final_price, aid)}*\n"
-        f"🏆 *{winner_name}* {winner_at}\n\n"
-        f"📊 Stats:\n"
-        f"• Purse Remaining: {fmt(remaining, aid)}\n"
-        f"• Players Bought: {sq_count}/25\n"
-        f"• Total Spent: {fmt(total_spent, aid)}\n\n"
-        f"⏰ Sold at: {ts}"
-    )
+    # ── Choose sold message ────────────────────────────────
+    import datetime
+    any_rtm = rtm_accepted or rtm_declined or rtm_no_raise or rtm_used
 
-    msg = await context.bot.send_message(
-        chat_id=live.chat_id,
-        text=sold_text,
-        parse_mode=ParseMode.MARKDOWN,
-        reply_markup=reauction_keyboard(),
-    )
+    winner_uname = winner_row["username"] if winner_row else ""
+    winner_at    = f"(@{winner_uname})" if winner_uname else ""
+    sq_count     = len(json.loads(winner_row["squad"])) if winner_row else 0
+    total_spent  = winner_row["total_spent"] if winner_row else 0
+    ts           = ist_now()
+
+    if rtm_accepted:
+        sold_text = rtm_accepted_text(
+            pr,
+            final_price    = final_price,
+            winner_name    = winner_name,
+            remaining_purse= remaining,
+            squad_count    = sq_count,
+            original_team  = _orig_bidder,
+        )
+    elif rtm_declined or rtm_no_raise:
+        sold_text = None
+    else:
+        sold_text = (
+            f"✅ *SOLD!* ✅\n"
+            f"{'═'*20}\n\n"
+            f"🏏 *{flag(pr['nationality'])} {pr['name']}*\n"
+            f"🎯 {pr['role']} | {pr['nationality']}\n\n"
+            f"💰 *{fmt(final_price, aid)}*\n"
+            f"🏆 *{winner_name}* {winner_at}\n\n"
+            f"📊 Stats:\n"
+            f"• Purse Remaining: {fmt(remaining, aid)}\n"
+            f"• Players Bought: {sq_count}/25\n"
+            f"• Total Spent: {fmt(total_spent, aid)}\n\n"
+            f"⏰ Sold at: {ts}"
+        )
+
+    # Send with retry on rate-limit
+    for attempt in range(3):
+        try:
+            if sold_text:
+                msg = await context.bot.send_message(
+                    chat_id=live.chat_id,
+                    text=sold_text,
+                    parse_mode=ParseMode.MARKDOWN,
+                    reply_markup=reauction_keyboard(),
+                )
+            else:
+                msg = await context.bot.send_message(
+                    chat_id=live.chat_id,
+                    text="➡️ Next player coming up...",
+                    reply_markup=reauction_keyboard(),
+                )
+            break  # success
+        except Exception as e:
+            logger.warning(f"SOLD send attempt {attempt+1} failed: {e}")
+            if attempt < 2:
+                await asyncio.sleep(1 + attempt)
+            else:
+                logger.error("All SOLD send attempts failed!")
+                # Create a dummy msg object to avoid crash
+                msg = type("Msg", (), {"message_id": 0})()
+
+    # ── RTM Summary ───────────────────────────────────────
+    if any_rtm and _rtm_team:
+        rtm_row  = db.get_part(aid, _rtm_team_id) if _rtm_team_id else None
+        cards_l  = rtm_row["rtm_cards"] if rtm_row else 0
+        raised   = _counter_bid if _counter_bid and _counter_bid != _orig_bid else 0
+        accepted = True if rtm_accepted else (False if rtm_declined else None)
+        try:
+            await context.bot.send_message(
+                chat_id=live.chat_id,
+                text=rtm_summary_text(
+                    pr,
+                    base_price     = pr["base_price"] or 0,
+                    original_bid   = _orig_bid,
+                    team_b         = _orig_bidder,
+                    team_a         = _rtm_team,
+                    raised_bid     = raised,
+                    accepted       = accepted,
+                    winner_team    = winner_name,
+                    final_amount   = final_price,
+                    rtm_cards_left = cards_l,
+                ),
+                parse_mode=ParseMode.MARKDOWN,
+            )
+        except Exception:
+            pass
+
+    # Save sold msg id
     db.cx.execute(
         "UPDATE players SET sold_msg_id=?, sold_chat_id=? WHERE player_id=?",
         (msg.message_id, live.chat_id, pr["player_id"]),
@@ -1377,82 +1344,6 @@ async def _finalize(context: ContextTypes.DEFAULT_TYPE, pr,
     live.rtm_state           = RTM_NONE
     live.rtm_team_id         = None
     live.rtm_counter_bid     = 0
-
-    asyncio.create_task(_plain_sold_cleanup(context))
-
-
-async def _finalize_rtm(context: ContextTypes.DEFAULT_TYPE, pr,
-                         winner_id: int, winner_name: str, final_price: int,
-                         rtm_accepted: bool = False,
-                         rtm_declined: bool = False,
-                         rtm_no_raise: bool = False):
-    """
-    RTM-path finalization. The player was already sold normally;
-    here we either keep that sale (declined) or reverse + re-sell to RTM team (accepted).
-    """
-    aid = live.auction_id
-
-    snap_rtm_team    = live.rtm_team_name
-    snap_rtm_team_id = live.rtm_team_id
-    snap_orig_bidder = live.rtm_orig_bidder_name
-    snap_orig_bid    = live.rtm_orig_bid
-    snap_counter_bid = live.rtm_counter_bid
-
-    if rtm_accepted or rtm_no_raise:
-        # Reverse original sale from rtm_window data
-        orig_winner_id    = live.rtm_window_winner_id
-        orig_price        = live.rtm_window_price
-
-        if orig_winner_id and orig_winner_id != winner_id:
-            # Refund original winner
-            db.refund_purse(aid, orig_winner_id, orig_price)
-            db.remove_from_squad(aid, orig_winner_id, pr["player_id"])
-
-        # Re-sell to RTM team
-        db.set_player_status(pr["player_id"], "sold", winner_id, final_price, None, live.chat_id)
-        db.deduct_purse(aid, winner_id, final_price)
-        db.add_to_squad(aid, winner_id, pr["player_id"])
-        db.record_bid(aid, winner_id, pr["player_id"], pr["name"], final_price, won=True)
-    # else rtm_declined → original sale already persisted, nothing to change
-
-    # Send RTM summary
-    rtm_row    = db.get_part(aid, snap_rtm_team_id) if snap_rtm_team_id else None
-    cards_l    = rtm_row["rtm_cards"] if rtm_row else 0
-    raised     = snap_counter_bid if snap_counter_bid and snap_counter_bid != snap_orig_bid else 0
-    accepted_b = True if (rtm_accepted or rtm_no_raise) else False
-
-    try:
-        await context.bot.send_message(
-            chat_id=live.chat_id,
-            text=rtm_summary_text(
-                pr,
-                base_price     = pr["base_price"] or 0,
-                original_bid   = snap_orig_bid,
-                team_b         = snap_orig_bidder,
-                team_a         = snap_rtm_team,
-                raised_bid     = raised,
-                accepted       = accepted_b,
-                winner_team    = winner_name,
-                final_amount   = final_price,
-                rtm_cards_left = cards_l,
-            ),
-            parse_mode=ParseMode.MARKDOWN,
-        )
-    except Exception:
-        pass
-
-    live.sold_count           += 1
-    _set_last_sold(pr["player_id"], pr["name"], winner_id, winner_name, final_price)
-    live.current_player_id    = None
-    live.current_bid          = 0
-    live.highest_bidder_id    = None
-    live.highest_bidder_name  = ""
-    live.rtm_state            = RTM_NONE
-    live.rtm_team_id          = None
-    live.rtm_counter_bid      = 0
-    live.rtm_window_open      = False
-    live.rtm_window_player_id = None
-    live.rtm_window_winner_id = None
 
     await _try_auto_next(context)
 
@@ -1547,9 +1438,9 @@ async def process_bid(update, context: ContextTypes.DEFAULT_TYPE,
     uid  = eff_uid(caller_uid)
     part = db.get_part(aid, uid) if aid else None
 
-    async def err(m):
+    async def err(m, md_v2: bool = False):
         if update.callback_query:
-            plain = m.replace("*", "").replace("`", "")
+            plain = m.replace("*", "").replace("\\", "").replace("`", "")
             await update.callback_query.answer(plain[:200], show_alert=True)
         else:
             await update.message.reply_text(m, parse_mode=ParseMode.MARKDOWN)
@@ -1564,7 +1455,7 @@ async def process_bid(update, context: ContextTypes.DEFAULT_TYPE,
         await err("Auction is paused.")
         return
     if live.rtm_state == RTM_OFFERED:
-        await err("RTM window is open. Use /rtm if you want to exercise RTM.")
+        await err("RTM window active. Wait for RTM to resolve first.")
         return
 
     # Block current highest bidder from bidding again (outside RTM)
@@ -1577,13 +1468,19 @@ async def process_bid(update, context: ContextTypes.DEFAULT_TYPE,
         row_caller = db.get_part(aid, uid)
         your_name  = team_display(row_caller) if row_caller else str(uid)
         if uid == live.rtm_team_id:
-            secs_left = max(0, int((live.rtm_counter_ends_at or 0) - _time.time()))
-            await err(rtm_wait_decision_text(
-                live.rtm_team_name, live.rtm_orig_bid,
-                live.rtm_orig_bid, live.rtm_orig_bidder_name, secs_left,
-            ))
+            secs_left = max(0, int((live.timer_ends_at or 0) - _time.time()))
+            await err(
+                rtm_wait_decision_text(
+                    live.rtm_team_name,
+                    live.rtm_counter_bid if live.rtm_counter_bid else live.rtm_orig_bid,
+                    live.rtm_orig_bid,
+                    live.rtm_orig_bidder_name,
+                    secs_left,
+                ),
+                md_v2=True,
+            )
         else:
-            await err(rtm_raise_error_text(live.rtm_orig_bidder_name, your_name))
+            await err(rtm_raise_error_text(live.rtm_orig_bidder_name, your_name), md_v2=True)
         return
 
     # In RTM_COUNTER — RTM team must use YES/NO buttons, not /bid
@@ -1591,13 +1488,16 @@ async def process_bid(update, context: ContextTypes.DEFAULT_TYPE,
         row_caller = db.get_part(aid, uid)
         your_name  = team_display(row_caller) if row_caller else str(uid)
         if uid == live.rtm_team_id:
-            secs_left = max(0, int((live.rtm_decision_ends_at or 0) - _time.time()))
-            await err(rtm_wait_decision_text(
-                live.rtm_team_name, live.rtm_counter_bid,
-                live.rtm_orig_bid, live.rtm_orig_bidder_name, secs_left,
-            ))
+            secs_left = max(0, int((live.timer_ends_at or 0) - _time.time()))
+            await err(
+                rtm_wait_decision_text(
+                    live.rtm_team_name, live.rtm_counter_bid,
+                    live.rtm_orig_bid, live.rtm_orig_bidder_name, secs_left,
+                ),
+                md_v2=True,
+            )
         else:
-            await err(rtm_raise_error_text(live.rtm_orig_bidder_name, your_name))
+            await err(rtm_raise_error_text(live.rtm_orig_bidder_name, your_name), md_v2=True)
         return
 
     pr = db.get_player(live.current_player_id)
@@ -1611,6 +1511,12 @@ async def process_bid(update, context: ContextTypes.DEFAULT_TYPE,
         await err(v_err)
         return
 
+    # Anti-snipe
+    if live.timer_ends_at:
+        rem = live.timer_ends_at - _time.time()
+        if 0 < rem < Config.ANTI_SNIPE:
+            live.timer_ends_at = _time.time() + Config.ANTI_SNIPE
+
     # RTM counter scenario — original bidder raises bid → Step 3
     if live.rtm_state == RTM_ACTIVE and uid == live.rtm_orig_bidder_id:
         if live.timer_task and not live.timer_task.done():
@@ -1623,17 +1529,20 @@ async def process_bid(update, context: ContextTypes.DEFAULT_TYPE,
             chat_id=live.chat_id,
             text=rtm_bid_raised_text(pr, bid_l),
             parse_mode=ParseMode.MARKDOWN,
-            reply_markup=rtm_ask_keyboard(),
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("✅ YES", callback_data="rtm_yes"),
+                InlineKeyboardButton("❌ NO",  callback_data="rtm_no"),
+            ]]),
         )
         live.rtm_msg_id = ask_msg.message_id
         live.timer_task = asyncio.create_task(_rtm_decision_timer(context))
 
         if update.callback_query:
-            await update.callback_query.answer(f"Bid raised to {fmt(bid_l, aid)}!")
+            await update.callback_query.answer(f"Bid raised to ₹{_cr(bid_l)}Cr!")
         else:
             await update.message.reply_text(
-                f"⬆️ Bid raised to *{fmt(bid_l, aid)}* — "
-                f"waiting for *{live.rtm_team_name}* to decide!",
+                f"⬆️ Bid raised to *₹{_cr(bid_l)}Cr* — "
+                f"waiting for *{live.rtm_team_name}* to decide\\!",
                 parse_mode=ParseMode.MARKDOWN,
             )
         return
@@ -1646,11 +1555,8 @@ async def process_bid(update, context: ContextTypes.DEFAULT_TYPE,
 
     db.record_bid(aid, uid, pr["player_id"], pr["name"], bid_l, won=False)
 
-    # Cancel existing timer and start fresh — every bid resets to full duration
-    if live.timer_task and not live.timer_task.done():
-        live.timer_task.cancel()
-    live.timer_ends_at = None  # cleared so new bid_timer sets it fresh
-    live.timer_task = asyncio.create_task(bid_timer(context))
+    if live.timer_task is None or live.timer_task.done():
+        live.timer_task = asyncio.create_task(bid_timer(context))
 
     duration = live.auto_sell_secs or Config.BID_TIMER
     outbid   = f"⬆️ Outbids: {prev_name}" if prev_name and prev_name != bid_display(part) else "🎯 Opening bid!"
@@ -1663,7 +1569,7 @@ async def process_bid(update, context: ContextTypes.DEFAULT_TYPE,
             f"Amount: *{fmt(bid_l,aid)}*\n"
             f"By: *{bid_display(part)}*\n"
             f"{outbid}\n"
-            f"🔄 Timer reset: *{duration}s*"
+            f"⏱ Timer: {duration}s"
         ),
         parse_mode=ParseMode.MARKDOWN,
         reply_markup=bid_keyboard(pr, bid_l),
@@ -2100,25 +2006,29 @@ async def cmd_auction_owners(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return
 
     def _uname(uid: int) -> str:
+        """Return @username if available, else first_name, else 'Unknown'."""
         u = db.get_user(uid)
         if not u:
-            return f"ID:{uid}"
-        return f"@{u['username']}" if u["username"] else (u["first_name"] or f"ID:{uid}")
+            return "Unknown"
+        if u["username"]:
+            return f"@{u['username']}"
+        return u["first_name"] or "Unknown"
 
-    lines = [f"👥 *Team Owners — {live.auction_name}*\n{'─'*28}"]
+    lines = [f"👥 *Auction Owners — {live.auction_name}*\n{'─'*28}"]
     for i, r in enumerate(parts, 1):
         main_uname = _uname(r["user_id"])
         co = db.get_co_owners(aid, r["user_id"])
         if co:
             co_names = [_uname(c["linked_user_id"]) for c in co]
-            owners = main_uname + ", " + ", ".join(co_names)
+            co_str = "  _(+co: " + ", ".join(co_names) + ")_"
         else:
-            owners = main_uname
+            co_str = ""
         rtm_info = (
-            f"\n   🎴 RTM: {r['rtm_team']} ×{r['rtm_cards']}"
-            if r["rtm_cards"] > 0 and r["rtm_team"] else ""
+            f"  🎴 RTM: {r['rtm_team']} ×{r['rtm_cards']}"
+            if r["rtm_cards"] > 0 and r["rtm_team"]
+            else ""
         )
-        lines.append(f"{i}. *{r['team_name']}* — {owners}{rtm_info}")
+        lines.append(f"{i}. *{r['team_name']}* — {main_uname}{co_str}{rtm_info}")
 
     await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
 
@@ -2735,14 +2645,14 @@ async def cmd_pass(update: Update, context: ContextTypes.DEFAULT_TYPE):
     db.set_player_status(pr["player_id"], "unsold")
     live.unsold_count    += 1
     _set_last_sold(pr["player_id"], pr["name"], None, "", 0)
-    live.current_player_id = None
+    live.current_player_id= None
     msg = await update.message.reply_text(
         f"⏭ *{pr['name']}* passed (UNSOLD).",
         parse_mode=ParseMode.MARKDOWN,
         reply_markup=reauction_keyboard(),
     )
     live.reauction_msg_id = msg.message_id
-    asyncio.create_task(_plain_sold_cleanup(context))
+    await _try_auto_next(context)
 
 
 async def cmd_sold(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2973,7 +2883,7 @@ async def cmd_auto_next(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Auto-next disabled.")
     else:
         try:
-            live.auto_next_secs = int(v) if v != "enable" else (live.auto_next_secs or 5)
+            live.auto_next_secs = int(v) if v not in ("enable",) else (live.auto_next_secs or 5)
             live.auto_next_on   = True
             await update.message.reply_text(f"Auto-next: *{live.auto_next_secs}s*",
                                             parse_mode=ParseMode.MARKDOWN)
@@ -2981,110 +2891,7 @@ async def cmd_auto_next(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("Invalid.")
 
 
-async def cmd_dtime(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    /dtime <seconds> — Set ALL timers to the same value at once.
-    Example: /dtime 10  sets bid, RTM window, RTM counter, RTM decision all to 10s.
-    /dtime show — display current timer settings.
-    """
-    await _reg(update.effective_user)
-    if not db.is_admin(update.effective_user.id):
-        await update.message.reply_text("Admin only.")
-        return
-
-    if not context.args or context.args[0].lower() == "show":
-        bid   = live.auto_sell_secs or Config.BID_TIMER
-        rtmw  = Config.RTM_OFFER_TIMER
-        rtmc  = Config.RTM_COUNTER_TIMER
-        rtmd  = Config.RTM_DECISION_TIMER
-        await update.message.reply_text(
-            f"⏱ *Current Timer Settings*\n{'─'*24}\n"
-            f"🔨 Bid Timer: *{bid}s*\n"
-            f"🎴 RTM Window (post-sold): *{rtmw}s*\n"
-            f"⬆️ RTM Counter (raise window): *{rtmc}s*\n"
-            f"✅ RTM Decision (YES/NO): *{rtmd}s*\n\n"
-            f"Use /dtime <secs> to set all timers at once.\n"
-            f"Or set individually:\n"
-            f"  /settimer bid <secs>\n"
-            f"  /settimer rtmwindow <secs>\n"
-            f"  /settimer rtmcounter <secs>\n"
-            f"  /settimer rtmdecision <secs>",
-            parse_mode=ParseMode.MARKDOWN,
-        )
-        return
-
-    raw = context.args[0].lower().rstrip("s")
-    try:
-        secs = int(raw)
-    except ValueError:
-        await update.message.reply_text("Usage: /dtime <seconds>  e.g. /dtime 10")
-        return
-
-    live.auto_sell_secs = secs
-    Config.BID_TIMER          = secs
-    Config.RTM_OFFER_TIMER    = secs
-    Config.RTM_COUNTER_TIMER  = secs
-    Config.RTM_DECISION_TIMER = secs
-
-    await update.message.reply_text(
-        f"✅ *All timers set to {secs}s*\n"
-        f"🔨 Bid timer: {secs}s\n"
-        f"🎴 RTM window: {secs}s\n"
-        f"⬆️ RTM counter: {secs}s\n"
-        f"✅ RTM decision: {secs}s",
-        parse_mode=ParseMode.MARKDOWN,
-    )
-
-
-async def cmd_set_timer(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    /settimer <type> <seconds> — Set a specific timer.
-    Types: bid, rtmwindow, rtmcounter, rtmdecision
-    Example: /settimer bid 30
-    """
-    await _reg(update.effective_user)
-    if not db.is_admin(update.effective_user.id):
-        await update.message.reply_text("Admin only.")
-        return
-    if len(context.args) < 2:
-        await update.message.reply_text(
-            "Usage: /settimer <type> <seconds>\n"
-            "Types: bid | rtmwindow | rtmcounter | rtmdecision\n"
-            "Example: /settimer bid 30"
-        )
-        return
-
-    timer_type = context.args[0].lower()
-    raw        = context.args[1].lower().rstrip("s")
-    try:
-        secs = int(raw)
-        if secs < 5:
-            await update.message.reply_text("Minimum timer is 5 seconds.")
-            return
-    except ValueError:
-        await update.message.reply_text("Invalid seconds value.")
-        return
-
-    label_map = {
-        "bid":         ("Bid Timer",              "BID_TIMER"),
-        "rtmwindow":   ("RTM Window (post-sold)", "RTM_OFFER_TIMER"),
-        "rtmcounter":  ("RTM Counter (raise)",    "RTM_COUNTER_TIMER"),
-        "rtmdecision": ("RTM Decision (YES/NO)",  "RTM_DECISION_TIMER"),
-    }
-    if timer_type not in label_map:
-        await update.message.reply_text(
-            "Unknown timer type. Use: bid | rtmwindow | rtmcounter | rtmdecision"
-        )
-        return
-
-    label, attr = label_map[timer_type]
-    setattr(Config, attr, secs)
-    if timer_type == "bid":
-        live.auto_sell_secs = secs
-
-    await update.message.reply_text(
-        f"✅ *{label}* set to *{secs}s*", parse_mode=ParseMode.MARKDOWN
-    )
+# ── PLAYER MANAGEMENT ────────────────────────────────────
 
 async def cmd_add_player(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _reg(update.effective_user)
@@ -3131,7 +2938,7 @@ async def cmd_add_player_list(update: Update, context: ContextTypes.DEFAULT_TYPE
     lines  = update.message.text.strip().split("\n")[1:]
     added, failed = [], []
     for line in lines:
-        line = re.sub(r"^\d+[\.\)]\s*", "", line.strip())
+        line = re.sub(r"^\d+[\.\)\s]\s*", "", line.strip())
         if not line: continue
         parts = [p.strip() for p in line.split(",")]
         if len(parts) < 5:
@@ -3209,11 +3016,7 @@ async def cmd_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # RTM HELPER
 # ─────────────────────────────────────────────────────────
 async def _handle_rtm_use(update, context: ContextTypes.DEFAULT_TYPE, uid: int):
-    """
-    Called when a team types /rtm.
-    Works during the 10s post-SOLD silent window (rtm_window_open=True).
-    Cancels the window timer, reverses the normal sale, opens RTM flow.
-    """
+    """Core logic for when a team tries to use RTM via /rtm or /right_to_match command."""
     aid = live.auction_id
 
     async def err(m):
@@ -3222,95 +3025,98 @@ async def _handle_rtm_use(update, context: ContextTypes.DEFAULT_TYPE, uid: int):
         else:
             await update.message.reply_text(m)
 
-    # Must be in the RTM window (post-SOLD, pre-auto-next)
-    if not live.rtm_window_open or live.rtm_state != RTM_OFFERED:
-        if live.rtm_state in (RTM_ACTIVE, RTM_COUNTER):
-            await err("RTM already in progress.")
-        else:
-            await err(
-                rtm_error_text(
-                    player_name=live.last_sold_name or "?",
-                    ipl_team="?",
-                    reason="RTM window is not open. It opens for 10s right after a player is sold."
-                )
-            )
-        return
-
-    if not live.active:
+    if not live.active or not live.current_player_id:
         await err("No active auction.")
         return
 
-    # Get the player that was just sold
-    pid = live.rtm_window_player_id
-    pr  = db.get_player(pid) if pid else None
+    # RTM can only be invoked during the RTM_OFFERED window (after timer expires)
+    if live.rtm_state not in (RTM_OFFERED,):
+        if live.rtm_state in (RTM_ACTIVE, RTM_COUNTER):
+            await err("RTM already in progress. Wait for it to resolve.")
+        else:
+            await err(
+                "RTM window is not open yet. "
+                "Wait for the bid timer to expire — if you hold a matching RTM card, "
+                "a window will open."
+            )
+        return
+
+    if live.highest_bidder_id is None:
+        await err("No bid placed yet — nothing to RTM against.")
+        return
+
+    if uid == live.highest_bidder_id:
+        await err("You are the highest bidder — you cannot RTM yourself!")
+        return
+
+    pr = db.get_player(live.current_player_id)
     if not pr:
         await err("Player not found.")
         return
 
     ipl_team = pr.get("ipl_team", "") or ""
     if not ipl_team.strip():
-        await err(rtm_error_text(pr["name"], "N/A",
-                                 "This player has no previous IPL team — RTM is not applicable."))
+        await err("This player has no previous IPL team — RTM is not applicable.")
         return
 
     row = db.get_part(aid, uid)
     if not row or row["rtm_cards"] <= 0:
-        await err(rtm_error_text(pr["name"], ipl_team, "You have no RTM cards."))
+        await err("You have no RTM cards.")
         return
 
-    # RTM card must match this player's IPL team
-    rtm_assigned = (row["rtm_team"] or "").strip()
-    if rtm_assigned.lower() != ipl_team.strip().lower():
-        await err(rtm_error_text(
-            pr["name"], ipl_team,
-            f"Your RTM card is for *{rtm_assigned or 'N/A'}*, "
-            f"but this player's previous team is *{ipl_team}*."
-        ))
+    # Check that this team's RTM card matches the player's ipl_team
+    rtm_team_assigned = (row["rtm_team"] or "").strip()
+    if rtm_team_assigned.lower() != ipl_team.strip().lower():
+        await err(
+            f"Your RTM card is for *{rtm_team_assigned or 'N/A'}*, "
+            f"but this player's previous team is *{ipl_team}*. "
+            f"RTM does not apply."
+        )
         return
 
-    # Can't RTM if you were the highest bidder who just won
-    if uid == live.rtm_window_winner_id:
-        await err("You won this player — you cannot RTM yourself!")
+    if row["purse"] < live.current_bid:
+        await err(f"Not enough purse to RTM! You need {fmt(live.current_bid, aid)}.")
         return
 
-    # Purse check against the sale price
-    if row["purse"] < live.rtm_window_price:
-        await err(f"Not enough purse to RTM! You need {fmt(live.rtm_window_price, aid)}.")
-        return
+    # Cancel RTM offer timer
+    if live.timer_task and not live.timer_task.done():
+        live.timer_task.cancel()
 
-    # ── RTM accepted — cancel the window timer ────────────
-    if live.rtm_window_task and not live.rtm_window_task.done():
-        live.rtm_window_task.cancel()
-    live.rtm_window_open = False
-
-    # Deduct RTM card
+    # Deduct one RTM card
     db.cx.execute(
-        "UPDATE participants SET rtm_cards=MAX(0,rtm_cards-1) WHERE auction_id=? AND user_id=?",
+        "UPDATE participants SET rtm_cards=MAX(0,rtm_cards-1)"
+        " WHERE auction_id=? AND user_id=?",
         (aid, uid),
     )
     db.cx.commit()
 
-    # Set RTM state — player is re-opened for this flow
     live.rtm_state            = RTM_ACTIVE
     live.rtm_team_id          = uid
     live.rtm_team_name        = bid_display(row)
-    live.rtm_orig_bidder_id   = live.rtm_window_winner_id
-    live.rtm_orig_bidder_name = live.rtm_window_winner_name
-    live.rtm_orig_bid         = live.rtm_window_price
-    live.current_player_id    = pid   # re-open the player
-    live.current_bid          = live.rtm_window_price
+    live.rtm_orig_bidder_id   = live.highest_bidder_id
+    live.rtm_orig_bidder_name = live.highest_bidder_name
+    live.rtm_orig_bid         = live.current_bid
 
     if update.callback_query:
         await update.callback_query.answer("RTM card used!", show_alert=True)
 
-    # Send Step 2: RTM ACTIVATED message
+    # Announce RTM use and invite original bidder to counter
     msg = await context.bot.send_message(
         chat_id=live.chat_id,
-        text=rtm_activated_text(pr),
+        text=(
+            f"🎴 *{live.rtm_team_name}* uses RTM on *{pr['name']}*!\n"
+            f"{'─'*28}\n"
+            f"Current highest bid: *{fmt(live.rtm_orig_bid, aid)}* "
+            f"by *{live.rtm_orig_bidder_name}*\n\n"
+            f"*{live.rtm_orig_bidder_name}* — raise your bid using:\n"
+            f"`/bid <amount>`  e.g. `/bid 19cr`\n\n"
+            f"⏱ You have *{Config.RTM_TIMER}s* to counter. "
+            f"If no counter, *{live.rtm_team_name}* wins the player at "
+            f"*{fmt(live.rtm_orig_bid, aid)}*."
+        ),
         parse_mode=ParseMode.MARKDOWN,
     )
     live.rtm_msg_id = msg.message_id
-
     # Start counter window — waits for original bidder to /bid
     live.timer_task = asyncio.create_task(_rtm_counter_timer(context))
 
@@ -3417,7 +3223,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer()
         return
 
-    # ── RTM YES (RTM team accepts counter bid — Step 4A) ─
+    # ── RTM YES (RTM team accepts counter bid) ─
     if data == "rtm_yes":
         euid = eff_uid(uid)
         is_rtm_team = (live.rtm_team_id == euid)
@@ -3426,33 +3232,32 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         if live.timer_task and not live.timer_task.done():
             live.timer_task.cancel()
-        aid       = live.auction_id
-        final_bid = live.rtm_counter_bid
-        rtm_name  = live.rtm_team_name
-        rtm_id    = live.rtm_team_id
-        orig_name = live.rtm_orig_bidder_name
-        pr        = db.get_player(live.current_player_id)
-        live.rtm_state = RTM_NONE
-
-        # Calculate display values for accepted text
+        aid = live.auction_id
+        final_bid  = live.rtm_counter_bid
+        rtm_name   = live.rtm_team_name
+        rtm_id     = live.rtm_team_id
+        orig_bidder= live.rtm_orig_bidder_name
+        live.current_bid         = final_bid
+        live.highest_bidder_id   = rtm_id
+        live.highest_bidder_name = rtm_name
+        live.rtm_state           = RTM_NONE
+        pr = db.get_player(live.current_player_id)
         winner_part = db.get_part(aid, rtm_id)
         rem_purse   = (winner_part["purse"] - final_bid) if winner_part else 0
-        sq_count    = (len(json.loads(winner_part["squad"])) + 1) if winner_part else 0
+        sq_count    = len(json.loads(winner_part["squad"])) + 1 if winner_part else 0
         try:
             await query.edit_message_text(
-                rtm_accepted_text(pr, final_bid, rtm_name, rem_purse, sq_count, orig_name),
+                rtm_accepted_text(pr, final_bid, rtm_name, rem_purse, sq_count, orig_bidder),
                 parse_mode=ParseMode.MARKDOWN,
             )
         except Exception:
             pass
         await query.answer("✅ Accepted!")
         if pr:
-            await _finalize_rtm(context, pr,
-                                winner_id=rtm_id, winner_name=rtm_name,
-                                final_price=final_bid, rtm_accepted=True)
+            await _finalize(context, pr, rtm_accepted=True)
         return
 
-    # ── RTM NO (RTM team declines counter bid — Step 4B) ─
+    # ── RTM NO (RTM team declines counter bid) ─
     if data == "rtm_no":
         euid = eff_uid(uid)
         is_rtm_team = (live.rtm_team_id == euid)
@@ -3466,12 +3271,14 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         orig_id  = live.rtm_orig_bidder_id
         orig_name= live.rtm_orig_bidder_name
         rtm_name = live.rtm_team_name
-        live.rtm_state = RTM_NONE
-
+        live.current_bid         = orig_bid
+        live.highest_bidder_id   = orig_id
+        live.highest_bidder_name = orig_name
+        live.rtm_state           = RTM_NONE
         pr = db.get_player(live.current_player_id)
-        winner_part = db.get_part(aid, orig_id) if orig_id else None
-        rem_purse   = (winner_part["purse"]) if winner_part else 0  # already deducted in window
-        sq_count    = (len(json.loads(winner_part["squad"]))) if winner_part else 0
+        winner_part = db.get_part(aid, orig_id)
+        rem_purse   = (winner_part["purse"] - orig_bid) if winner_part else 0
+        sq_count    = len(json.loads(winner_part["squad"])) + 1 if winner_part else 0
         try:
             await query.edit_message_text(
                 rtm_declined_text(pr, orig_bid, orig_name, rem_purse, sq_count, rtm_name),
@@ -3481,9 +3288,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pass
         await query.answer("❌ Declined.")
         if pr:
-            await _finalize_rtm(context, pr,
-                                winner_id=orig_id, winner_name=orig_name,
-                                final_price=orig_bid, rtm_declined=True)
+            await _finalize(context, pr, rtm_declined=True)
         return
 
     # ── REAUCTION PROMPT ─────────────────────
@@ -3650,9 +3455,6 @@ DOT_MAP = {
     "pauseauction": cmd_pause, "resumeauction": cmd_resume,
     "endauction": cmd_end_auction, "endsauction": cmd_end_auction,
     "autosell": cmd_auto_sell, "autonext": cmd_auto_next,
-    "dtime": cmd_dtime, "defaulttimer": cmd_dtime,
-    "settimer": cmd_set_timer, "timer": cmd_set_timer,
-    "teamowners": cmd_auction_owners,
     "leaderboard": cmd_leaderboard, "help": cmd_help,
     "mute": cmd_mute, "unmute": cmd_unmute,
     "setrtm": cmd_set_rtm,
@@ -3750,9 +3552,6 @@ def build_app() -> Application:
     app.add_handler(CommandHandler(["endauction","endsauction"], cmd_end_auction))
     app.add_handler(CommandHandler("autosell", cmd_auto_sell))
     app.add_handler(CommandHandler("autonext", cmd_auto_next))
-    app.add_handler(CommandHandler(["dtime","defaulttimer"], cmd_dtime))
-    app.add_handler(CommandHandler(["settimer","timer"], cmd_set_timer))
-    app.add_handler(CommandHandler(["teamowners","auctionowners","auction_owners"], cmd_auction_owners))
 
     # Admin: queue
     app.add_handler(CommandHandler(["addtoqueue","atq"], cmd_add_to_queue))
