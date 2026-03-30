@@ -1519,13 +1519,22 @@ async def process_bid(update, context: ContextTypes.DEFAULT_TYPE,
         live.rtm_state       = RTM_COUNTER
         live.rtm_counter_bid = bid_l
 
+        # Embed all data in callback_data so YES/NO never depend on live state
+        # Format: y|pid|rtm_uid|final_price|orig_uid|orig_price (max ~50 chars, Telegram limit 64)
+        pid_val  = pr["player_id"]
+        rtm_uid  = live.rtm_team_id
+        orig_uid = live.rtm_orig_bidder_id
+        orig_bid = live.rtm_orig_bid
+        yes_data = f"ry|{pid_val}|{rtm_uid}|{bid_l}|{orig_uid}|{orig_bid}"
+        no_data  = f"rn|{pid_val}|{rtm_uid}|{bid_l}|{orig_uid}|{orig_bid}"
+
         ask_msg = await context.bot.send_message(
             chat_id=live.chat_id,
             text=rtm_bid_raised_text(pr, bid_l),
             parse_mode=ParseMode.MARKDOWN,
             reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("✅ YES", callback_data="rtm_yes"),
-                InlineKeyboardButton("❌ NO",  callback_data="rtm_no"),
+                InlineKeyboardButton("✅ YES", callback_data=yes_data),
+                InlineKeyboardButton("❌ NO",  callback_data=no_data),
             ]]),
         )
         live.rtm_msg_id = ask_msg.message_id
@@ -3129,7 +3138,23 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     data  = query.data
     uid   = query.from_user.id
-    await _reg(query.from_user)
+
+    try:
+        await _reg(query.from_user)
+    except Exception:
+        pass  # Don't let _reg crash stop button response
+
+    try:
+        await _handle_callback_inner(update, context, query, data, uid)
+    except Exception as e:
+        logger.error(f"handle_callback crashed [data={data}]: {e}", exc_info=True)
+        try:
+            await query.answer("⚠️ An error occurred. Please try again.", show_alert=True)
+        except Exception:
+            pass
+
+
+async def _handle_callback_inner(update, context, query, data, uid):
 
     # ── JOIN ─────────────────────────────────
     if data.startswith("join_"):
@@ -3224,72 +3249,203 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer()
         return
 
-    # ── RTM YES (RTM team accepts counter bid) ─
-    if data == "rtm_yes":
-        euid = eff_uid(uid)
-        is_rtm_team = (live.rtm_team_id == euid)
-        if live.rtm_state != RTM_COUNTER or (not is_rtm_team and not db.is_admin(uid)):
-            await query.answer("Only the RTM team or admin can accept/decline.", show_alert=True)
-            return
-        if live.timer_task and not live.timer_task.done():
-            live.timer_task.cancel()
-        aid = live.auction_id
-        final_bid  = live.rtm_counter_bid
-        rtm_name   = live.rtm_team_name
-        rtm_id     = live.rtm_team_id
-        orig_bidder= live.rtm_orig_bidder_name
-        live.current_bid         = final_bid
-        live.highest_bidder_id   = rtm_id
-        live.highest_bidder_name = rtm_name
-        live.rtm_state           = RTM_NONE
-        pr = db.get_player(live.current_player_id)
-        winner_part = db.get_part(aid, rtm_id)
-        rem_purse   = (winner_part["purse"] - final_bid) if winner_part else 0
-        sq_count    = len(json.loads(winner_part["squad"])) + 1 if winner_part else 0
+    # ── RTM YES — stateless: all data in callback_data ──────
+    # Format: ry|player_id|rtm_uid|final_price|orig_uid|orig_price
+    if data.startswith("ry|") or data == "rtm_yes":
+        await query.answer("✅ Processing...", show_alert=False)
         try:
-            await query.edit_message_text(
-                rtm_accepted_text(pr, final_bid, rtm_name, rem_purse, sq_count, orig_bidder),
-                parse_mode=ParseMode.MARKDOWN,
+            if data.startswith("ry|"):
+                parts       = data.split("|")
+                pid_val     = int(parts[1])
+                rtm_uid     = int(parts[2])
+                final_price = int(parts[3])
+                orig_uid    = int(parts[4])
+                orig_bid    = int(parts[5])
+            else:
+                pid_val     = live.current_player_id
+                rtm_uid     = live.rtm_team_id
+                final_price = live.rtm_counter_bid
+                orig_uid    = live.rtm_orig_bidder_id
+                orig_bid    = live.rtm_orig_bid
+
+            euid = eff_uid(uid)
+            aid  = live.auction_id
+
+            if rtm_uid != euid and not db.is_admin(uid):
+                await context.bot.send_message(
+                    query.message.chat_id,
+                    "❌ Only the RTM team or an admin can click YES.")
+                return
+
+            # Cancel any running timer and clear state
+            if live.timer_task and not live.timer_task.done():
+                live.timer_task.cancel()
+            live.rtm_state = RTM_NONE
+
+            pr = db.get_player(pid_val)
+            if not pr:
+                await context.bot.send_message(query.message.chat_id, "⚠️ Player not found.")
+                return
+
+            # Guard: player must not already be finalized
+            if pr["status"] == "sold" and pr["sold_to"] != rtm_uid:
+                await context.bot.send_message(
+                    query.message.chat_id,
+                    f"⚠️ {pr['name']} already sold to another team.")
+                return
+
+            ipl      = (pr["ipl_team"] or "N/A") if pr["ipl_team"] is not None else "N/A"
+            rtm_row_pre  = db.get_part(aid, rtm_uid)
+            rtm_name     = team_display(rtm_row_pre) if rtm_row_pre else f"Team {rtm_uid}"
+            orig_row_pre = db.get_part(aid, orig_uid)
+            orig_name    = team_display(orig_row_pre) if orig_row_pre else live.rtm_orig_bidder_name
+
+            # DB: sell to RTM team at raised price
+            db.set_player_status(pr["player_id"], "sold", rtm_uid, final_price, None, query.message.chat_id)
+            db.deduct_purse(aid, rtm_uid, final_price)
+            db.add_to_squad(aid, rtm_uid, pr["player_id"])
+            db.record_bid(aid, rtm_uid, pr["player_id"], pr["name"], final_price, won=True)
+
+            rtm_row = db.get_part(aid, rtm_uid)
+            rem     = rtm_row["purse"] if rtm_row else 0
+            sq      = len(json.loads(rtm_row["squad"])) if rtm_row else 0
+            ts      = ist_now()
+
+            text = (
+                f"✅ *RTM ACCEPTED - PLAYER SOLD!*\n"
+                f"{'═'*20}\n\n"
+                f"🏏 *{flag(pr['nationality'])} {pr['name']}* ({ipl})\n"
+                f"🎯 {pr['role']} | {pr['nationality']}\n\n"
+                f"💰 *Final Price:* {fmt(final_price, aid)}\n"
+                f"🏆 *Winner:* *{rtm_name}* 🎴 (via RTM)\n\n"
+                f"📊 *Transaction:*\n"
+                f"• Deducted: {fmt(final_price, aid)} from {rtm_name}\n"
+                f"• Remaining Purse: {fmt(rem, aid)}\n"
+                f"• Squad: {sq}/25 players\n\n"
+                f"❌ {orig_name} loses the bid\n\n"
+                f"⏰ Sold at: {ts}"
             )
-        except Exception:
-            pass
-        await query.answer("✅ Accepted!")
-        if pr:
-            await _finalize(context, pr, rtm_accepted=True)
+
+            try:
+                await query.edit_message_text(text, parse_mode=ParseMode.MARKDOWN)
+            except Exception:
+                await context.bot.send_message(
+                    query.message.chat_id, text,
+                    parse_mode=ParseMode.MARKDOWN, reply_markup=reauction_keyboard())
+
+            live.sold_count         += 1
+            _set_last_sold(pr["player_id"], pr["name"], rtm_uid, rtm_name, final_price)
+            live.current_player_id   = None
+            live.current_bid         = 0
+            live.highest_bidder_id   = None
+            live.highest_bidder_name = ""
+            live.rtm_team_id         = None
+            live.rtm_counter_bid     = 0
+            await _try_auto_next(context)
+
+        except Exception as e:
+            logger.error(f"ry| handler CRASHED: {e}", exc_info=True)
+            await context.bot.send_message(
+                query.message.chat_id,
+                f"⚠️ RTM YES error — admin use /forcesold\nDetails: {e}")
         return
 
-    # ── RTM NO (RTM team declines counter bid) ─
-    if data == "rtm_no":
-        euid = eff_uid(uid)
-        is_rtm_team = (live.rtm_team_id == euid)
-        if live.rtm_state != RTM_COUNTER or (not is_rtm_team and not db.is_admin(uid)):
-            await query.answer("Only the RTM team or admin can accept/decline.", show_alert=True)
-            return
-        if live.timer_task and not live.timer_task.done():
-            live.timer_task.cancel()
-        aid      = live.auction_id
-        orig_bid = live.rtm_orig_bid
-        orig_id  = live.rtm_orig_bidder_id
-        orig_name= live.rtm_orig_bidder_name
-        rtm_name = live.rtm_team_name
-        live.current_bid         = orig_bid
-        live.highest_bidder_id   = orig_id
-        live.highest_bidder_name = orig_name
-        live.rtm_state           = RTM_NONE
-        pr = db.get_player(live.current_player_id)
-        winner_part = db.get_part(aid, orig_id)
-        rem_purse   = (winner_part["purse"] - orig_bid) if winner_part else 0
-        sq_count    = len(json.loads(winner_part["squad"])) + 1 if winner_part else 0
+    if data.startswith("rn|") or data == "rtm_no":
+        await query.answer("❌ Processing...", show_alert=False)
         try:
-            await query.edit_message_text(
-                rtm_declined_text(pr, orig_bid, orig_name, rem_purse, sq_count, rtm_name),
-                parse_mode=ParseMode.MARKDOWN,
+            if data.startswith("rn|"):
+                parts       = data.split("|")
+                pid_val     = int(parts[1])
+                rtm_uid     = int(parts[2])
+                final_price = int(parts[3])
+                orig_uid    = int(parts[4])
+                orig_price  = int(parts[5])
+            else:
+                pid_val     = live.current_player_id
+                rtm_uid     = live.rtm_team_id
+                final_price = live.rtm_counter_bid
+                orig_uid    = live.rtm_orig_bidder_id
+                orig_price  = live.rtm_orig_bid
+
+            euid = eff_uid(uid)
+            aid  = live.auction_id
+
+            if rtm_uid != euid and not db.is_admin(uid):
+                await context.bot.send_message(
+                    query.message.chat_id,
+                    "❌ Only the RTM team or an admin can click NO.")
+                return
+
+            if live.timer_task and not live.timer_task.done():
+                live.timer_task.cancel()
+            live.rtm_state = RTM_NONE
+
+            pr = db.get_player(pid_val)
+            if not pr:
+                await context.bot.send_message(query.message.chat_id, "⚠️ Player not found.")
+                return
+
+            if pr["status"] == "sold" and pr["sold_to"] != orig_uid:
+                await context.bot.send_message(
+                    query.message.chat_id,
+                    f"⚠️ {pr['name']} already sold to another team.")
+                return
+
+            ipl          = (pr["ipl_team"] or "N/A") if pr["ipl_team"] is not None else "N/A"
+            orig_row_pre = db.get_part(aid, orig_uid)
+            orig_name    = team_display(orig_row_pre) if orig_row_pre else live.rtm_orig_bidder_name
+            rtm_row_pre  = db.get_part(aid, rtm_uid)
+            rtm_name     = team_display(rtm_row_pre) if rtm_row_pre else live.rtm_team_name
+
+            # DB: sell to original bidder at original price
+            db.set_player_status(pr["player_id"], "sold", orig_uid, orig_price, None, query.message.chat_id)
+            db.deduct_purse(aid, orig_uid, orig_price)
+            db.add_to_squad(aid, orig_uid, pr["player_id"])
+            db.record_bid(aid, orig_uid, pr["player_id"], pr["name"], orig_price, won=True)
+
+            orig_row = db.get_part(aid, orig_uid)
+            rem      = orig_row["purse"] if orig_row else 0
+            sq       = len(json.loads(orig_row["squad"])) if orig_row else 0
+            ts       = ist_now()
+
+            text = (
+                f"❌ *RTM DECLINED - ORIGINAL SALE!*\n"
+                f"{'═'*20}\n\n"
+                f"🏏 *{flag(pr['nationality'])} {pr['name']}* ({ipl})\n"
+                f"🎯 {pr['role']} | {pr['nationality']}\n\n"
+                f"💰 *Final Price:* {fmt(orig_price, aid)} (Original bid)\n"
+                f"🏆 *Winner:* *{orig_name}*\n\n"
+                f"🎴 {rtm_name} declined to match the raised bid\n\n"
+                f"📊 *Transaction:*\n"
+                f"• Deducted: {fmt(orig_price, aid)} from {orig_name}\n"
+                f"• Remaining Purse: {fmt(rem, aid)}\n"
+                f"• Squad: {sq}/25 players\n\n"
+                f"✅ {orig_name} wins the player!\n\n"
+                f"⏰ Sold at: {ts}"
             )
-        except Exception:
-            pass
-        await query.answer("❌ Declined.")
-        if pr:
-            await _finalize(context, pr, rtm_declined=True)
+
+            try:
+                await query.edit_message_text(text, parse_mode=ParseMode.MARKDOWN)
+            except Exception:
+                await context.bot.send_message(
+                    query.message.chat_id, text,
+                    parse_mode=ParseMode.MARKDOWN, reply_markup=reauction_keyboard())
+
+            live.sold_count         += 1
+            _set_last_sold(pr["player_id"], pr["name"], orig_uid, orig_name, orig_price)
+            live.current_player_id   = None
+            live.current_bid         = 0
+            live.highest_bidder_id   = None
+            live.highest_bidder_name = ""
+            live.rtm_team_id         = None
+            live.rtm_counter_bid     = 0
+            await _try_auto_next(context)
+
+        except Exception as e:
+            logger.error(f"rn| handler CRASHED: {e}", exc_info=True)
+            await context.bot.send_message(
+                query.message.chat_id,
+                f"⚠️ RTM NO error — admin use /forcesold\nDetails: {e}")
         return
 
     # ── REAUCTION PROMPT ─────────────────────
