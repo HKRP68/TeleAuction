@@ -118,6 +118,16 @@ class LiveState:
     # TeamUp links {linked_uid: primary_uid}
     team_links: dict           = field(default_factory=dict)
 
+    # Squad composition limits (set via /setlimit)
+    # Format: {"OS":(max,min),"Bat":(max,min),"Bowl":(max,min),"AR":(max,min),"WK":(max,min)}
+    squad_limits: dict         = field(default_factory=dict)
+
+    # Minimum bid increment (lakhs) — default 10L
+    min_increment: int         = 10
+
+    # Undo snapshot — stores last sold transaction for /undo
+    undo_snapshot: Optional[dict] = None
+
 
 live = LiveState()
 flask_app = Flask(__name__)
@@ -576,6 +586,8 @@ def save_live_state():
         "auto_sell_secs": live.auto_sell_secs,
         "auto_next_secs": live.auto_next_secs,
         "auto_next_on":   live.auto_next_on,
+        "squad_limits":   live.squad_limits,
+        "min_increment":  live.min_increment,
         "player_queue":   [
             (r["player_id"] if hasattr(r, "keys") else int(r))
             for r in live.player_queue
@@ -672,6 +684,8 @@ def _apply_state_dict(state: dict) -> bool:
         live.auto_sell_secs = state.get("auto_sell_secs")
         live.auto_next_secs = state.get("auto_next_secs")
         live.auto_next_on   = state.get("auto_next_on", False)
+        live.squad_limits   = state.get("squad_limits", {})
+        live.min_increment  = state.get("min_increment", 10)
         pids = state.get("player_queue", [])
         live.player_queue = []
         for pid in pids:
@@ -911,17 +925,77 @@ def get_rtm_eligible(aid: int, exclude_uid: int, ipl_team: str = "") -> list:
 
 
 def validate_bid(row, player_row, bid_l: int, auction_row) -> Optional[str]:
+    aid = row["auction_id"]
     if row["is_muted"]:
         return "Your team is muted and cannot bid."
     if row["purse"] < bid_l:
-        return f"Not enough purse! You have {fmt(row['purse'], row['auction_id'])} left."
+        return f"Not enough purse! You have {fmt(row['purse'], aid)} left."
     sq = json.loads(row["squad"])
     if len(sq) >= auction_row["max_players"]:
         return f"Squad full! Max {auction_row['max_players']} players."
     if bid_l < player_row["base_price"] and player_row["base_price"] > 0:
-        return f"Min bid is {fmt(player_row['base_price'], row['auction_id'])}."
+        return f"Min bid is {fmt(player_row['base_price'], aid)}."
     if live.current_bid > 0 and bid_l <= live.current_bid:
-        return f"Bid must exceed current {fmt(live.current_bid, row['auction_id'])}."
+        return f"Bid must exceed current {fmt(live.current_bid, aid)}."
+    # Minimum increment check
+    if live.current_bid > 0 and live.min_increment > 0:
+        if bid_l - live.current_bid < live.min_increment:
+            return (
+                f"Minimum raise is {fmt(live.min_increment, aid)}. "
+                f"Bid at least {fmt(live.current_bid + live.min_increment, aid)}."
+            )
+    # Squad composition limits
+    if live.squad_limits:
+        lims = live.squad_limits
+        p_role = player_row["role"]    # Bat / Bowl / AR / WK
+        p_nat  = player_row["nationality"]  # Indian / Overseas
+
+        # Build current squad role counts
+        def _squad_counts(sq_ids):
+            counts = {"Bat": 0, "Bowl": 0, "AR": 0, "WK": 0, "OS": 0, "Indian": 0}
+            for pid in sq_ids:
+                pr = db.get_player(int(pid))
+                if not pr: continue
+                counts[pr["role"]]  = counts.get(pr["role"], 0) + 1
+                if pr["nationality"] == "Overseas":
+                    counts["OS"] += 1
+                else:
+                    counts["Indian"] += 1
+            return counts
+
+        counts = _squad_counts(sq)
+        remaining = auction_row["max_players"] - len(sq)  # slots left including this player
+
+        # Overseas cap
+        if p_nat == "Overseas" and "OS" in lims:
+            os_max, os_min = lims["OS"]
+            if counts["OS"] >= os_max:
+                return f"Overseas limit reached! Max {os_max} overseas players per squad."
+
+        # Role max cap
+        role_key = p_role  # Bat, Bowl, AR, WK
+        if role_key in lims:
+            r_max, r_min = lims[role_key]
+            if counts.get(role_key, 0) >= r_max:
+                return f"Role limit reached! Max {r_max} {role_key} players per squad."
+
+        # Check if buying this player would make min requirements for other roles impossible
+        # (only warn if squad is nearly full)
+        if remaining <= 3:
+            for chk_role, (chk_max, chk_min) in lims.items():
+                if chk_min <= 0 or chk_role == "OS":
+                    continue
+                chk_role_key = chk_role
+                current_count = counts.get(chk_role_key, 0)
+                if chk_role_key == p_role:
+                    current_count += 1  # this player would add one
+                slots_after = remaining - 1  # after buying this player
+                if current_count + slots_after < chk_min:
+                    return (
+                        f"⚠️ Buying this player makes {chk_role} minimum ({chk_min}) "
+                        f"impossible to reach with {slots_after} slots left."
+                    )
+
     return None
 
 
@@ -979,62 +1053,66 @@ def _cr(lakhs: int) -> str:
     return f"{lakhs}L"
 
 
-# ── STEP 1: RTM CHECK after bid timer expires ─────────────
+# ── STEP 2: RTM CHALLENGE — bot asks Team A if they want to RTM ───
 def rtm_check_text(player_row, eligible: list) -> str:
-    ipl   = player_row["ipl_team"] or "N/A"
-    names = "\n".join(f"  • *{team_display(r)}*" for r in eligible)
+    """Sent to Team A after timer expires — USE RTM or PASS buttons."""
+    ipl      = player_row["ipl_team"] or "N/A"
+    aid      = player_row["auction_id"]
+    # Show one team or list if multiple
+    team_a   = ", ".join(f"*{md_safe(team_display(r))}*" for r in eligible)
     return (
-        f"⏰ *AUCTION PAUSED - RTM CHECK*\n"
+        f"🔄 *RTM CHALLENGE!*\n"
         f"{'═'*20}\n\n"
-        f"🏏 *{flag(player_row['nationality'])} {player_row['name']}* ({ipl})\n"
-        f"🎯 {player_row['role']} | {player_row['nationality']}\n\n"
-        f"💵 *Final Bid:* ₹{_cr(live.current_bid)}\n"
-        f"👤 *Leading Team:* {live.highest_bidder_name}\n\n"
-        f"🎴 *RTM ALERT*\n"
-        f"Team(s) with *{ipl}* RTM card:\n"
-        f"{names}\n\n"
-        f"⏱️ *{Config.RTM_OFFER_TIMER} seconds* to use RTM!\n"
-        f"Use: `/rtm {player_row['name']}` or `/right_to_match {player_row['name']}`"
+        f"🏏 *{flag(player_row['nationality'])} {md_safe(player_row['name'])}*\n"
+        f"💰 Winning Bid: *{fmt(live.current_bid, aid)}* by *{md_safe(live.highest_bidder_name)}*\n\n"
+        f"🎴 {team_a}, do you want to exercise your *Right to Match*?\n\n"
+        f"⏳ *{Config.RTM_OFFER_TIMER} seconds* to decide!"
     )
 
 
-# ── STEP 2: RTM CARD ACTIVATED ────────────────────────────
+def rtm_challenge_keyboard(eligible: list, pid: int, orig_uid: int, orig_bid: int) -> InlineKeyboardMarkup:
+    """USE RTM / PASS buttons — only eligible team(s) and admin can click."""
+    rtm_uid = eligible[0]["user_id"] if eligible else 0
+    # Embed all data in callback to avoid live-state dependency
+    use_data  = f"rtm_use_btn|{pid}|{rtm_uid}|{orig_uid}|{orig_bid}"
+    pass_data = f"rtm_pass_btn|{pid}|{orig_uid}|{orig_bid}"
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ USE RTM", callback_data=use_data),
+        InlineKeyboardButton("❌ PASS",    callback_data=pass_data),
+    ]])
+
+
+# ── STEP 3: Team B raise message (after Team A clicks USE RTM) ────
 def rtm_activated_text(player_row) -> str:
-    ipl = player_row["ipl_team"] or "N/A"
+    aid = player_row["auction_id"]
     return (
-        f"🎴 *RTM CARD ACTIVATED!*\n"
+        f"📈 *TEAM B: RAISE THE STAKES!*\n"
         f"{'═'*20}\n\n"
-        f"🏏 *{player_row['name']}*\n"
-        f"💰 Original Bid: *₹{_cr(live.rtm_orig_bid)}*\n"
-        f"👤 Original Winner: *{live.rtm_orig_bidder_name}*\n\n"
-        f"🎯 *{live.rtm_team_name}* has used RTM Card for *{ipl}*!\n\n"
-        f"📋 *WHAT HAPPENS NOW?*\n"
-        f"1️⃣ {live.rtm_orig_bidder_name} can raise the bid "
-        f"(use `/bid {player_row['name']} <amount>`)\n"
-        f"2️⃣ If raised, {live.rtm_team_name} must Accept or Reject the new amount\n"
-        f"3️⃣ If no raise in {Config.RTM_COUNTER_TIMER}s, "
-        f"{live.rtm_team_name} gets player for ₹{_cr(live.rtm_orig_bid)}\n\n"
-        f"⏱️ *{Config.RTM_COUNTER_TIMER} seconds* for {live.rtm_orig_bidder_name} to raise..."
+        f"*{md_safe(live.rtm_team_name)}* wants to RTM!\n\n"
+        f"🏏 *{md_safe(player_row['name'])}*\n"
+        f"💰 Current bid: *{fmt(live.rtm_orig_bid, aid)}*\n\n"
+        f"*{md_safe(live.rtm_orig_bidder_name)}*, you have one chance to raise.\n"
+        f"Use /bid <amount> — must be higher than {fmt(live.rtm_orig_bid, aid)}.\n\n"
+        f"⏳ *{Config.RTM_COUNTER_TIMER} seconds* to raise...\n"
+        f"_(No raise = {md_safe(live.rtm_team_name)} wins at current price)_"
     )
 
 
-# ── STEP 3: BID RAISED by original bidder ─────────────────
+# ── STEP 4: Final Decision — Team A MATCH or DECLINE ─────────────
 def rtm_bid_raised_text(player_row, new_bid: int) -> str:
     diff = new_bid - live.rtm_orig_bid
+    aid  = player_row["auction_id"]
     return (
-        f"⬆️ *BID RAISED!*\n"
+        f"⚖️ *FINAL MATCH DECISION*\n"
         f"{'═'*20}\n\n"
-        f"🏏 *{player_row['name']}*\n\n"
-        f"💵 New Bid: *₹{_cr(new_bid)}* ⬆️\n"
-        f"👤 Raised By: *{live.rtm_orig_bidder_name}*\n"
-        f"📈 Increase: +₹{_cr(diff)}\n\n"
-        f"🎴 *RTM DECISION REQUIRED*\n"
-        f"{live.rtm_team_name}, do you match this new bid?\n\n"
-        f"💭 *Your Options:*\n"
-        f"✅ *YES* → Buy player for ₹{_cr(new_bid)} (Deducted from purse)\n"
-        f"❌ *NO* → Lose player to {live.rtm_orig_bidder_name} for ₹{_cr(live.rtm_orig_bid)}\n\n"
-        f"⏱️ *{Config.RTM_DECISION_TIMER} seconds* to decide!\n\n"
-        f"_Only {live.rtm_team_name} or Admin can click_"
+        f"*{md_safe(live.rtm_orig_bidder_name)}* raised to *{fmt(new_bid, aid)}*!\n\n"
+        f"🏏 *{md_safe(player_row['name'])}*\n"
+        f"📈 Increase: +{fmt(diff, aid)}\n\n"
+        f"*{md_safe(live.rtm_team_name)}*, will you match this final amount?\n\n"
+        f"✅ *MATCH* → Player sold to you for {fmt(new_bid, aid)}\n"
+        f"❌ *DECLINE* → Player goes to {md_safe(live.rtm_orig_bidder_name)} for {fmt(new_bid, aid)}\n\n"
+        f"⏳ *{Config.RTM_DECISION_TIMER} seconds* to decide!\n"
+        f"_Only {md_safe(live.rtm_team_name)} or Admin can click_"
     )
 
 
@@ -1170,8 +1248,8 @@ def rtm_wait_decision_text(rtm_team: str, new_bid: int, original_bid: int,
 
 def rtm_ask_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([[
-        InlineKeyboardButton("✅ YES", callback_data="rtm_yes"),
-        InlineKeyboardButton("❌ NO",  callback_data="rtm_no"),
+        InlineKeyboardButton("✅ MATCH",   callback_data="rtm_yes"),
+        InlineKeyboardButton("❌ DECLINE", callback_data="rtm_no"),
     ]])
 
 
@@ -1332,10 +1410,9 @@ async def _mark_unsold(context: ContextTypes.DEFAULT_TYPE, pr):
 
 async def _check_rtm(context: ContextTypes.DEFAULT_TYPE, pr):
     """
-    STEP 1 — After bid timer expires with a bid.
-    Checks for eligible RTM teams matching the player's ipl_team.
-    If found → sends RTM CHECK message and opens 30s offer window.
-    If none  → finalizes immediately.
+    Called when bid timer expires with a bid.
+    NEW FLOW: If eligible RTM teams exist, send RTM CHALLENGE with buttons.
+    Team A clicks USE RTM (card deducted then) or PASS (card untouched).
     """
     ipl_team = (pr["ipl_team"] or "") if pr["ipl_team"] is not None else ""
     eligible = get_rtm_eligible(live.auction_id, live.highest_bidder_id, ipl_team)
@@ -1344,30 +1421,53 @@ async def _check_rtm(context: ContextTypes.DEFAULT_TYPE, pr):
         await _finalize(context, pr)
         return
 
-    live.rtm_state = RTM_OFFERED
+    # Store who the challenge is for (first eligible team — or handle multiple below)
+    live.rtm_state            = RTM_OFFERED
+    live.rtm_team_id          = eligible[0]["user_id"]
+    live.rtm_team_name        = bid_display(eligible[0])
+    live.rtm_orig_bidder_id   = live.highest_bidder_id
+    live.rtm_orig_bidder_name = live.highest_bidder_name
+    live.rtm_orig_bid         = live.current_bid
+    # Keep current_player_id alive so buttons can reference it
+
     msg = await context.bot.send_message(
         chat_id=live.chat_id,
         text=rtm_check_text(pr, eligible),
         parse_mode=ParseMode.MARKDOWN,
+        reply_markup=rtm_challenge_keyboard(
+            eligible,
+            pid      = pr["player_id"],
+            orig_uid = live.highest_bidder_id,
+            orig_bid = live.current_bid,
+        ),
     )
     live.rtm_offer_msg_id = msg.message_id
     live.timer_task = asyncio.create_task(_rtm_offer_timer(context))
 
 
 async def _rtm_offer_timer(context: ContextTypes.DEFAULT_TYPE):
-    """Wait RTM_OFFER_TIMER (30s) for an eligible team to use /rtm, then finalize."""
+    """15s for Team A to click USE RTM or PASS. Expiry = auto-PASS."""
     end = _time.time() + Config.RTM_OFFER_TIMER
     while _time.time() < end:
         await asyncio.sleep(1)
         if live.rtm_state != RTM_OFFERED:
-            return  # Someone acted on it
+            return  # Team A already clicked
     if live.rtm_state == RTM_OFFERED:
         live.rtm_state = RTM_NONE
+        # Remove buttons and show timeout message
+        try:
+            await context.bot.edit_message_reply_markup(
+                chat_id=live.chat_id,
+                message_id=live.rtm_offer_msg_id,
+                reply_markup=None,
+            )
+        except Exception:
+            pass
         await context.bot.send_message(
             chat_id=live.chat_id,
             text=(
                 f"⏰ RTM window expired. "
-                f"*{live.highest_bidder_name}* wins the player!"
+                f"*{md_safe(live.rtm_orig_bidder_name)}* wins the player!"
             ),
             parse_mode=ParseMode.MARKDOWN,
         )
@@ -1378,41 +1478,49 @@ async def _rtm_offer_timer(context: ContextTypes.DEFAULT_TYPE):
 
 async def _rtm_counter_timer(context: ContextTypes.DEFAULT_TYPE):
     """
-    STEP 5 path — Wait RTM_COUNTER_TIMER (20s) for original bidder to raise.
-    If no raise → RTM team wins at original bid (STEP 5 message).
+    Step 3 — Wait RTM_COUNTER_TIMER for Team B (original bidder) to raise.
+    If Team B does NOT raise: Team A auto-wins at the ORIGINAL price (no Step 4 needed).
+    If Team B raises: move to Step 4 (MATCH / DECLINE).
     """
     end = _time.time() + Config.RTM_COUNTER_TIMER
     live.rtm_counter_ends_at = end
     while _time.time() < end:
         await asyncio.sleep(1)
         if live.rtm_state != RTM_ACTIVE:
-            return  # Bidder countered — state moved on
+            return  # Team B raised — state moved to RTM_COUNTER
+
     if live.rtm_state != RTM_ACTIVE:
         return
-    # No raise — RTM team wins
+
+    # Team B did NOT raise → Team A auto-wins at original price
+    orig_bid           = live.rtm_orig_bid
+    rtm_uid            = live.rtm_team_id
+    rtm_name           = live.rtm_team_name
+    orig_bidder_name   = live.rtm_orig_bidder_name
+    aid                = live.auction_id
+
     live.rtm_state           = RTM_NONE
-    live.current_bid         = live.rtm_orig_bid
-    live.highest_bidder_id   = live.rtm_team_id
-    live.highest_bidder_name = live.rtm_team_name
+    live.current_bid         = orig_bid
+    live.highest_bidder_id   = rtm_uid
+    live.highest_bidder_name = rtm_name
 
     pr = db.get_player(live.current_player_id)
     if not pr:
         return
 
-    # Fetch RTM team cards remaining (already deducted when /rtm was used)
-    rtm_row   = db.get_part(live.auction_id, live.rtm_team_id)
+    rtm_row    = db.get_part(aid, rtm_uid)
     cards_left = rtm_row["rtm_cards"] if rtm_row else 0
-    sq_count   = len(json.loads(rtm_row["squad"])) + 1 if rtm_row else 0  # +1 after acquire
+    sq_count   = len(json.loads(rtm_row["squad"])) + 1 if rtm_row else 0
 
     await context.bot.send_message(
         chat_id=live.chat_id,
         text=rtm_no_raise_text(
             pr,
-            orig_bid      = live.rtm_orig_bid,
-            rtm_team      = live.rtm_team_name,
-            rtm_cards_left= cards_left,
-            squad_count   = sq_count,
-            original_team = live.rtm_orig_bidder_name,
+            orig_bid       = orig_bid,
+            rtm_team       = rtm_name,
+            rtm_cards_left = cards_left,
+            squad_count    = sq_count,
+            original_team  = orig_bidder_name,
         ),
         parse_mode=ParseMode.MARKDOWN,
     )
@@ -1500,6 +1608,19 @@ async def _finalize(context: ContextTypes.DEFAULT_TYPE, pr,
     _orig_bidder  = live.rtm_orig_bidder_name
     _orig_bid     = live.rtm_orig_bid
     _counter_bid  = live.rtm_counter_bid
+
+    # Save undo snapshot BEFORE any DB writes so /undo can reverse this
+    winner_row_pre = db.get_part(aid, winner_id)
+    squad_pre      = winner_row_pre["squad"] if winner_row_pre else "[]"
+    live.undo_snapshot = {
+        "player_id":   pr["player_id"],
+        "player_name": pr["name"],
+        "winner_id":   winner_id,
+        "winner_name": winner_name,
+        "price":       final_price,
+        "squad_pre":   squad_pre,       # squad BEFORE this player was added
+        "purse_pre":   (winner_row_pre["purse"] if winner_row_pre else 0),
+    }
 
     # Persist DB writes FIRST so remaining purse is correct
     db.set_player_status(pr["player_id"], "sold", winner_id, final_price, None, live.chat_id)
@@ -1788,6 +1909,14 @@ async def process_bid(update, context: ContextTypes.DEFAULT_TYPE,
 
     # RTM counter scenario — original bidder raises bid → Step 3
     if live.rtm_state == RTM_ACTIVE and uid == live.rtm_orig_bidder_id:
+        # Bid MUST be strictly higher than current (original) bid
+        if bid_l <= live.rtm_orig_bid:
+            await err(
+                f"Your raise must be *higher* than the current bid "
+                f"({fmt(live.rtm_orig_bid, aid)}). "
+                f"Or wait — {md_safe(live.rtm_team_name)} will win at current price."
+            )
+            return
         if live.timer_task and not live.timer_task.done():
             live.timer_task.cancel()
 
@@ -1808,8 +1937,8 @@ async def process_bid(update, context: ContextTypes.DEFAULT_TYPE,
             text=rtm_bid_raised_text(pr, bid_l),
             parse_mode=ParseMode.MARKDOWN,
             reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("✅ YES", callback_data=yes_data),
-                InlineKeyboardButton("❌ NO",  callback_data=no_data),
+                InlineKeyboardButton("✅ MATCH",   callback_data=yes_data),
+                InlineKeyboardButton("❌ DECLINE", callback_data=no_data),
             ]]),
         )
         live.rtm_msg_id = ask_msg.message_id
@@ -2563,6 +2692,512 @@ async def cmd_bulk_player(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+
+# ── UNDO LAST SALE ────────────────────────────────────────
+
+async def cmd_undo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/undo — Reverse the last SOLD transaction."""
+    await _reg(update.effective_user)
+    if not db.is_admin(update.effective_user.id):
+        await update.message.reply_text("Admin only.")
+        return
+    if not live.undo_snapshot:
+        await update.message.reply_text("Nothing to undo.")
+        return
+
+    snap = live.undo_snapshot
+    aid  = live.auction_id
+    pid  = snap["player_id"]
+    wid  = snap["winner_id"]
+
+    # Reverse: restore player to available
+    db.cx.execute(
+        "UPDATE players SET status='available', sold_to=NULL, "
+        "sold_price=NULL, sold_msg_id=NULL, sold_chat_id=NULL WHERE player_id=?",
+        (pid,)
+    )
+    # Restore purse
+    db.cx.execute(
+        "UPDATE participants SET purse=?, squad=? WHERE auction_id=? AND user_id=?",
+        (snap["purse_pre"], snap["squad_pre"], aid, wid)
+    )
+    # Recalculate total_spent
+    db.cx.execute(
+        "UPDATE participants SET total_spent=("
+        "  SELECT COALESCE(SUM(b.bid_amount),0) FROM bid_history b "
+        "  WHERE b.auction_id=? AND b.user_id=? AND b.won=1"
+        ") WHERE auction_id=? AND user_id=?",
+        (aid, wid, aid, wid)
+    )
+    # Remove winning bid from history
+    db.cx.execute(
+        "DELETE FROM bid_history WHERE auction_id=? AND user_id=? AND player_id=? AND won=1",
+        (aid, wid, pid)
+    )
+    db.cx.commit()
+
+    # Add player back to front of queue
+    fresh = db.get_player(pid)
+    if fresh:
+        live.player_queue.insert(0, fresh)
+    live.sold_count = max(0, live.sold_count - 1)
+    live.undo_snapshot = None  # can only undo once
+    save_live_state()
+
+    await update.message.reply_text(
+        f"↩️ *Undone!*\n"
+        f"*{md_safe(snap['player_name'])}* returned to queue.\n"
+        f"*{md_safe(snap['winner_name'])}* purse restored by {fmt(snap['price'], aid)}.\n\n"
+        f"Use /next to re-auction this player.",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+
+
+# ── SET SQUAD LIMITS ─────────────────────────────────────
+
+async def cmd_set_limit(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/setlimit OS_max-OS_min,BAT_max-BAT_min,BOWL_max-BOWL_min,ALR_max-ALR_min,WK_max-WK_min
+    
+    Example: /setlimit 8-4,12-5,8-3,4-2,2-1
+    Sets: Overseas max=8 min=4, Bat max=12 min=5, Bowl max=8 min=3, AR max=4 min=2, WK max=2 min=1
+    Use 0-0 to leave a category unlimited.
+    /setlimit show — display current limits
+    /setlimit clear — remove all limits
+    """
+    await _reg(update.effective_user)
+    if not db.is_admin(update.effective_user.id):
+        await update.message.reply_text("Admin only.")
+        return
+
+    def _fmt_limits() -> str:
+        if not live.squad_limits:
+            return "No limits set."
+        lines = []
+        labels = {"OS": "🌏 Overseas", "Bat": "🏏 Batsmen", "Bowl": "🎳 Bowlers",
+                  "AR": "⚡ All-Rounders", "WK": "🧤 Wicket-Keepers"}
+        for k, lbl in labels.items():
+            if k in live.squad_limits:
+                mx, mn = live.squad_limits[k]
+                lines.append(f"{lbl}: min {mn} — max {mx}")
+        return "\n".join(lines) if lines else "No limits set."
+
+    if not context.args:
+        await update.message.reply_text(
+            f"⚖️ *Squad Composition Limits*\n{'─'*28}\n"
+            f"{_fmt_limits()}\n\n"
+            f"Usage:\n"
+            f"`/setlimit OS-BAT-BOWL-ALR-WK`\n"
+            f"Each value: `max-min` (use 0-0 = no limit)\n\n"
+            f"Example: `/setlimit 8-4,12-5,8-3,4-2,2-1`\n"
+            f"→ Overseas: 4–8 | Bat: 5–12 | Bowl: 3–8 | AR: 2–4 | WK: 1–2",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+
+    arg = context.args[0].lower()
+    if arg == "show":
+        await update.message.reply_text(
+            f"⚖️ *Current Limits*\n{'─'*28}\n{_fmt_limits()}",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+    if arg == "clear":
+        live.squad_limits = {}
+        save_live_state()
+        await update.message.reply_text("✅ All squad limits cleared.")
+        return
+
+    parts = context.args[0].split(",")
+    if len(parts) != 5:
+        await update.message.reply_text(
+            "❌ Need exactly 5 values separated by commas:\n"
+            "`/setlimit OS,BAT,BOWL,ALR,WK`\n"
+            "Each as `max-min`, e.g. `8-4`\n"
+            "Use `0-0` to leave unlimited.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+
+    keys = ["OS", "Bat", "Bowl", "AR", "WK"]
+    limits = {}
+    for key, val in zip(keys, parts):
+        val = val.strip()
+        if val in ("0-0", "0"):
+            continue  # unlimited
+        if "-" not in val:
+            await update.message.reply_text(f"❌ Bad format for {key}: `{val}`. Use `max-min` e.g. `8-4`.")
+            return
+        try:
+            mx, mn = val.split("-", 1)
+            mx, mn = int(mx.strip()), int(mn.strip())
+            if mx < mn:
+                await update.message.reply_text(f"❌ {key}: max ({mx}) must be ≥ min ({mn})")
+                return
+            if mx > 0:
+                limits[key] = (mx, mn)
+        except ValueError:
+            await update.message.reply_text(f"❌ Bad numbers for {key}: `{val}`")
+            return
+
+    live.squad_limits = limits
+    save_live_state()
+    await update.message.reply_text(
+        f"✅ *Squad Limits Set*\n{'─'*28}\n{_fmt_limits()}",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+
+
+# ── SET BID INCREMENT ─────────────────────────────────────
+
+async def cmd_set_increment(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/setincrement <amount> — Set minimum bid raise (e.g. 25l, 1cr)."""
+    await _reg(update.effective_user)
+    if not db.is_admin(update.effective_user.id):
+        await update.message.reply_text("Admin only.")
+        return
+    if not context.args:
+        await update.message.reply_text(
+            f"📈 Min Increment: *{fmt(live.min_increment, live.auction_id)}*\n"
+            f"Usage: /setincrement <amount>\n"
+            f"Examples: /setincrement 25l  /setincrement 1cr  /setincrement 0 (off)",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+    v = parse_price(context.args[0])
+    if v is None:
+        await update.message.reply_text("Invalid amount.")
+        return
+    live.min_increment = v
+    save_live_state()
+    label = fmt(v, live.auction_id) if v > 0 else "off"
+    await update.message.reply_text(
+        f"✅ Minimum bid increment: *{label}*",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+
+
+# ── SET SQUAD SIZE MID-AUCTION ────────────────────────────
+
+async def cmd_set_squad_limit(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/setsquadlimit <min> <max> — Change squad size limits mid-auction."""
+    await _reg(update.effective_user)
+    if not db.is_admin(update.effective_user.id):
+        await update.message.reply_text("Admin only.")
+        return
+    if not live.auction_id:
+        await update.message.reply_text("No active auction.")
+        return
+    if len(context.args) < 2:
+        ar = db.get_auction(live.auction_id)
+        await update.message.reply_text(
+            f"Squad size: min={ar['min_players']} max={ar['max_players']}\n"
+            f"Usage: /setsquadlimit <min> <max>",
+        )
+        return
+    try:
+        mn, mx = int(context.args[0]), int(context.args[1])
+        if mn > mx or mn < 1 or mx > 50:
+            raise ValueError
+    except ValueError:
+        await update.message.reply_text("Invalid. Example: /setsquadlimit 11 25")
+        return
+    db.cx.execute(
+        "UPDATE auctions SET min_players=?, max_players=? WHERE auction_id=?",
+        (mn, mx, live.auction_id)
+    )
+    db.cx.commit()
+    await update.message.reply_text(
+        f"✅ Squad limits updated: min *{mn}* — max *{mx}*",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+
+
+# ── FIND PLAYER ───────────────────────────────────────────
+
+async def cmd_find_player(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/findplayer <name|role|team> — Search players by name, role, or team."""
+    await _reg(update.effective_user)
+    if not db.is_admin(update.effective_user.id):
+        await update.message.reply_text("Admin only.")
+        return
+    if not live.auction_id:
+        await update.message.reply_text("No active auction.")
+        return
+    if not context.args:
+        await update.message.reply_text("Usage: /findplayer <name or role or team>")
+        return
+
+    query = " ".join(context.args).strip().lower()
+    aid   = live.auction_id
+    rows  = db.cx.execute(
+        "SELECT p.*, pt.team_name as buyer_team FROM players p "
+        "LEFT JOIN participants pt ON pt.auction_id=p.auction_id AND pt.user_id=p.sold_to "
+        "WHERE p.auction_id=? AND ("
+        "  LOWER(p.name) LIKE ? OR LOWER(p.role) LIKE ? OR "
+        "  LOWER(p.ipl_team) LIKE ? OR LOWER(p.tier) LIKE ? OR "
+        "  LOWER(p.nationality) LIKE ?"
+        ") ORDER BY p.status, p.name LIMIT 20",
+        (aid, f"%{query}%", f"%{query}%", f"%{query}%", f"%{query}%", f"%{query}%")
+    ).fetchall()
+
+    if not rows:
+        await update.message.reply_text(f"No players found matching '{query}'")
+        return
+
+    lines = [f"🔍 *Results for '{query}'* ({len(rows)})\n{'─'*28}"]
+    for r in rows:
+        status_icon = {"sold": "✅", "unsold": "❌", "available": "🔵"}.get(r["status"], "❓")
+        price_info  = f" → {fmt(r['sold_price'], aid)} ({r['buyer_team'] or '?'})" if r["status"] == "sold" else ""
+        in_queue    = " _(in queue)_" if any(
+            (q["player_id"] if hasattr(q, "keys") else q) == r["player_id"]
+            for q in live.player_queue
+        ) else ""
+        lines.append(
+            f"{status_icon} *{md_safe(r['name'])}* — {r['role']} | {r['ipl_team'] or 'N/A'}"
+            f" | {fmt(r['base_price'], aid)}{price_info}{in_queue}"
+        )
+
+    text = "\n".join(lines)
+    try:
+        await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
+    except Exception:
+        await update.message.reply_text(text.replace("*","").replace("_",""))
+
+
+# ── PLAYER CARD ───────────────────────────────────────────
+
+async def cmd_player_card(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/playercard <name> — Show full player profile."""
+    await _reg(update.effective_user)
+    if not live.auction_id:
+        await update.message.reply_text("No active auction.")
+        return
+    if not context.args:
+        await update.message.reply_text("Usage: /playercard <player name>")
+        return
+
+    query = " ".join(context.args).strip()
+    aid   = live.auction_id
+    rows  = db.cx.execute(
+        "SELECT * FROM players WHERE auction_id=? AND LOWER(name) LIKE ?",
+        (aid, f"%{query.lower()}%")
+    ).fetchall()
+
+    if not rows:
+        await update.message.reply_text(f"Player '{query}' not found.")
+        return
+
+    r = rows[0]
+    status_icon = {"sold": "✅ SOLD", "unsold": "❌ UNSOLD", "available": "🔵 Available"}.get(
+        r["status"], r["status"])
+    buyer_line = ""
+    if r["status"] == "sold" and r["sold_to"]:
+        pt = db.get_part(aid, r["sold_to"])
+        buyer_name = pt["team_name"] if pt else "Unknown"
+        buyer_line = f"\n🏆 *Sold to:* {md_safe(buyer_name)} at {fmt(r['sold_price'], aid)}"
+
+    in_queue_pos = next(
+        (i+1 for i, q in enumerate(live.player_queue)
+         if (q["player_id"] if hasattr(q, "keys") else q) == r["player_id"]),
+        None
+    )
+    queue_line = f"\n📋 Queue position: #{in_queue_pos}" if in_queue_pos else ""
+
+    text = (
+        f"🏏 *{flag(r['nationality'])} {md_safe(r['name'])}*\n"
+        f"{'─'*28}\n"
+        f"🎯 Role: *{r['role']}* | {r['nationality']}\n"
+        f"🏟 Prev Team: *{r['ipl_team'] or 'None'}*\n"
+        f"⭐ Tier: *{r['tier']}*\n"
+        f"💰 Base Price: *{fmt(r['base_price'], aid) if r['base_price'] else 'Open'}*\n"
+        f"📊 Status: *{status_icon}*"
+        f"{buyer_line}{queue_line}"
+    )
+    await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
+
+
+# ── MY STATS ─────────────────────────────────────────────
+
+async def cmd_my_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/mystats — Personal auction stats for team owners."""
+    await _reg(update.effective_user)
+    uid = eff_uid(update.effective_user.id)
+    aid = live.auction_id
+    if not aid:
+        await update.message.reply_text("No active auction.")
+        return
+
+    part = db.get_part(aid, uid)
+    if not part:
+        await update.message.reply_text("You are not registered in this auction.")
+        return
+
+    sq   = json.loads(part["squad"])
+    bids = db.cx.execute(
+        "SELECT * FROM bid_history WHERE auction_id=? AND user_id=? ORDER BY ts DESC",
+        (aid, uid)
+    ).fetchall()
+
+    won_bids  = [b for b in bids if b["won"]]
+    lost_bids = [b for b in bids if not b["won"]]
+    sq_players = [db.get_player(int(pid)) for pid in sq]
+    sq_players = [p for p in sq_players if p]
+
+    # Role breakdown
+    role_counts = {}
+    for p in sq_players:
+        role_counts[p["role"]] = role_counts.get(p["role"], 0) + 1
+
+    os_count  = sum(1 for p in sq_players if p["nationality"] == "Overseas")
+    ind_count = sum(1 for p in sq_players if p["nationality"] == "Indian")
+
+    ar = db.get_auction(aid)
+    max_sq = ar["max_players"] if ar else 25
+
+    role_line = " | ".join(f"{k}:{v}" for k, v in role_counts.items()) or "None"
+
+    text = (
+        f"📊 *My Stats — {md_safe(part['team_name'])}*\n"
+        f"{'─'*28}\n\n"
+        f"💰 *Purse:* {fmt(part['purse'], aid)} remaining\n"
+        f"💸 *Total Spent:* {fmt(part['total_spent'], aid)}\n\n"
+        f"🏏 *Squad:* {len(sq)}/{max_sq} players\n"
+        f"  🇮🇳 Indian: {ind_count}  🌏 Overseas: {os_count}\n"
+        f"  Roles: {role_line}\n\n"
+        f"📋 *Bid History:*\n"
+        f"  🟢 Won: {len(won_bids)} players\n"
+        f"  🔴 Lost bids: {len(lost_bids)}\n"
+        f"  📈 Total bids placed: {len(bids)}\n"
+    )
+    if won_bids:
+        avg = sum(b["bid_amount"] for b in won_bids) // len(won_bids)
+        text += f"  💰 Avg price paid: {fmt(avg, aid)}\n"
+    if sq_players:
+        most_expensive = max(sq_players, key=lambda p: p["sold_price"] or 0)
+        text += f"\n🌟 *Most expensive:* {md_safe(most_expensive['name'])} — {fmt(most_expensive['sold_price'] or 0, aid)}"
+
+    await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
+
+
+# ── ANNOUNCE ─────────────────────────────────────────────
+
+async def cmd_announce(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/announce <message> — Broadcast a formatted message to the group."""
+    await _reg(update.effective_user)
+    if not db.is_admin(update.effective_user.id):
+        await update.message.reply_text("Admin only.")
+        return
+    if not context.args:
+        await update.message.reply_text("Usage: /announce <your message>")
+        return
+    msg_text = " ".join(context.args)
+    target   = live.chat_id or update.effective_chat.id
+    await context.bot.send_message(
+        chat_id=target,
+        text=f"📢 *ANNOUNCEMENT*\n{'─'*28}\n{msg_text}",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+
+
+# ── TRANSFER PLAYER ───────────────────────────────────────
+
+async def cmd_transfer(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/transfer @from @to <player name> — Trade a sold player between teams."""
+    await _reg(update.effective_user)
+    if not db.is_admin(update.effective_user.id):
+        await update.message.reply_text("Admin only.")
+        return
+    if not live.auction_id:
+        await update.message.reply_text("No active auction.")
+        return
+    if len(context.args) < 3:
+        await update.message.reply_text(
+            "Usage: /transfer @FromTeam @ToTeam <Player Name>\n"
+            "Example: /transfer @team1 @team2 Virat Kohli"
+        )
+        return
+
+    aid      = live.auction_id
+    from_arg = context.args[0].lstrip("@")
+    to_arg   = context.args[1].lstrip("@")
+    player_q = " ".join(context.args[2:]).strip()
+
+    # Resolve teams by username or team_name
+    parts = db.get_all_parts(aid)
+    def _find_team(q):
+        q_lo = q.lower()
+        for r in parts:
+            u = db.get_user(r["user_id"])
+            un = (u["username"] or "").lower() if u else ""
+            if un == q_lo or r["team_name"].lower() == q_lo:
+                return r
+        return None
+
+    from_row = _find_team(from_arg)
+    to_row   = _find_team(to_arg)
+    if not from_row:
+        await update.message.reply_text(f"Team '{from_arg}' not found.")
+        return
+    if not to_row:
+        await update.message.reply_text(f"Team '{to_arg}' not found.")
+        return
+
+    # Find the player in from_team's squad
+    from_sq = json.loads(from_row["squad"])
+    player_found = None
+    for pid in from_sq:
+        p = db.get_player(int(pid))
+        if p and player_q.lower() in p["name"].lower():
+            player_found = p
+            break
+
+    if not player_found:
+        await update.message.reply_text(
+            f"'{player_q}' not found in {from_row['team_name']}'s squad.\n"
+            f"Use /squad @{from_arg} to see their players."
+        )
+        return
+
+    to_sq = json.loads(to_row["squad"])
+    ar    = db.get_auction(aid)
+    if len(to_sq) >= ar["max_players"]:
+        await update.message.reply_text(f"{to_row['team_name']}'s squad is full (max {ar['max_players']}).")
+        return
+
+    price = player_found["sold_price"] or 0
+
+    # Perform transfer
+    # Remove from source squad
+    new_from_sq = [p for p in from_sq if int(p) != player_found["player_id"]]
+    # Add to destination squad
+    to_sq.append(player_found["player_id"])
+
+    db.cx.execute(
+        "UPDATE participants SET squad=?, purse=purse+?, total_spent=MAX(0,total_spent-?) "
+        "WHERE auction_id=? AND user_id=?",
+        (json.dumps(new_from_sq), price, price, aid, from_row["user_id"])
+    )
+    db.cx.execute(
+        "UPDATE participants SET squad=?, purse=MAX(0,purse-?), total_spent=total_spent+? "
+        "WHERE auction_id=? AND user_id=?",
+        (json.dumps(to_sq), price, price, aid, to_row["user_id"])
+    )
+    db.cx.execute(
+        "UPDATE players SET sold_to=? WHERE player_id=?",
+        (to_row["user_id"], player_found["player_id"])
+    )
+    db.cx.commit()
+
+    await update.message.reply_text(
+        f"🔄 *Transfer Complete!*\n{'─'*28}\n"
+        f"🏏 *{md_safe(player_found['name'])}*\n"
+        f"From: *{md_safe(from_row['team_name'])}*\n"
+        f"To: *{md_safe(to_row['team_name'])}*\n"
+        f"Price adjusted: {fmt(price, aid)}",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+
+
 # ── SET RTM ───────────────────────────────────────────────
 
 async def cmd_set_rtm(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -3259,6 +3894,450 @@ async def _do_end_auction(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
         text="✅ *Auction Successfully Ended!* Start a new one with /create\\_auction.",
         parse_mode=ParseMode.MARKDOWN,
     )
+    # Auto-send Excel data export to the group
+    try:
+        ar2   = db.get_auction(aid)
+        xlsx  = _build_auction_excel(aid)
+        fname = (live.auction_name or "Auction").replace(" ","_") + "_FinalData.xlsx"
+        await context.bot.send_document(
+            chat_id=chat_id,
+            document=xlsx,
+            filename=fname,
+            caption=(
+                f"📊 *{md_safe(live.auction_name)} — Final Auction Data*\n"
+                f"Sheets: Summary · Teams · Players · Squad Details · Bid History"
+            ),
+            parse_mode=ParseMode.MARKDOWN,
+        )
+    except Exception as e:
+        logger.warning(f"Auto-export Excel on end: {e}")
+
+
+# ─────────────────────────────────────────────────────────
+# DATA EXPORT / IMPORT
+# ─────────────────────────────────────────────────────────
+
+def _build_auction_excel(aid: int) -> bytes:
+    """Build a 5-sheet Excel workbook with all auction data."""
+    import io
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, PatternFill, Alignment
+    from openpyxl.utils import get_column_letter
+
+    HDR_FILL    = PatternFill("solid", start_color="1F4E79")
+    HDR_FONT    = Font(bold=True, color="FFFFFF", name="Arial", size=11)
+    ALT_FILL    = PatternFill("solid", start_color="D6E4F0")
+    SOLD_FILL   = PatternFill("solid", start_color="E2EFDA")
+    UNSOLD_FILL = PatternFill("solid", start_color="FCE4D6")
+
+    def style_header(ws, headers):
+        ws.append(headers)
+        for cell in ws[1]:
+            cell.font      = HDR_FONT
+            cell.fill      = HDR_FILL
+            cell.alignment = Alignment(horizontal="center", vertical="center")
+        ws.row_dimensions[1].height = 22
+
+    def autofit(ws):
+        for col in ws.columns:
+            col_letter = get_column_letter(col[0].column)
+            max_len = max((len(str(cell.value or "")) for cell in col), default=8)
+            ws.column_dimensions[col_letter].width = min(max(max_len + 3, 10), 42)
+
+    def alt_rows(ws, start_row=2):
+        for i, row in enumerate(ws.iter_rows(min_row=start_row), 1):
+            if i % 2 == 0:
+                for cell in row:
+                    cell.fill = ALT_FILL
+
+    ar      = db.get_auction(aid)
+    parts   = db.get_all_parts(aid)
+    players = db.cx.execute(
+        "SELECT * FROM players WHERE auction_id=? ORDER BY status, name", (aid,)
+    ).fetchall()
+    team_map = {r["user_id"]: r["team_name"] for r in parts}
+
+    wb = Workbook()
+
+    # ── Sheet 1: Summary ──
+    ws = wb.active
+    ws.title = "Summary"
+    ws["A1"] = f"Auction: {ar['name']}"
+    ws["A1"].font = Font(bold=True, name="Arial", size=14)
+    ws.merge_cells("A1:D1")
+    ws.append([])
+    for k, v in [
+        ("Status",         ar["status"].title()),
+        ("Max Teams",      ar["max_teams"]),
+        ("Starting Purse", f"{ar['purse']}L"),
+        ("Min / Max Squad", f"{ar['min_players']} / {ar['max_players']}"),
+        ("Currency",       ar["currency"]),
+        ("Players Total",  len(players)),
+        ("Sold",           sum(1 for p in players if p["status"] == "sold")),
+        ("Unsold",         sum(1 for p in players if p["status"] == "unsold")),
+        ("Available",      sum(1 for p in players if p["status"] == "available")),
+        ("Total Spent (L)", sum((p["sold_price"] or 0) for p in players if p["status"] == "sold")),
+    ]:
+        ws.append([k, v])
+        ws[ws.max_row][0].font = Font(bold=True, name="Arial")
+    ws.column_dimensions["A"].width = 22
+    ws.column_dimensions["B"].width = 20
+
+    # ── Sheet 2: Teams ──
+    ws2 = wb.create_sheet("Teams")
+    style_header(ws2, [
+        "Team Name", "Username", "Purse Remaining (L)",
+        "Total Spent (L)", "Spent (Cr)", "Squad Size", "RTM Cards", "RTM Team"
+    ])
+    for r in parts:
+        sq = json.loads(r["squad"])
+        u  = db.get_user(r["user_id"])
+        uname = (f"@{u['username']}" if u and u["username"] else (u["first_name"] if u else str(r["user_id"])))
+        ws2.append([
+            r["team_name"], uname, r["purse"], r["total_spent"],
+            round(r["total_spent"]/100, 2), len(sq),
+            r["rtm_cards"], r["rtm_team"] or ""
+        ])
+    alt_rows(ws2); autofit(ws2)
+
+    # ── Sheet 3: Players ──
+    ws3 = wb.create_sheet("Players")
+    style_header(ws3, [
+        "#", "Player Name", "Role", "Nationality", "Prev Team (IPL)", "Tier",
+        "Base Price (L)", "Status", "Sold To", "Sold Price (L)", "Sold Price (Cr)"
+    ])
+    for i, p in enumerate(players, 1):
+        buyer = team_map.get(p["sold_to"], "") if p["sold_to"] else ""
+        sp_cr = round((p["sold_price"] or 0)/100, 2) if (p["sold_price"] or 0) >= 100 else ""
+        ws3.append([
+            i, p["name"], p["role"], p["nationality"],
+            p["ipl_team"] or "", p["tier"], p["base_price"],
+            p["status"].title(), buyer, p["sold_price"] or "", sp_cr
+        ])
+        fill = SOLD_FILL if p["status"]=="sold" else (UNSOLD_FILL if p["status"]=="unsold" else None)
+        if fill:
+            for cell in ws3[ws3.max_row]: cell.fill = fill
+    alt_rows(ws3); autofit(ws3)
+
+    # ── Sheet 4: Squad Details ──
+    ws4 = wb.create_sheet("Squad Details")
+    style_header(ws4, [
+        "Team Name", "Player Name", "Role", "Nationality",
+        "Prev Team", "Tier", "Price Paid (L)", "Price Paid (Cr)"
+    ])
+    pmap = {p["player_id"]: p for p in players}
+    for r in parts:
+        for pid in json.loads(r["squad"]):
+            p = pmap.get(int(pid))
+            if not p: continue
+            sp_cr = round((p["sold_price"] or 0)/100, 2) if (p["sold_price"] or 0) >= 100 else ""
+            ws4.append([
+                r["team_name"], p["name"], p["role"], p["nationality"],
+                p["ipl_team"] or "", p["tier"], p["sold_price"] or "", sp_cr
+            ])
+    alt_rows(ws4); autofit(ws4)
+
+    # ── Sheet 5: Bid History ──
+    ws5 = wb.create_sheet("Bid History")
+    style_header(ws5, ["Timestamp", "Team", "Player", "Bid (L)", "Bid (Cr)", "Result"])
+    bids = db.cx.execute(
+        "SELECT b.*, p.team_name FROM bid_history b "
+        "LEFT JOIN participants p ON p.auction_id=b.auction_id AND p.user_id=b.user_id "
+        "WHERE b.auction_id=? ORDER BY b.ts", (aid,)
+    ).fetchall()
+    for b in bids:
+        cr = round(b["bid_amount"]/100, 2) if b["bid_amount"] >= 100 else ""
+        ws5.append([
+            b["ts"], b["team_name"] or "", b["player_name"],
+            b["bid_amount"], cr, "Won" if b["won"] else "Lost"
+        ])
+    alt_rows(ws5); autofit(ws5)
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
+
+
+async def cmd_download_data(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/downloaddata — Export all auction data as Excel."""
+    await _reg(update.effective_user)
+    if not db.is_admin(update.effective_user.id):
+        await update.message.reply_text("Admin only.")
+        return
+
+    aid = live.auction_id
+    if not aid:
+        row = db.cx.execute(
+            "SELECT auction_id FROM auctions ORDER BY auction_id DESC LIMIT 1"
+        ).fetchone()
+        if row: aid = row["auction_id"]
+    if not aid:
+        await update.message.reply_text("No auction data found.")
+        return
+
+    ar  = db.get_auction(aid)
+    msg = await update.message.reply_text("⏳ Building Excel report…")
+    try:
+        xlsx_bytes = _build_auction_excel(aid)
+        fname      = (ar["name"] or "Auction").replace(" ", "_") + "_Data.xlsx"
+        await update.message.reply_document(
+            document=xlsx_bytes,
+            filename=fname,
+            caption=(
+                f"📊 *{md_safe(ar['name'])} — Full Data*\n"
+                f"Sheets: Summary · Teams · Players · Squad Details · Bid History"
+            ),
+            parse_mode=ParseMode.MARKDOWN,
+        )
+    except Exception as e:
+        logger.error(f"cmd_download_data: {e}", exc_info=True)
+        await update.message.reply_text(f"Failed to build Excel: {e}")
+    finally:
+        try: await msg.delete()
+        except Exception: pass
+
+
+async def cmd_download_template(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/downloadtemplate — Send the player upload template."""
+    await _reg(update.effective_user)
+    if not db.is_admin(update.effective_user.id):
+        await update.message.reply_text("Admin only.")
+        return
+
+    import io
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, PatternFill, Alignment
+    from openpyxl.utils import get_column_letter
+
+    wb  = Workbook()
+    ws  = wb.active
+    ws.title = "Players"
+
+    HDR_FILL = PatternFill("solid", start_color="1F4E79")
+    HDR_FONT = Font(bold=True, color="FFFFFF", name="Arial", size=11)
+
+    headers = ["name", "role", "ipl_team", "nationality", "base_price", "tier"]
+    ws.append(headers)
+    for cell in ws[1]:
+        cell.font = HDR_FONT; cell.fill = HDR_FILL
+        cell.alignment = Alignment(horizontal="center")
+    ws.row_dimensions[1].height = 22
+
+    # Notes row (grey, italic)
+    notes = [
+        "Full player name",
+        "Bat / Bowl / AR / WK",
+        "Prev IPL team for RTM (blank = none)",
+        "Indian / Overseas",
+        "e.g. 2cr / 50l / 200 (lakhs)",
+        "Marquee / A / B / C / Uncapped"
+    ]
+    ws.append(notes)
+    for cell in ws[2]:
+        cell.font = Font(italic=True, color="808080", name="Arial", size=9)
+        cell.alignment = Alignment(wrap_text=True)
+    ws.row_dimensions[2].height = 30
+
+    samples = [
+        ["Virat Kohli",    "Bat",  "RCB", "Indian",   "2cr",   "Marquee"],
+        ["Pat Cummins",    "Bowl", "SRH", "Overseas", "3cr",   "A"],
+        ["Hardik Pandya",  "AR",   "MI",  "Indian",   "1.5cr", "A"],
+        ["Rishabh Pant",   "WK",   "DC",  "Indian",   "2cr",   "Marquee"],
+        ["Jasprit Bumrah", "Bowl", "MI",  "Indian",   "2cr",   "A"],
+    ]
+    for s in samples: ws.append(s)
+
+    for i, w in enumerate([22,10,20,12,14,12], 1):
+        ws.column_dimensions[get_column_letter(i)].width = w
+
+    # Instructions sheet
+    ws2 = wb.create_sheet("Instructions")
+    lines = [
+        ("IPL Auction Bot — Player Upload Template", True, 13),
+        ("", False, 11),
+        ("HOW TO USE", True, 11),
+        ("1. Fill the Players sheet. Delete the grey notes row before uploading.", False, 11),
+        ("2. Save as .xlsx, .csv, or .json", False, 11),
+        ("3. Send the file with command /uploaddata (attach file to message)", False, 11),
+        ("   OR paste CSV/JSON text after /uploaddata", False, 11),
+        ("", False, 11),
+        ("PRICE FORMAT", True, 11),
+        ("  2cr  → 2 Crore (= 200 lakhs)", False, 11),
+        ("  50l  → 50 Lakh", False, 11),
+        ("  200  → 200 Lakh (bare number = lakhs)", False, 11),
+        ("", False, 11),
+        ("JSON FORMAT", True, 11),
+        ('  [{"name":"Virat Kohli","role":"Bat","ipl_team":"RCB","nationality":"Indian","base_price":"2cr","tier":"Marquee"}]', False, 9),
+        ("", False, 11),
+        ("CSV FORMAT", True, 11),
+        ("  name,role,ipl_team,nationality,base_price,tier", False, 11),
+        ("  Virat Kohli,Bat,RCB,Indian,2cr,Marquee", False, 11),
+    ]
+    for text, bold, size in lines:
+        ws2.append([text])
+        ws2[ws2.max_row][0].font = Font(bold=bold, name="Arial", size=size)
+    ws2.column_dimensions["A"].width = 90
+
+    buf = io.BytesIO()
+    wb.save(buf)
+
+    await update.message.reply_document(
+        document=buf.getvalue(),
+        filename="PlayerTemplate.xlsx",
+        caption=(
+            "📋 *Player Upload Template*\n\n"
+            "• Fill the *Players* sheet\n"
+            "• Delete the grey notes row\n"
+            "• Send back with /uploaddata (attach file)\n\n"
+            "Also accepts: CSV text, JSON text, .csv file, .json file"
+        ),
+        parse_mode=ParseMode.MARKDOWN,
+    )
+
+
+async def cmd_upload_data(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/uploaddata — Import players from Excel, CSV, or JSON."""
+    await _reg(update.effective_user)
+    if not db.is_admin(update.effective_user.id):
+        await update.message.reply_text("Admin only.")
+        return
+    if not live.auction_id:
+        await update.message.reply_text(
+            "Create an auction first with /create\_auction.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+
+    import io, csv as _csv_mod
+
+    def _parse_price(s: str) -> int:
+        s = str(s or "20").strip().lower()
+        try:
+            if s.endswith("cr"): return int(float(s[:-2]) * 100)
+            if s.endswith("l"):  return int(float(s[:-1]))
+            return int(float(s))
+        except Exception:
+            return 20
+
+    def _normalise(raw: dict) -> dict:
+        kv  = {k.strip().lower().replace(" ","_"): str(v or "").strip() for k,v in raw.items()}
+        name = kv.get("name") or kv.get("player_name") or kv.get("player") or ""
+        role = kv.get("role","bat").strip().upper()
+        role = {"BATSMAN":"Bat","BOWLER":"Bowl","ALLROUNDER":"AR","WICKETKEEPER":"WK",
+                "BAT":"Bat","BOWL":"Bowl","AR":"AR","WK":"WK"}.get(role, "Bat")
+        nat  = "Overseas" if "over" in kv.get("nationality","indian").lower() else "Indian"
+        ipl  = kv.get("ipl_team") or kv.get("prev_team") or kv.get("team") or ""
+        bp   = _parse_price(kv.get("base_price") or kv.get("price") or "20")
+        tier = kv.get("tier","C").strip().title()
+        tier = tier if tier in ("Marquee","A","B","C","Uncapped") else "C"
+        return {"name": name.strip(), "role": role, "nationality": nat,
+                "ipl_team": ipl.strip(), "base_price": bp, "tier": tier}
+
+    rows = []
+    doc  = update.message.document
+
+    if doc:
+        fname    = (doc.file_name or "").lower()
+        file_obj = await doc.get_file()
+        raw      = bytes(await file_obj.download_as_bytearray())
+
+        if fname.endswith((".xlsx",".xls")):
+            import openpyxl
+            wb = openpyxl.load_workbook(io.BytesIO(raw), data_only=True)
+            ws = wb["Players"] if "Players" in wb.sheetnames else wb.active
+            hdrs = None
+            for r in ws.iter_rows(values_only=True):
+                if not any(c is not None for c in r): continue
+                if hdrs is None:
+                    # Detect header row: must contain "name" or "player"
+                    row_strs = [str(c or "").strip().lower() for c in r]
+                    if any(x in row_strs for x in ("name","player","player_name")):
+                        hdrs = [str(c or "").strip().lower().replace(" ","_") for c in r]
+                    continue
+                d = _normalise(dict(zip(hdrs, r)))
+                if d["name"]: rows.append(d)
+
+        elif fname.endswith(".csv"):
+            text   = raw.decode("utf-8", errors="replace")
+            reader = _csv_mod.DictReader(io.StringIO(text))
+            for r in reader:
+                d = _normalise(r)
+                if d["name"]: rows.append(d)
+
+        elif fname.endswith(".json"):
+            import json as _j
+            data = _j.loads(raw.decode("utf-8"))
+            if isinstance(data, dict): data = [data]
+            for r in data:
+                d = _normalise(r)
+                if d["name"]: rows.append(d)
+
+        else:
+            await update.message.reply_text("Unsupported file type. Use .xlsx, .csv, or .json")
+            return
+
+    else:
+        body = (update.message.text or "").strip()
+        if body.lower().startswith("/uploaddata"): body = body[11:].strip()
+        if not body:
+            await update.message.reply_text(
+                "Attach a file (.xlsx / .csv / .json) to this command,\n"
+                "or paste JSON/CSV text after /uploaddata.\n\n"
+                "Use /downloadtemplate to get the template."
+            )
+            return
+        if body.startswith("[") or body.startswith("{"):
+            import json as _j
+            try:
+                data = _j.loads(body)
+                if isinstance(data, dict): data = [data]
+                for r in data:
+                    d = _normalise(r)
+                    if d["name"]: rows.append(d)
+            except Exception as e:
+                await update.message.reply_text(f"Invalid JSON: {e}")
+                return
+        else:
+            reader = _csv_mod.DictReader(io.StringIO(body))
+            for r in reader:
+                d = _normalise(r)
+                if d["name"]: rows.append(d)
+
+    if not rows:
+        await update.message.reply_text(
+            "No valid rows found. Make sure the file has a header row:\n"
+            "name, role, ipl_team, nationality, base_price, tier\n\n"
+            "Use /downloadtemplate for the correct format."
+        )
+        return
+
+    aid    = live.auction_id
+    added  = 0
+    skipped= []
+    for d in rows:
+        try:
+            db.cx.execute(
+                "INSERT INTO players(auction_id,name,role,nationality,ipl_team,base_price,tier,status)"
+                " VALUES(?,?,?,?,?,?,?,\'available\')",
+                (aid, d["name"], d["role"], d["nationality"],
+                 d["ipl_team"], d["base_price"], d["tier"])
+            )
+            added += 1
+        except Exception as e:
+            skipped.append(d["name"])
+    db.cx.commit()
+
+    if not live.active:
+        live.player_queue = list(db.get_available(aid))
+
+    skip_note = f"\n\u26a0\ufe0f Skipped {len(skipped)}: {', '.join(skipped[:5])}" if skipped else ""
+    await update.message.reply_text(
+        f"\u2705 *{added} players imported!*\n"
+        f"Auction: *{md_safe(live.auction_name)}*\n"
+        f"Available: {len(db.get_available(aid))} players{skip_note}\n\n"
+        f"Use /startauction when ready.",
+        parse_mode=ParseMode.MARKDOWN,
+    )
 
 
 async def cmd_auto_sell(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -3776,29 +4855,128 @@ async def _handle_callback_inner(update, context, query, data, uid):
         await process_bid(update, context, uid, bid_l)
         return
 
-    # ── RTM USE (button path disabled — use /rtm command) ──
-    if data == "rtm_use":
-        await query.answer(
-            "Use the /rtm or /right_to_match command to exercise RTM.",
-            show_alert=True,
-        )
+    # ── RTM USE BUTTON (Team A clicked USE RTM) ──────────────
+    # Format: rtm_use_btn|pid|rtm_uid|orig_uid|orig_bid
+    if data.startswith("rtm_use_btn") or data == "rtm_use":
+        await query.answer("🎴 RTM Activated!", show_alert=False)
+        try:
+            if "|" in data:
+                parts    = data.split("|")
+                pid_val  = int(parts[1])
+                rtm_uid  = int(parts[2])
+                orig_uid = int(parts[3])
+                orig_bid = int(parts[4])
+            else:
+                pid_val  = live.current_player_id
+                rtm_uid  = live.rtm_team_id
+                orig_uid = live.rtm_orig_bidder_id
+                orig_bid = live.rtm_orig_bid
+
+            euid = eff_uid(uid)
+            if rtm_uid != euid and not db.is_admin(uid):
+                await context.bot.send_message(query.message.chat_id,
+                    "❌ Only the RTM team or admin can click USE RTM.")
+                return
+
+            if live.rtm_state != RTM_OFFERED:
+                await context.bot.send_message(query.message.chat_id,
+                    "⚠️ RTM window already closed.")
+                return
+
+            # Cancel offer timer
+            if live.timer_task and not live.timer_task.done():
+                live.timer_task.cancel()
+            live.rtm_state = RTM_ACTIVE
+
+            aid = live.auction_id
+            # Deduct RTM card NOW (team confirmed they want to use it)
+            db.cx.execute(
+                "UPDATE participants SET rtm_cards=MAX(0,rtm_cards-1)"
+                " WHERE auction_id=? AND user_id=?", (aid, rtm_uid)
+            )
+            db.cx.commit()
+
+            pr = db.get_player(pid_val)
+            if not pr:
+                await context.bot.send_message(query.message.chat_id, "⚠️ Player not found.")
+                return
+
+            # Remove buttons from challenge message
+            try:
+                await query.edit_message_reply_markup(reply_markup=None)
+            except Exception:
+                pass
+
+            # Send Step 3: Team B raise message
+            msg = await context.bot.send_message(
+                chat_id=live.chat_id,
+                text=rtm_activated_text(pr),
+                parse_mode=ParseMode.MARKDOWN,
+            )
+            live.rtm_msg_id = msg.message_id
+            live.timer_task = asyncio.create_task(_rtm_counter_timer(context))
+            logger.info(f"RTM USE: uid={uid} pid={pid_val} orig_bid={orig_bid}")
+
+        except Exception as e:
+            logger.error(f"rtm_use_btn crashed: {e}", exc_info=True)
+            await context.bot.send_message(query.message.chat_id, f"⚠️ RTM error: {e}")
         return
 
-    # ── RTM SKIP (after timer-based RTM offer) ─
-    if data == "rtm_skip":
-        if not db.is_admin(uid) and live.rtm_team_id != eff_uid(uid):
-            await query.answer("Not your action.", show_alert=True)
-            return
-        if live.rtm_state == RTM_OFFERED:
+    # ── RTM PASS BUTTON (Team A clicked PASS) ────────────────
+    # Format: rtm_pass_btn|pid|orig_uid|orig_bid
+    if data.startswith("rtm_pass_btn") or data == "rtm_skip":
+        await query.answer("❌ RTM Passed", show_alert=False)
+        try:
+            if "|" in data:
+                parts    = data.split("|")
+                pid_val  = int(parts[1])
+                orig_uid = int(parts[2])
+                orig_bid = int(parts[3])
+            else:
+                pid_val  = live.current_player_id
+                orig_uid = live.rtm_orig_bidder_id
+                orig_bid = live.rtm_orig_bid
+
+            euid = eff_uid(uid)
+            rtm_uid = live.rtm_team_id
+            if rtm_uid != euid and not db.is_admin(uid):
+                await context.bot.send_message(query.message.chat_id,
+                    "❌ Only the RTM team or admin can click PASS.")
+                return
+
+            if live.rtm_state != RTM_OFFERED:
+                await context.bot.send_message(query.message.chat_id,
+                    "⚠️ RTM window already closed.")
+                return
+
+            # Cancel offer timer
             if live.timer_task and not live.timer_task.done():
                 live.timer_task.cancel()
             live.rtm_state = RTM_NONE
+            # Card NOT deducted — team passed
+
+            pr = db.get_player(pid_val)
+            # Remove buttons, show passed message
             try:
-                await query.edit_message_text("RTM skipped. Player goes to highest bidder.")
-            except Exception: pass
-            pr = db.get_player(live.current_player_id)
-            if pr: await _finalize(context, pr)
-        await query.answer()
+                await query.edit_message_text(
+                    f"❌ RTM Passed — Player goes to *{md_safe(live.rtm_orig_bidder_name)}*",
+                    parse_mode=ParseMode.MARKDOWN,
+                )
+            except Exception:
+                pass
+
+            if pr:
+                # Finalize to original bidder at original bid
+                live.current_player_id   = pid_val
+                live.current_bid         = orig_bid
+                live.highest_bidder_id   = orig_uid
+                live.highest_bidder_name = live.rtm_orig_bidder_name
+                await _finalize(context, pr)
+            logger.info(f"RTM PASS: uid={uid} pid={pid_val}")
+
+        except Exception as e:
+            logger.error(f"rtm_pass_btn crashed: {e}", exc_info=True)
+            await context.bot.send_message(query.message.chat_id, f"⚠️ RTM error: {e}")
         return
 
     # ── RTM YES — stateless: all data in callback_data ──────
@@ -4311,6 +5489,18 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("pauseauction", cmd_pause))
     app.add_handler(CommandHandler("resumeauction", cmd_resume))
     app.add_handler(CommandHandler(["endauction","endsauction"], cmd_end_auction))
+    app.add_handler(CommandHandler(["downloaddata","exportdata"], cmd_download_data))
+    app.add_handler(CommandHandler(["downloadtemplate","template"], cmd_download_template))
+    app.add_handler(CommandHandler(["uploaddata","importdata"], cmd_upload_data))
+    app.add_handler(CommandHandler(["undo","undosold"], cmd_undo))
+    app.add_handler(CommandHandler(["setlimit","squadlimit"], cmd_set_limit))
+    app.add_handler(CommandHandler(["setincrement","increment"], cmd_set_increment))
+    app.add_handler(CommandHandler(["setsquadlimit"], cmd_set_squad_limit))
+    app.add_handler(CommandHandler(["findplayer","search"], cmd_find_player))
+    app.add_handler(CommandHandler(["playercard","pc"], cmd_player_card))
+    app.add_handler(CommandHandler(["mystats","stats"], cmd_my_stats))
+    app.add_handler(CommandHandler(["announce","broadcast"], cmd_announce))
+    app.add_handler(CommandHandler(["transfer","tradeplayer"], cmd_transfer))
     app.add_handler(CommandHandler("autosell", cmd_auto_sell))
     app.add_handler(CommandHandler("autonext", cmd_auto_next))
     app.add_handler(CommandHandler(["dtime","timers"], cmd_dtime))
