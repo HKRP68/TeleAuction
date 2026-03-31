@@ -600,7 +600,10 @@ def save_live_state():
 
 
 async def _backup_db_to_telegram():
-    """Upload the full SQLite DB file as a document to STATE_CHANNEL_ID."""
+    """
+    Upload the full SQLite DB file to STATE_CHANNEL_ID and PIN it.
+    On restart, get_chat() returns the pinned message — no stored ID needed.
+    """
     global _db_backup_msg_id
     if not Config.STATE_CHANNEL_ID or not _ptb_app:
         return
@@ -610,9 +613,8 @@ async def _backup_db_to_telegram():
     except Exception:
         pass
     caption = (
-        f"\U0001f512 DB Backup | {live.auction_name}\n"
-        f"Sold:{live.sold_count} Queue:{len(live.player_queue)} "
-        f"Active:{live.active} Paused:{live.paused}"
+        f"\U0001f512 AuctionDB | {live.auction_name} | "
+        f"sold={live.sold_count} queue={len(live.player_queue)}"
     )
     try:
         with open(Config.DB_PATH, "rb") as f:
@@ -623,6 +625,16 @@ async def _backup_db_to_telegram():
             filename="auction_backup.db",
             caption=caption,
         )
+        # Pin the new message — restore uses pinned_message, needs no stored ID
+        try:
+            await _ptb_app.bot.pin_chat_message(
+                chat_id=Config.STATE_CHANNEL_ID,
+                message_id=msg.message_id,
+                disable_notification=True,
+            )
+        except Exception as pe:
+            logger.warning(f"Pin failed (bot not channel admin?): {pe}")
+        # Delete previous backup
         if _db_backup_msg_id and _db_backup_msg_id != msg.message_id:
             try:
                 await _ptb_app.bot.delete_message(
@@ -632,12 +644,7 @@ async def _backup_db_to_telegram():
             except Exception:
                 pass
         _db_backup_msg_id = msg.message_id
-        db.cx.execute(
-            "INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)",
-            ("db_backup_msg_id", str(msg.message_id))
-        )
-        db.cx.commit()
-        logger.info(f"DB backed up to Telegram msg={msg.message_id} ({len(db_bytes):,}B)")
+        logger.info(f"DB backed up+pinned msg={msg.message_id} ({len(db_bytes):,}B)")
     except FileNotFoundError:
         logger.warning("DB file missing — skipping Telegram backup")
     except Exception as e:
@@ -681,49 +688,43 @@ def _apply_state_dict(state: dict) -> bool:
 
 async def restore_live_state_async(bot) -> bool:
     """
-    Restore on startup:
-    1. Download full DB from Telegram channel → replace local file
-    2. Read live_state JSON from restored DB
-    3. Fallback: reconstruct from whatever DB tables exist
+    Restore on startup — survives complete Render filesystem wipe.
+
+    Step 1: get_chat(STATE_CHANNEL_ID).pinned_message → download DB
+            Works with NO stored IDs — pinned message is always findable.
+    Step 2: Read live_state JSON from the restored DB.
+    Step 3: Fallback — reconstruct from DB tables if they exist.
     """
     import json as _json
     global _db_backup_msg_id
 
-    # ── Step 1: Download DB backup from Telegram ───────────
+    # ── Step 1: Restore DB from Telegram pinned message ────
     if Config.STATE_CHANNEL_ID:
         try:
-            # Get message id from SQLite (may survive short restarts)
-            mid_str = None
-            try:
-                mid_str = db.get_setting("db_backup_msg_id")
-            except Exception:
-                pass
+            chat   = await bot.get_chat(Config.STATE_CHANNEL_ID)
+            pinned = getattr(chat, "pinned_message", None)
 
-            if mid_str:
-                _db_backup_msg_id = int(mid_str)
-                # Forward to admin's DM to get a downloadable copy
-                fwd = await bot.forward_message(
-                    chat_id=Config.SUPER_ADMIN_ID,
-                    from_chat_id=Config.STATE_CHANNEL_ID,
-                    message_id=_db_backup_msg_id,
-                )
-                if fwd and fwd.document:
-                    file_obj = await bot.get_file(fwd.document.file_id)
-                    db_bytes  = await file_obj.download_as_bytearray()
-                    with open(Config.DB_PATH, "wb") as f:
-                        f.write(bytes(db_bytes))
-                    logger.info(
-                        f"\u2705 DB downloaded from Telegram "
-                        f"({len(db_bytes):,} bytes) — reconnecting"
-                    )
-                    db._local.__dict__.clear()   # force SQLite reconnect
+            if pinned and pinned.document:
+                logger.info(f"Found pinned DB backup msg={pinned.message_id}, downloading...")
+                file_obj = await bot.get_file(pinned.document.file_id)
+                db_bytes  = await file_obj.download_as_bytearray()
+                import os
+                os.makedirs(os.path.dirname(os.path.abspath(Config.DB_PATH)), exist_ok=True)
+                with open(Config.DB_PATH, "wb") as f:
+                    f.write(bytes(db_bytes))
+                # Force SQLite reconnect with new file
                 try:
-                    await bot.delete_message(
-                        chat_id=Config.SUPER_ADMIN_ID,
-                        message_id=fwd.message_id,
-                    )
+                    db._local.__dict__.clear()
                 except Exception:
                     pass
+                try:
+                    db._init()
+                except Exception:
+                    pass
+                _db_backup_msg_id = pinned.message_id
+                logger.info(f"DB restored from Telegram ({len(db_bytes):,} bytes)")
+            else:
+                logger.info("STATE_CHANNEL_ID set but no pinned DB backup found")
         except Exception as e:
             logger.warning(f"Telegram DB restore: {e}")
 
@@ -734,19 +735,19 @@ async def restore_live_state_async(bot) -> bool:
             state = _json.loads(raw)
             if _apply_state_dict(state):
                 logger.info(
-                    f"\u2705 State restored: {live.auction_name} "
+                    f"State applied: {live.auction_name} "
                     f"sold={live.sold_count} queue={len(live.player_queue)}"
                 )
                 return True
+            logger.warning("live_state JSON present but _apply_state_dict failed")
     except Exception as e:
         logger.warning(f"live_state read: {e}")
 
-    # ── Step 3: Fallback reconstruct ───────────────────────
+    # ── Step 3: Reconstruct from DB tables ────────────────
     result = restore_live_state()
     if result:
-        logger.info(f"\u2705 Reconstructed from DB: {live.auction_name}")
+        logger.info(f"Reconstructed from DB tables: {live.auction_name}")
     return result
-
 
 def restore_live_state() -> bool:
     """Synchronous fallback: reconstruct from DB tables without any snapshot."""
