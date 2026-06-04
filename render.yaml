@@ -11,5 +11,9 @@ services:
         sync: false
       - key: WEBHOOK_URL
         sync: false
+      - key: DATABASE_PATH
+        value: /opt/render/project/src/data/auction.db
+      - key: STATE_CHANNEL_ID
+        sync: false
       - key: PORT
         value: 8080

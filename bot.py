@@ -21,6 +21,7 @@ import time as _time
 from dataclasses import dataclass, field
 from typing import Optional
 
+from dotenv import load_dotenv
 from flask import Flask, request
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
@@ -31,6 +32,8 @@ from telegram.ext import (
 
 logging.basicConfig(format="%(asctime)s %(levelname)s %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+load_dotenv()
 
 # ─────────────────────────────────────────────────────────
 # CONFIG
@@ -146,15 +149,27 @@ class DB:
 
     def _cx(self) -> sqlite3.Connection:
         if not hasattr(self._local, "c") or self._local.c is None:
-            self._local.c = sqlite3.connect(self.path, check_same_thread=False)
+            os.makedirs(os.path.dirname(os.path.abspath(self.path)), exist_ok=True)
+            self._local.c = sqlite3.connect(
+                self.path,
+                timeout=30,
+                check_same_thread=False,
+            )
             self._local.c.row_factory = sqlite3.Row
+            self._configure_connection(self._local.c)
         return self._local.c
 
     @property
     def cx(self): return self._cx()
 
+    def _configure_connection(self, c: sqlite3.Connection):
+        c.execute("PRAGMA foreign_keys = ON")
+        c.execute("PRAGMA busy_timeout = 30000")
+
     def _init(self):
-        c = sqlite3.connect(self.path)
+        os.makedirs(os.path.dirname(os.path.abspath(self.path)), exist_ok=True)
+        c = sqlite3.connect(self.path, timeout=30)
+        self._configure_connection(c)
         c.executescript("""
         CREATE TABLE IF NOT EXISTS global_users (
             user_id    INTEGER PRIMARY KEY,
@@ -238,6 +253,27 @@ class DB:
             key TEXT PRIMARY KEY,
             value TEXT
         );
+
+        CREATE INDEX IF NOT EXISTS idx_auctions_status
+            ON auctions(status);
+
+        CREATE INDEX IF NOT EXISTS idx_participants_auction_user
+            ON participants(auction_id, user_id);
+
+        CREATE INDEX IF NOT EXISTS idx_team_co_owners_auction_primary
+            ON team_co_owners(auction_id, primary_user_id);
+
+        CREATE INDEX IF NOT EXISTS idx_players_auction_status
+            ON players(auction_id, status);
+
+        CREATE INDEX IF NOT EXISTS idx_players_auction_name
+            ON players(auction_id, name);
+
+        CREATE INDEX IF NOT EXISTS idx_bid_history_auction_player
+            ON bid_history(auction_id, player_id);
+
+        CREATE INDEX IF NOT EXISTS idx_bid_history_auction_user
+            ON bid_history(auction_id, user_id);
         """)
         c.commit()
         c.close()

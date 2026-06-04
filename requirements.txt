@@ -1,5 +1,4 @@
-python-telegram-bot[webhooks,job-queue]>=20.7
-flask>=3.0.0
-gunicorn>=21.0.0
-python-dotenv>=1.0.0
-requests>=2.31.0
+python-telegram-bot[webhooks,job-queue]>=20.7,<21
+flask>=3.0,<4
+python-dotenv>=1.0,<2
+requests>=2.31,<3
