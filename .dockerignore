@@ -1,0 +1,14 @@
+.env
+.env.*
+!.env.example
+auction.db
+auction.db-*
+data/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.git/
+.github/
+.venv/
+venv/
+.DS_Store

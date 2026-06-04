@@ -1,11 +1,9 @@
-version: '3.8'
-
 services:
   bot:
     build: .
     env_file: .env
     volumes:
-      # Persist SQLite database across restarts
+      # Persist SQLite database across restarts.
       - ./data:/app/data
     restart: unless-stopped
     ports:
