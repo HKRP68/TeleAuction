@@ -24,7 +24,7 @@ Copy the included example file and fill in your values:
 cp .env.example .env
 ```
 
-Required values:
+For Telegram auctions, set these values:
 
 ```env
 BOT_TOKEN=your_token_from_botfather
@@ -43,6 +43,11 @@ DATABASE_PATH=auction.db
 # Optional Telegram channel/group ID for pinned SQLite backups.
 STATE_CHANNEL_ID=0
 ```
+
+To use only the Draft Desk, leave `BOT_TOKEN` and `SUPER_ADMIN_ID` empty. Start the
+app and open `https://your-service.example/draft`; no Telegram auction, bot token,
+or draft URL token is required. `WEBHOOK_URL` is only for Telegram updates and
+should be the public URL of this same service when Telegram integration is enabled.
 
 ---
 
@@ -214,11 +219,15 @@ Most slash commands also support dot shortcuts through the dot-command handler, 
 
 ## 🏏 Draft mode and web draft desk
 
-Draft mode is a turn-based alternative to bidding. Create an auction as normal, set a long `WEB_ADMIN_TOKEN`, then open:
+Draft mode is a turn-based alternative to bidding. Open the Draft Desk directly:
 
 ```text
-https://your-service.example/draft?token=YOUR_WEB_ADMIN_TOKEN
+https://your-service.example/draft
 ```
+
+Create the draft on this page, then add each **Team Name**, **Owner**, and optional
+**Co-owner**. This setup is stored in the database and does not require creating an
+auction or registering teams in Telegram.
 
 The desk imports `.xlsx` or `.csv` files for players and the draft order. Player sheets use these exact columns:
 
@@ -232,7 +241,7 @@ Order sheets use:
 round_no,pick_no,tier,team_name,owner_name,owner_tag_id
 ```
 
-`owner_tag_id` is the owner’s numeric Telegram ID. The person whose turn it is selects with `/pick Jasprit Bumrah`. A turn may select its own tier or a lower tier: **Platinum → Gold → Silver → Bronze**. The bot posts the round/pick, updated tiered squad, and the next owner’s turn. The web token is intentionally required; do not expose the draft URL or token publicly.
+`owner_tag_id` is only needed when you also use Telegram `/pick` commands. A turn may select its own tier or a lower tier: **Platinum → Gold → Silver → Bronze**. The bot posts the round/pick, updated tiered squad, and the next owner’s turn when Telegram integration is enabled.
 
 ---
 

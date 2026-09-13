@@ -23,7 +23,7 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 from dotenv import load_dotenv
-from flask import Flask, abort, jsonify, request
+from flask import Flask, abort, jsonify, redirect, request, url_for
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
 from telegram.ext import (
@@ -36,20 +36,25 @@ logger = logging.getLogger(__name__)
 
 load_dotenv()
 
+
+def _env_int(name: str, default: int) -> int:
+    """Read an integer environment variable while treating an empty value as unset."""
+    return int(os.getenv(name) or default)
+
+
 # ─────────────────────────────────────────────────────────
 # CONFIG
 # ─────────────────────────────────────────────────────────
 class Config:
     BOT_TOKEN: str      = os.getenv("BOT_TOKEN", "YOUR_TOKEN_HERE")
-    SUPER_ADMIN_ID: int = int(os.getenv("SUPER_ADMIN_ID", "0"))
+    SUPER_ADMIN_ID: int = _env_int("SUPER_ADMIN_ID", 0)
     WEBHOOK_URL: str    = os.getenv("WEBHOOK_URL", "")
-    PORT: int           = int(os.getenv("PORT", "8080"))
+    PORT: int           = _env_int("PORT", 8080)
     DB_PATH: str        = os.getenv("DATABASE_PATH", "auction.db")
-    WEB_ADMIN_TOKEN: str = os.getenv("WEB_ADMIN_TOKEN", "")
     # Optional: a private Telegram channel/group where bot is admin.
     # Bot stores state JSON here — survives Render filesystem wipes.
     # Set to the channel_id (e.g. -1001234567890) in Render env vars.
-    STATE_CHANNEL_ID: int = int(os.getenv("STATE_CHANNEL_ID", "0"))
+    STATE_CHANNEL_ID: int = _env_int("STATE_CHANNEL_ID", 0)
     BID_TIMER: int           = 30
     RTM_OFFER_TIMER: int     = 30   # Step 1 → window for eligible teams to use /rtm
     RTM_COUNTER_TIMER: int   = 20   # Step 2 → window for original bidder to raise
@@ -379,6 +384,11 @@ class DB:
             "SELECT COUNT(*) c FROM participants WHERE auction_id=?", (aid,)
         ).fetchone()
         return r["c"] if r else 0
+
+    def next_web_user_id(self) -> int:
+        """Return an internal ID for a website-only team owner/co-owner."""
+        row = self.cx.execute("SELECT MIN(user_id) AS lowest FROM global_users WHERE user_id < 0").fetchone()
+        return min(-1, int(row["lowest"] or 0) - 1)
 
     # ── PARTICIPANTS ─────────────────────────────────────
     def join(self, aid: int, uid: int, username: str, team_name: str, purse: int) -> bool:
@@ -5576,19 +5586,22 @@ async def dot_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ─────────────────────────────────────────────────────────
-# FLASK
+# FLASK / DRAFT WEBSITE
 # ─────────────────────────────────────────────────────────
-def _web_authorized() -> bool:
-    """Require an explicit token so the public webhook service cannot edit a draft."""
-    return bool(Config.WEB_ADMIN_TOKEN) and request.values.get("token", "") == Config.WEB_ADMIN_TOKEN
-
-
 def _web_draft_aid() -> int:
-    if not _web_authorized():
-        abort(403, "Set WEB_ADMIN_TOKEN and include it as ?token=... in the draft desk URL.")
     if not live.auction_id:
-        abort(400, "Create an auction in Telegram first.")
+        abort(400, "Create an auction in the Draft Desk first.")
     return live.auction_id
+
+
+def _positive_int(value: str, field_name: str) -> int:
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        abort(400, f"{field_name} must be a whole number.")
+    if number < 1:
+        abort(400, f"{field_name} must be at least 1.")
+    return number
 
 
 def _sheet_rows(upload):
@@ -5619,20 +5632,63 @@ def _require_columns(rows, columns):
 
 @flask_app.route("/draft", methods=["GET"])
 def draft_desk():
+    if not live.auction_id:
+        return """<!doctype html><title>Draft Desk</title><style>body{font:16px system-ui;max-width:700px;margin:2rem auto;padding:0 1rem}form{padding:1rem;margin:1rem 0;background:#f3f6fa}input{margin:.25rem;width:100%;box-sizing:border-box}</style>
+        <h1>🏏 Draft Desk</h1><p>Create the draft here. Telegram and an access token are not required.</p>
+        <form action='/draft/auction' method='post'><h2>Create draft</h2><label>Draft name <input name=name required></label><label>Maximum teams <input name=max_teams type=number min=1 value=8 required></label><label>Starting purse <input name=purse type=number min=1 value=1000 required></label><label>Minimum players <input name=min_players type=number min=1 value=11 required></label><label>Maximum players <input name=max_players type=number min=1 value=25 required></label><button>Create draft</button></form>"""
     aid = _web_draft_aid()
-    token = request.values["token"]
+    auction = db.get_auction(aid)
     order = db.current_draft_order(aid)
     players = db.get_available(aid)
+    teams = db.get_all_parts(aid)
     orders = db.cx.execute("SELECT * FROM draft_orders WHERE auction_id=? ORDER BY round_no,pick_no", (aid,)).fetchall()
     available = "".join(f"<li>{escape(p['name'])} <small>({escape(p['tier'])})</small></li>" for p in players[:100]) or "<li>No available players</li>"
     turns = "".join(f"<li>R{o['round_no']} P{o['pick_no']} — {escape(o['team_name'])} ({escape(o['tier'])}) {'✅' if o['picked_player_id'] else '⌛'}</li>" for o in orders) or "<li>No draft order uploaded</li>"
+    team_rows = "".join(f"<li><b>{escape(t['team_name'])}</b> — {escape(t['username']) or 'No owner name'}" + (f"; co-owner: {escape(db.get_user(db.get_co_owners(aid, t['user_id'])[0]['linked_user_id'])['first_name'])}" if db.get_co_owners(aid, t['user_id']) else "") + "</li>" for t in teams) or "<li>No teams added</li>"
     current = "No current turn" if not order else f"R{order['round_no']}P{order['pick_no']} · {escape(order['team_name'])} · {escape(order['tier'])} · owner {order['owner_tag_id']}"
-    token = escape(token, quote=True)
     return f"""<!doctype html><title>Draft Desk</title><style>body{{font:16px system-ui;max-width:900px;margin:2rem auto;padding:0 1rem}}form{{padding:1rem;margin:1rem 0;background:#f3f6fa}}input{{margin:.25rem}}.grid{{display:grid;grid-template-columns:1fr 1fr;gap:2rem}}</style>
-    <h1>🏏 Draft Desk</h1><p><b>Current turn:</b> {current}</p>
-    <form action='/draft/players?token={token}' method='post' enctype='multipart/form-data'><b>Import players (.xlsx / .csv)</b><br><small>Required columns: name, rating, tier, icon_eligible, gender, indian_status, category, country, bat_hand, bowl_hand, bowl_style, bat_rating, bowl_rating.</small><br><input type=file name=file required><button>Import players</button></form>
-    <form action='/draft/orders?token={token}' method='post' enctype='multipart/form-data'><b>Import draft order (.xlsx / .csv)</b><br><small>Columns: round_no, pick_no, tier, team_name, owner_name, owner_tag_id.</small><br><input type=file name=file required><button>Import order</button></form>
-    <div class=grid><section><h2>Next picks</h2><ol>{turns}</ol></section><section><h2>Available players</h2><ol>{available}</ol></section></div>"""
+    <h1>🏏 {escape(auction['name'])}</h1><p><b>Current turn:</b> {current}</p>
+    <form action='/draft/teams' method='post'><b>Add team</b><br><label>Team name <input name=team_name required></label><label>Owner <input name=owner required></label><label>Co-owner <input name=co_owner></label><button>Add team</button></form>
+    <form action='/draft/players' method='post' enctype='multipart/form-data'><b>Import players (.xlsx / .csv)</b><br><small>Required columns: name, rating, tier, icon_eligible, gender, indian_status, category, country, bat_hand, bowl_hand, bowl_style, bat_rating, bowl_rating.</small><br><input type=file name=file required><button>Import players</button></form>
+    <form action='/draft/orders' method='post' enctype='multipart/form-data'><b>Import draft order (.xlsx / .csv)</b><br><small>Columns: round_no, pick_no, tier, team_name, owner_name, owner_tag_id.</small><br><input type=file name=file required><button>Import order</button></form>
+    <div class=grid><section><h2>Teams</h2><ol>{team_rows}</ol><h2>Next picks</h2><ol>{turns}</ol></section><section><h2>Available players</h2><ol>{available}</ol></section></div>"""
+
+
+@flask_app.route("/draft/auction", methods=["POST"])
+def draft_create_auction():
+    name = (request.form.get("name") or "").strip()
+    if not name:
+        abort(400, "Draft name is required.")
+    max_teams = _positive_int(request.form.get("max_teams"), "Maximum teams")
+    purse = _positive_int(request.form.get("purse"), "Starting purse")
+    min_players = _positive_int(request.form.get("min_players"), "Minimum players")
+    max_players = _positive_int(request.form.get("max_players"), "Maximum players")
+    if min_players > max_players:
+        abort(400, "Minimum players cannot exceed maximum players.")
+    aid = db.create_auction(name, max_teams, purse, min_players, max_players, 0)
+    live.auction_id, live.auction_name = aid, name
+    return redirect(url_for("draft_desk"))
+
+
+@flask_app.route("/draft/teams", methods=["POST"])
+def draft_add_team():
+    aid = _web_draft_aid()
+    team_name = (request.form.get("team_name") or "").strip()
+    owner = (request.form.get("owner") or "").strip()
+    co_owner = (request.form.get("co_owner") or "").strip()
+    if not team_name or not owner:
+        abort(400, "Team name and owner are required.")
+    if db.count_participants(aid) >= db.get_auction(aid)["max_teams"]:
+        abort(400, "This draft already has the maximum number of teams.")
+    owner_id = db.next_web_user_id()
+    db.upsert_user(owner_id, "", owner)
+    if not db.join(aid, owner_id, owner, team_name, db.get_auction(aid)["purse"]):
+        abort(400, "Could not add this team.")
+    if co_owner:
+        co_owner_id = db.next_web_user_id()
+        db.upsert_user(co_owner_id, "", co_owner)
+        db.link_co_owner(aid, owner_id, co_owner_id)
+    return redirect(url_for("draft_desk"))
 
 
 @flask_app.route("/draft/players", methods=["POST"])
@@ -5806,12 +5862,15 @@ async def _setup_wh(app: Application, url: str):
 
 
 def main():
-    if not Config.BOT_TOKEN or "YOUR_TOKEN" in Config.BOT_TOKEN:
-        raise ValueError("BOT_TOKEN not set!")
+    telegram_enabled = bool(Config.BOT_TOKEN and "YOUR_TOKEN" not in Config.BOT_TOKEN)
+    if not telegram_enabled:
+        logger.info("Starting Draft Desk without Telegram integration...")
+        flask_app.run(host="0.0.0.0", port=Config.PORT, use_reloader=False)
+        return
     if not Config.SUPER_ADMIN_ID:
-        raise ValueError("SUPER_ADMIN_ID not set!")
+        raise ValueError("SUPER_ADMIN_ID must be set when Telegram integration is enabled!")
 
-    logger.info("Starting IPL Auction Bot v4.0...")
+    logger.info("Starting IPL Auction Bot v4.0 with Telegram integration...")
 
     # Attempt a quick synchronous restore from DB (Layer 3) so
     # /status works immediately even before Telegram restore completes
