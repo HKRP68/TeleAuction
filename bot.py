@@ -677,6 +677,18 @@ def draft_tier_allowed(player_tier: str, order_tier: str) -> bool:
     return DRAFT_TIERS.index(normalize_draft_tier(player_tier)) >= DRAFT_TIERS.index(normalize_draft_tier(order_tier))
 
 
+def is_draft_picker(aid: int, order, user_id: int) -> bool:
+    """Return whether a user is the scheduled team's owner or linked co-owner."""
+    team = db.cx.execute(
+        "SELECT user_id FROM participants WHERE auction_id=? AND team_name=?", (aid, order["team_name"])
+    ).fetchone()
+    if not team:
+        return user_id == order["owner_tag_id"]
+    if user_id == team["user_id"]:
+        return True
+    return any(link["linked_user_id"] == user_id for link in db.get_co_owners(aid, team["user_id"]))
+
+
 def add_draft_player(aid: int, data: dict) -> int:
     """Add a detailed player record used by both the website and /pick."""
     values = [str(data.get(field, "")).strip() for field in DRAFT_PLAYER_COLUMNS]
@@ -704,8 +716,8 @@ async def cmd_pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("There is no remaining draft pick.")
         return
     uid = update.effective_user.id
-    if uid != order["owner_tag_id"] and not db.is_admin(uid):
-        await update.message.reply_text("It is not your turn to pick.")
+    if not is_draft_picker(live.auction_id, order, uid) and not db.is_admin(uid):
+        await update.message.reply_text("Only this team's owner or co-owner can make the current pick.")
         return
     player = db.get_player_by_name(live.auction_id, " ".join(context.args))
     if not player or player["status"] != "available":
@@ -5630,94 +5642,95 @@ def _require_columns(rows, columns):
         raise ValueError("Missing required columns: " + ", ".join(missing))
 
 
+DRAFT_PLAYER_LABELS = {"name": "Name", "rating": "Rating", "tier": "Tier", "icon_eligible": "Icon eligible", "gender": "Gender", "indian_status": "Indian status", "category": "Category", "country": "Country", "bat_hand": "Bat hand", "bowl_hand": "Bowl hand", "bowl_style": "Bowl style", "bat_rating": "Bat rating", "bowl_rating": "Bowl rating"}
+
+
+def _tag_id(value, field_name):
+    try:
+        return int((value or "").strip())
+    except (TypeError, ValueError):
+        abort(400, f"{field_name} must be a numeric Telegram tag ID.")
+
+
 @flask_app.route("/draft", methods=["GET"])
 def draft_desk():
     if not live.auction_id:
-        return """<!doctype html><title>Draft Desk</title><style>body{font:16px system-ui;max-width:700px;margin:2rem auto;padding:0 1rem}form{padding:1rem;margin:1rem 0;background:#f3f6fa}input{margin:.25rem;width:100%;box-sizing:border-box}</style>
-        <h1>🏏 Draft Desk</h1><p>Create the draft here. Telegram and an access token are not required.</p>
-        <form action='/draft/auction' method='post'><h2>Create draft</h2><label>Draft name <input name=name required></label><label>Maximum teams <input name=max_teams type=number min=1 value=8 required></label><label>Starting purse <input name=purse type=number min=1 value=1000 required></label><label>Minimum players <input name=min_players type=number min=1 value=11 required></label><label>Maximum players <input name=max_players type=number min=1 value=25 required></label><button>Create draft</button></form>"""
-    aid = _web_draft_aid()
-    auction = db.get_auction(aid)
-    order = db.current_draft_order(aid)
-    players = db.get_available(aid)
-    teams = db.get_all_parts(aid)
+        return """<!doctype html><title>Draft Desk</title><style>body{font:16px system-ui;max-width:700px;margin:2rem auto;padding:0 1rem}form{padding:1rem;margin:1rem 0;background:#f3f6fa}input{margin:.25rem;width:100%;box-sizing:border-box}</style><h1>🏏 Draft Desk</h1><p>Create the draft here. Telegram and an access token are not required.</p><form action='/draft/auction' method='post'><h2>Create draft</h2><label>Draft name <input name=name required></label><label>Maximum teams <input name=max_teams type=number min=1 value=8 required></label><label>Starting purse <input name=purse type=number min=1 value=1000 required></label><label>Minimum players <input name=min_players type=number min=1 value=11 required></label><label>Maximum players <input name=max_players type=number min=1 value=25 required></label><button>Create draft</button></form>"""
+    aid = _web_draft_aid(); auction = db.get_auction(aid); order = db.current_draft_order(aid)
+    players = db.cx.execute("SELECT * FROM players WHERE auction_id=? ORDER BY player_id", (aid,)).fetchall(); teams = db.get_all_parts(aid)
     orders = db.cx.execute("SELECT * FROM draft_orders WHERE auction_id=? ORDER BY round_no,pick_no", (aid,)).fetchall()
-    available = "".join(f"<li>{escape(p['name'])} <small>({escape(p['tier'])})</small></li>" for p in players[:100]) or "<li>No available players</li>"
-    turns = "".join(f"<li>R{o['round_no']} P{o['pick_no']} — {escape(o['team_name'])} ({escape(o['tier'])}) {'✅' if o['picked_player_id'] else '⌛'}</li>" for o in orders) or "<li>No draft order uploaded</li>"
-    team_rows = "".join(f"<li><b>{escape(t['team_name'])}</b> — {escape(t['username']) or 'No owner name'}" + (f"; co-owner: {escape(db.get_user(db.get_co_owners(aid, t['user_id'])[0]['linked_user_id'])['first_name'])}" if db.get_co_owners(aid, t['user_id']) else "") + "</li>" for t in teams) or "<li>No teams added</li>"
-    current = "No current turn" if not order else f"R{order['round_no']}P{order['pick_no']} · {escape(order['team_name'])} · {escape(order['tier'])} · owner {order['owner_tag_id']}"
-    return f"""<!doctype html><title>Draft Desk</title><style>body{{font:16px system-ui;max-width:900px;margin:2rem auto;padding:0 1rem}}form{{padding:1rem;margin:1rem 0;background:#f3f6fa}}input{{margin:.25rem}}.grid{{display:grid;grid-template-columns:1fr 1fr;gap:2rem}}</style>
-    <h1>🏏 {escape(auction['name'])}</h1><p><b>Current turn:</b> {current}</p>
-    <form action='/draft/teams' method='post'><b>Add team</b><br><label>Team name <input name=team_name required></label><label>Owner <input name=owner required></label><label>Co-owner <input name=co_owner></label><button>Add team</button></form>
-    <form action='/draft/players' method='post' enctype='multipart/form-data'><b>Import players (.xlsx / .csv)</b><br><small>Required columns: name, rating, tier, icon_eligible, gender, indian_status, category, country, bat_hand, bowl_hand, bowl_style, bat_rating, bowl_rating.</small><br><input type=file name=file required><button>Import players</button></form>
-    <form action='/draft/orders' method='post' enctype='multipart/form-data'><b>Import draft order (.xlsx / .csv)</b><br><small>Columns: round_no, pick_no, tier, team_name, owner_name, owner_tag_id.</small><br><input type=file name=file required><button>Import order</button></form>
-    <div class=grid><section><h2>Teams</h2><ol>{team_rows}</ol><h2>Next picks</h2><ol>{turns}</ol></section><section><h2>Available players</h2><ol>{available}</ol></section></div>"""
+    current = "No current turn" if not order else f"Round {order['round_no']} · Pick {order['pick_no']} · {escape(order['team_name'])} · {escape(order['tier'])}"
+    cards = "".join(f"""<article class="team"><div><b>{escape(t['team_name'])}</b><br><small>Owner tag ID: {t['user_id']} · Co-owner tag ID: {', '.join(str(x['linked_user_id']) for x in db.get_co_owners(aid,t['user_id'])) or '—'}</small></div><a href="/draft/teams/{t['user_id']}/edit">Edit team</a></article>""" for t in teams) or "<p>No teams added yet.</p>"
+    turns = "".join(f"<tr><td>R{o['round_no']} P{o['pick_no']}</td><td>{escape(o['team_name'])}</td><td>{escape(o['tier'])}</td><td>{'Picked' if o['picked_player_id'] else 'Waiting'}</td></tr>" for o in orders) or "<tr><td colspan=4>No draft order uploaded.</td></tr>"
+    headers = "".join(f"<th>{DRAFT_PLAYER_LABELS[c]}</th>" for c in DRAFT_PLAYER_COLUMNS)
+    rows = "".join("<tr>"+"".join(f"<td>{escape(str(player[c] or '—'))}</td>" for c in DRAFT_PLAYER_COLUMNS)+"</tr>" for player in players) or f"<tr><td colspan={len(DRAFT_PLAYER_COLUMNS)}>No available players.</td></tr>"
+    return f"""<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1"><title>{escape(auction['name'])}</title><style>:root{{--navy:#14213d;--blue:#246bdf;--paper:#f5f7fc;--line:#dbe2ef}}*{{box-sizing:border-box}}body{{margin:0;background:var(--paper);font:15px system-ui;color:#18233a}}header{{background:linear-gradient(120deg,var(--navy),#2459a8);color:#fff;padding:2.5rem max(1.25rem,calc((100% - 1160px)/2))}}header p,small{{color:#68738a}}header p{{color:#dbe8ff}}main{{max-width:1160px;margin:auto;padding:1.5rem}}.notice,.panel,.team{{background:#fff;border:1px solid var(--line);border-radius:12px;padding:1.25rem;margin-bottom:1rem}}.notice{{border-left:4px solid #f5b700}}.grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(290px,1fr));gap:1rem}}.grid .panel{{margin:0}}label{{display:block;font-weight:600;margin:.6rem 0}}input{{display:block;width:100%;padding:.6rem;margin-top:.25rem;border:1px solid #bdc8dc;border-radius:7px}}button,a{{display:inline-block;background:var(--blue);color:#fff;border:0;border-radius:7px;padding:.65rem .9rem;text-decoration:none;font-weight:700}}.team{{display:flex;justify-content:space-between;align-items:center}}.scroll{{overflow:auto;border:1px solid var(--line);border-radius:10px}}table{{border-collapse:collapse;width:100%;white-space:nowrap}}th,td{{padding:.65rem .75rem;text-align:left;border-bottom:1px solid var(--line)}}th{{background:#edf3ff;text-transform:uppercase;font-size:.75rem}}@media(max-width:600px){{.team{{align-items:flex-start;gap:1rem;flex-direction:column}}}}</style></head><body><header><h1>🏏 {escape(auction['name'])}</h1><p>Draft control room · {len(teams)}/{auction['max_teams']} teams · {len(players)} imported players</p></header><main><div class="notice"><b>Current turn</b><br>{current}</div><div class="grid"><section class="panel"><h2>Add team</h2><p><small>Only the owner or co-owner tag ID for a team can make that team’s pick.</small></p><form action="/draft/teams" method="post"><label>Team name<input name="team_name" required></label><label>Owner tag ID<input name="owner_tag_id" inputmode="numeric" required></label><label>Co-owner tag ID (optional)<input name="co_owner_tag_id" inputmode="numeric"></label><button>Add team</button></form></section><section class="panel"><h2>Import data</h2><form action="/draft/players" method="post" enctype="multipart/form-data"><label>Players spreadsheet (.xlsx / .csv)<input type="file" name="file" accept=".xlsx,.csv" required></label><small>All spreadsheet columns are visible below.</small><p><button>Import players</button></p></form><form action="/draft/orders" method="post" enctype="multipart/form-data"><label>Draft order (.xlsx / .csv)<input type="file" name="file" accept=".xlsx,.csv" required></label><button>Import order</button></form></section></div><section class="panel"><h2>Teams</h2>{cards}</section><section class="panel"><h2>Draft order</h2><div class="scroll"><table><thead><tr><th>Turn</th><th>Team</th><th>Tier</th><th>Status</th></tr></thead><tbody>{turns}</tbody></table></div></section><section class="panel"><h2>Players — full spreadsheet details</h2><div class="scroll"><table><thead><tr>{headers}</tr></thead><tbody>{rows}</tbody></table></div></section></main></body></html>"""
 
 
 @flask_app.route("/draft/auction", methods=["POST"])
 def draft_create_auction():
     name = (request.form.get("name") or "").strip()
-    if not name:
-        abort(400, "Draft name is required.")
-    max_teams = _positive_int(request.form.get("max_teams"), "Maximum teams")
-    purse = _positive_int(request.form.get("purse"), "Starting purse")
-    min_players = _positive_int(request.form.get("min_players"), "Minimum players")
-    max_players = _positive_int(request.form.get("max_players"), "Maximum players")
-    if min_players > max_players:
-        abort(400, "Minimum players cannot exceed maximum players.")
-    aid = db.create_auction(name, max_teams, purse, min_players, max_players, 0)
-    live.auction_id, live.auction_name = aid, name
+    if not name: abort(400, "Draft name is required.")
+    max_teams = _positive_int(request.form.get("max_teams"), "Maximum teams"); purse = _positive_int(request.form.get("purse"), "Starting purse")
+    min_players = _positive_int(request.form.get("min_players"), "Minimum players"); max_players = _positive_int(request.form.get("max_players"), "Maximum players")
+    if min_players > max_players: abort(400, "Minimum players cannot exceed maximum players.")
+    aid = db.create_auction(name, max_teams, purse, min_players, max_players, 0); live.auction_id, live.auction_name = aid, name
     return redirect(url_for("draft_desk"))
+
+
+def _save_draft_team(aid, existing_owner=None):
+    name = (request.form.get("team_name") or "").strip(); owner = _tag_id(request.form.get("owner_tag_id") or request.form.get("owner"), "Owner tag ID")
+    co_raw = request.form.get("co_owner_tag_id") or request.form.get("co_owner"); co = _tag_id(co_raw, "Co-owner tag ID") if co_raw else None
+    if not name: abort(400, "Team name is required.")
+    if co == owner: abort(400, "Owner and co-owner tag IDs must be different.")
+    if existing_owner is None:
+        if db.count_participants(aid) >= db.get_auction(aid)["max_teams"]: abort(400, "This draft already has the maximum number of teams.")
+        if not db.join(aid, owner, str(owner), name, db.get_auction(aid)["purse"]): abort(400, "That owner tag ID is already assigned to a team.")
+    elif owner != existing_owner:
+        if db.get_part(aid, owner): abort(400, "That owner tag ID is already assigned to a team.")
+        db.cx.execute("UPDATE participants SET user_id=?,username=? WHERE auction_id=? AND user_id=?", (owner, str(owner), aid, existing_owner)); db.cx.execute("UPDATE team_co_owners SET primary_user_id=? WHERE auction_id=? AND primary_user_id=?", (owner, aid, existing_owner))
+    db.upsert_user(owner, "", str(owner)); db.update_part(aid, owner, team_name=name, username=str(owner))
+    db.cx.execute("DELETE FROM team_co_owners WHERE auction_id=? AND primary_user_id=?", (aid, owner))
+    if co is not None:
+        db.upsert_user(co, "", str(co))
+        try: db.link_co_owner(aid, owner, co)
+        except sqlite3.IntegrityError: abort(400, "That co-owner tag ID is already linked to another team.")
+    db.cx.commit()
 
 
 @flask_app.route("/draft/teams", methods=["POST"])
 def draft_add_team():
-    aid = _web_draft_aid()
-    team_name = (request.form.get("team_name") or "").strip()
-    owner = (request.form.get("owner") or "").strip()
-    co_owner = (request.form.get("co_owner") or "").strip()
-    if not team_name or not owner:
-        abort(400, "Team name and owner are required.")
-    if db.count_participants(aid) >= db.get_auction(aid)["max_teams"]:
-        abort(400, "This draft already has the maximum number of teams.")
-    owner_id = db.next_web_user_id()
-    db.upsert_user(owner_id, "", owner)
-    if not db.join(aid, owner_id, owner, team_name, db.get_auction(aid)["purse"]):
-        abort(400, "Could not add this team.")
-    if co_owner:
-        co_owner_id = db.next_web_user_id()
-        db.upsert_user(co_owner_id, "", co_owner)
-        db.link_co_owner(aid, owner_id, co_owner_id)
-    return redirect(url_for("draft_desk"))
+    _save_draft_team(_web_draft_aid()); return redirect(url_for("draft_desk"))
+
+
+@flask_app.route("/draft/teams/<int:owner_id>/edit", methods=["GET", "POST"])
+def draft_edit_team(owner_id):
+    aid = _web_draft_aid(); team = db.get_part(aid, owner_id)
+    if not team: abort(404, "Team not found.")
+    if request.method == "POST": _save_draft_team(aid, owner_id); return redirect(url_for("draft_desk"))
+    co = db.get_co_owners(aid, owner_id); co_id = co[0]["linked_user_id"] if co else ""
+    return f"""<!doctype html><title>Edit team</title><style>body{{font:16px system-ui;max-width:600px;margin:2rem auto;padding:0 1rem}}label{{display:block;margin:.8rem 0;font-weight:600}}input{{display:block;width:100%;padding:.6rem;box-sizing:border-box}}</style><h1>Edit {escape(team['team_name'])}</h1><form method="post"><label>Team name<input name="team_name" value="{escape(team['team_name'])}" required></label><label>Owner tag ID<input name="owner_tag_id" value="{owner_id}" required></label><label>Co-owner tag ID<input name="co_owner_tag_id" value="{co_id}"></label><button>Save team</button> <a href="/draft">Cancel</a></form>"""
 
 
 @flask_app.route("/draft/players", methods=["POST"])
 def draft_players_upload():
     aid = _web_draft_aid()
     try:
-        rows = _sheet_rows(request.files.get("file"))
-        _require_columns(rows, DRAFT_PLAYER_COLUMNS)
-        added = 0
-        for row in rows:
-            add_draft_player(aid, row)
-            added += 1
-    except (ValueError, AttributeError) as exc:
-        abort(400, str(exc))
-    return jsonify({"imported_players": added}), 201
+        rows = _sheet_rows(request.files.get("file")); _require_columns(rows, DRAFT_PLAYER_COLUMNS)
+        for row in rows: add_draft_player(aid, row)
+    except (ValueError, AttributeError) as exc: abort(400, str(exc))
+    return jsonify({"imported_players": len(rows)}), 201
 
 
 @flask_app.route("/draft/orders", methods=["POST"])
 def draft_orders_upload():
     aid = _web_draft_aid()
     try:
-        rows = _sheet_rows(request.files.get("file"))
-        _require_columns(rows, DRAFT_ORDER_COLUMNS)
-        for row in rows:
-            db.add_draft_order(aid, int(row["round_no"]), int(row["pick_no"]), row["tier"],
-                               str(row["team_name"]), str(row.get("owner_name", "")), int(row["owner_tag_id"]))
-    except (ValueError, KeyError, TypeError, AttributeError) as exc:
-        abort(400, f"Invalid draft-order row: {exc}")
+        rows = _sheet_rows(request.files.get("file")); _require_columns(rows, DRAFT_ORDER_COLUMNS)
+        for row in rows: db.add_draft_order(aid, int(row["round_no"]), int(row["pick_no"]), row["tier"], str(row["team_name"]), str(row.get("owner_name", "")), int(row["owner_tag_id"]))
+    except (ValueError, KeyError, TypeError, AttributeError) as exc: abort(400, f"Invalid draft-order row: {exc}")
     return jsonify({"imported_orders": len(rows)}), 201
+
 
 @flask_app.route("/")
 def root(): return "IPL Auction Bot v4.0 is running!", 200
