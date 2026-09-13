@@ -212,6 +212,30 @@ Most slash commands also support dot shortcuts through the dot-command handler, 
 
 ---
 
+## 🏏 Draft mode and web draft desk
+
+Draft mode is a turn-based alternative to bidding. Create an auction as normal, set a long `WEB_ADMIN_TOKEN`, then open:
+
+```text
+https://your-service.example/draft?token=YOUR_WEB_ADMIN_TOKEN
+```
+
+The desk imports `.xlsx` or `.csv` files for players and the draft order. Player sheets use these exact columns:
+
+```text
+name,rating,tier,icon_eligible,gender,indian_status,category,country,bat_hand,bowl_hand,bowl_style,bat_rating,bowl_rating
+```
+
+Order sheets use:
+
+```text
+round_no,pick_no,tier,team_name,owner_name,owner_tag_id
+```
+
+`owner_tag_id` is the owner’s numeric Telegram ID. The person whose turn it is selects with `/pick Jasprit Bumrah`. A turn may select its own tier or a lower tier: **Platinum → Gold → Silver → Bronze**. The bot posts the round/pick, updated tiered squad, and the next owner’s turn. The web token is intentionally required; do not expose the draft URL or token publicly.
+
+---
+
 ## 📋 Auction rules implemented
 
 - Starting purse is configurable per auction; IPL-style examples use ₹125 Crore.
