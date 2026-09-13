@@ -10,6 +10,7 @@ IPL Cricket Auction Bot — v4.0
 """
 
 import asyncio
+from html import escape
 import json
 import logging
 import os
@@ -22,7 +23,7 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 from dotenv import load_dotenv
-from flask import Flask, request
+from flask import Flask, abort, jsonify, request
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
 from telegram.ext import (
@@ -44,6 +45,7 @@ class Config:
     WEBHOOK_URL: str    = os.getenv("WEBHOOK_URL", "")
     PORT: int           = int(os.getenv("PORT", "8080"))
     DB_PATH: str        = os.getenv("DATABASE_PATH", "auction.db")
+    WEB_ADMIN_TOKEN: str = os.getenv("WEB_ADMIN_TOKEN", "")
     # Optional: a private Telegram channel/group where bot is admin.
     # Bot stores state JSON here — survives Render filesystem wipes.
     # Set to the channel_id (e.g. -1001234567890) in Render env vars.
@@ -231,6 +233,21 @@ class DB:
             sold_chat_id    INTEGER
         );
 
+        CREATE TABLE IF NOT EXISTS draft_orders (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            auction_id      INTEGER NOT NULL,
+            round_no        INTEGER NOT NULL,
+            pick_no         INTEGER NOT NULL,
+            tier            TEXT NOT NULL,
+            team_name       TEXT NOT NULL,
+            owner_name      TEXT DEFAULT '',
+            owner_tag_id    INTEGER NOT NULL,
+            picked_player_id INTEGER,
+            picked_at       TIMESTAMP,
+            UNIQUE(auction_id, round_no, pick_no),
+            FOREIGN KEY(picked_player_id) REFERENCES players(player_id)
+        );
+
         CREATE TABLE IF NOT EXISTS bid_history (
             id          INTEGER PRIMARY KEY AUTOINCREMENT,
             auction_id  INTEGER NOT NULL,
@@ -274,7 +291,16 @@ class DB:
 
         CREATE INDEX IF NOT EXISTS idx_bid_history_auction_user
             ON bid_history(auction_id, user_id);
+
+        CREATE INDEX IF NOT EXISTS idx_draft_orders_turn
+            ON draft_orders(auction_id, picked_player_id, round_no, pick_no);
         """)
+        # SQLite's CREATE TABLE cannot add fields to existing installations.
+        existing = {row[1] for row in c.execute("PRAGMA table_info(players)")}
+        for column in ("rating", "icon_eligible", "gender", "indian_status", "category",
+                       "country", "bat_hand", "bowl_hand", "bowl_style", "bat_rating", "bowl_rating"):
+            if column not in existing:
+                c.execute(f"ALTER TABLE players ADD COLUMN {column} TEXT DEFAULT ''")
         c.commit()
         c.close()
 
@@ -540,6 +566,32 @@ class DB:
         self.cx.execute("DELETE FROM players WHERE auction_id=?", (aid,))
         self.cx.commit()
 
+    # ── DRAFT ───────────────────────────────────────────
+    def add_draft_order(self, aid: int, round_no: int, pick_no: int, tier: str,
+                        team_name: str, owner_name: str, owner_tag_id: int):
+        self.cx.execute("""INSERT INTO draft_orders
+            (auction_id,round_no,pick_no,tier,team_name,owner_name,owner_tag_id)
+            VALUES(?,?,?,?,?,?,?)
+            ON CONFLICT(auction_id,round_no,pick_no) DO UPDATE SET
+            tier=excluded.tier,team_name=excluded.team_name,owner_name=excluded.owner_name,
+            owner_tag_id=excluded.owner_tag_id""",
+            (aid, round_no, pick_no, normalize_draft_tier(tier), team_name, owner_name, owner_tag_id))
+        self.cx.commit()
+
+    def current_draft_order(self, aid: int):
+        return self.cx.execute("SELECT * FROM draft_orders WHERE auction_id=? AND picked_player_id IS NULL "
+                               "ORDER BY round_no, pick_no LIMIT 1", (aid,)).fetchone()
+
+    def pick_draft_player(self, order_id: int, player_id: int) -> bool:
+        cur = self.cx.execute("UPDATE draft_orders SET picked_player_id=?,picked_at=CURRENT_TIMESTAMP "
+                              "WHERE id=? AND picked_player_id IS NULL", (player_id, order_id))
+        self.cx.commit()
+        return cur.rowcount == 1
+
+    def draft_squad(self, aid: int, team_name: str):
+        return self.cx.execute("""SELECT p.* FROM draft_orders d JOIN players p ON p.player_id=d.picked_player_id
+            WHERE d.auction_id=? AND d.team_name=? ORDER BY d.round_no,d.pick_no""", (aid, team_name)).fetchall()
+
     # ── BID HISTORY ─────────────────────────────────────
     def record_bid(self, aid: int, uid: int, pid: int, name: str,
                    amount: int, won: bool = False):
@@ -592,6 +644,84 @@ class DB:
 
 
 db = DB()
+
+
+# ─────────────────────────────────────────────────────────
+# DRAFT MODE
+# ─────────────────────────────────────────────────────────
+DRAFT_TIERS = ("Platinum", "Gold", "Silver", "Bronze")
+DRAFT_PLAYER_COLUMNS = ("name", "rating", "tier", "icon_eligible", "gender", "indian_status", "category",
+                        "country", "bat_hand", "bowl_hand", "bowl_style", "bat_rating", "bowl_rating")
+DRAFT_ORDER_COLUMNS = ("round_no", "pick_no", "tier", "team_name", "owner_name", "owner_tag_id")
+
+
+def normalize_draft_tier(value: str) -> str:
+    """Return a supported draft tier, accepting case-insensitive spreadsheet input."""
+    value = str(value or "").strip().lower()
+    aliases = {"platinum": "Platinum", "gold": "Gold", "silver": "Silver", "bronze": "Bronze"}
+    return aliases.get(value, "Bronze")
+
+
+def draft_tier_allowed(player_tier: str, order_tier: str) -> bool:
+    """A Platinum turn can choose every tier; lower turns can choose their tier or below."""
+    return DRAFT_TIERS.index(normalize_draft_tier(player_tier)) >= DRAFT_TIERS.index(normalize_draft_tier(order_tier))
+
+
+def add_draft_player(aid: int, data: dict) -> int:
+    """Add a detailed player record used by both the website and /pick."""
+    values = [str(data.get(field, "")).strip() for field in DRAFT_PLAYER_COLUMNS]
+    if not values[0]:
+        raise ValueError("name is required")
+    values[2] = normalize_draft_tier(values[2])
+    cur = db.cx.execute("""INSERT INTO players
+        (auction_id,name,rating,tier,icon_eligible,gender,indian_status,category,country,bat_hand,bowl_hand,bowl_style,bat_rating,bowl_rating,status)
+        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?, 'available')""", (aid, *values))
+    db.cx.commit()
+    return cur.lastrowid
+
+
+async def cmd_pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Make the current scheduled draft pick: /pick Jasprit Bumrah."""
+    await _reg(update.effective_user)
+    if not live.auction_id:
+        await update.message.reply_text("Create or restore an auction before using draft mode.")
+        return
+    if not context.args:
+        await update.message.reply_text("Usage: /pick <player name>")
+        return
+    order = db.current_draft_order(live.auction_id)
+    if not order:
+        await update.message.reply_text("There is no remaining draft pick.")
+        return
+    uid = update.effective_user.id
+    if uid != order["owner_tag_id"] and not db.is_admin(uid):
+        await update.message.reply_text("It is not your turn to pick.")
+        return
+    player = db.get_player_by_name(live.auction_id, " ".join(context.args))
+    if not player or player["status"] != "available":
+        await update.message.reply_text("That player is unavailable. Use the exact available player name.")
+        return
+    if not draft_tier_allowed(player["tier"], order["tier"]):
+        await update.message.reply_text(f"This is a {order['tier']} pick; choose {order['tier']} or a lower tier player.")
+        return
+    if not db.pick_draft_player(order["id"], player["player_id"]):
+        await update.message.reply_text("That pick was already completed. Please try again.")
+        return
+    db.set_player_status(player["player_id"], "drafted")
+    squad = db.draft_squad(live.auction_id, order["team_name"])
+    by_tier = {tier: [] for tier in DRAFT_TIERS}
+    for member in squad:
+        by_tier[normalize_draft_tier(member["tier"])].append(member["name"])
+    squad_lines = [f"{tier} — {', '.join(names)}" for tier, names in by_tier.items() if names]
+    next_turn = db.current_draft_order(live.auction_id)
+    next_text = "Draft complete. 🎉" if not next_turn else f"Next turn: {db.display(next_turn['owner_tag_id'])} ({next_turn['team_name']})"
+    await update.message.reply_text(
+        f"🏏 *{md_safe(order['team_name'])}*\n"
+        f"*R{order['round_no']}P{order['pick_no']}* · {order['tier']} pick\n"
+        f"Player — *{md_safe(player['name'])}*\n"
+        "────────────\n*Updated squad*\n" + "\n".join(squad_lines) + f"\n\n⏭ {md_safe(next_text)}",
+        parse_mode=ParseMode.MARKDOWN,
+    )
 
 
 # ─────────────────────────────────────────────────────────
@@ -2059,6 +2189,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/mybidhistory — Your bid results\n"
         "/auctionhistory — Past auctions\n"
         "/leaderboard — Top teams\n"
+        "/pick <player> — Make your scheduled draft selection\n"
     )
     a = ""
     if is_adm:
@@ -2073,6 +2204,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "/add\\_player\\_list — Bulk from list\n"
             "/bulkplayer <P1>,<P2>,... — Quick bulk add\n"
             "/clearplayers\n"
+            "/pick <player> — Pick for the current draft turn\n"
             "\n*ADMIN: AUCTION*\n"
             "/startauction — Begin bidding\n"
             "/next — Next player\n"
@@ -5446,6 +5578,91 @@ async def dot_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ─────────────────────────────────────────────────────────
 # FLASK
 # ─────────────────────────────────────────────────────────
+def _web_authorized() -> bool:
+    """Require an explicit token so the public webhook service cannot edit a draft."""
+    return bool(Config.WEB_ADMIN_TOKEN) and request.values.get("token", "") == Config.WEB_ADMIN_TOKEN
+
+
+def _web_draft_aid() -> int:
+    if not _web_authorized():
+        abort(403, "Set WEB_ADMIN_TOKEN and include it as ?token=... in the draft desk URL.")
+    if not live.auction_id:
+        abort(400, "Create an auction in Telegram first.")
+    return live.auction_id
+
+
+def _sheet_rows(upload):
+    """Read .xlsx or .csv uploads into lowercase-header dictionaries."""
+    import csv
+    import io
+    filename = (upload.filename or "").lower()
+    raw = upload.read()
+    if filename.endswith(".xlsx"):
+        import openpyxl
+        ws = openpyxl.load_workbook(io.BytesIO(raw), data_only=True).active
+        data = list(ws.iter_rows(values_only=True))
+        if not data:
+            return []
+        headers = [str(v or "").strip().lower().replace(" ", "_") for v in data[0]]
+        return [dict(zip(headers, row)) for row in data[1:] if any(v is not None and str(v).strip() for v in row)]
+    if filename.endswith(".csv"):
+        return list(csv.DictReader(io.StringIO(raw.decode("utf-8-sig", errors="replace"))))
+    raise ValueError("Upload an .xlsx or .csv file")
+
+
+def _require_columns(rows, columns):
+    present = set(rows[0]) if rows else set()
+    missing = [column for column in columns if column not in present]
+    if missing:
+        raise ValueError("Missing required columns: " + ", ".join(missing))
+
+
+@flask_app.route("/draft", methods=["GET"])
+def draft_desk():
+    aid = _web_draft_aid()
+    token = request.values["token"]
+    order = db.current_draft_order(aid)
+    players = db.get_available(aid)
+    orders = db.cx.execute("SELECT * FROM draft_orders WHERE auction_id=? ORDER BY round_no,pick_no", (aid,)).fetchall()
+    available = "".join(f"<li>{escape(p['name'])} <small>({escape(p['tier'])})</small></li>" for p in players[:100]) or "<li>No available players</li>"
+    turns = "".join(f"<li>R{o['round_no']} P{o['pick_no']} — {escape(o['team_name'])} ({escape(o['tier'])}) {'✅' if o['picked_player_id'] else '⌛'}</li>" for o in orders) or "<li>No draft order uploaded</li>"
+    current = "No current turn" if not order else f"R{order['round_no']}P{order['pick_no']} · {escape(order['team_name'])} · {escape(order['tier'])} · owner {order['owner_tag_id']}"
+    token = escape(token, quote=True)
+    return f"""<!doctype html><title>Draft Desk</title><style>body{{font:16px system-ui;max-width:900px;margin:2rem auto;padding:0 1rem}}form{{padding:1rem;margin:1rem 0;background:#f3f6fa}}input{{margin:.25rem}}.grid{{display:grid;grid-template-columns:1fr 1fr;gap:2rem}}</style>
+    <h1>🏏 Draft Desk</h1><p><b>Current turn:</b> {current}</p>
+    <form action='/draft/players?token={token}' method='post' enctype='multipart/form-data'><b>Import players (.xlsx / .csv)</b><br><small>Required columns: name, rating, tier, icon_eligible, gender, indian_status, category, country, bat_hand, bowl_hand, bowl_style, bat_rating, bowl_rating.</small><br><input type=file name=file required><button>Import players</button></form>
+    <form action='/draft/orders?token={token}' method='post' enctype='multipart/form-data'><b>Import draft order (.xlsx / .csv)</b><br><small>Columns: round_no, pick_no, tier, team_name, owner_name, owner_tag_id.</small><br><input type=file name=file required><button>Import order</button></form>
+    <div class=grid><section><h2>Next picks</h2><ol>{turns}</ol></section><section><h2>Available players</h2><ol>{available}</ol></section></div>"""
+
+
+@flask_app.route("/draft/players", methods=["POST"])
+def draft_players_upload():
+    aid = _web_draft_aid()
+    try:
+        rows = _sheet_rows(request.files.get("file"))
+        _require_columns(rows, DRAFT_PLAYER_COLUMNS)
+        added = 0
+        for row in rows:
+            add_draft_player(aid, row)
+            added += 1
+    except (ValueError, AttributeError) as exc:
+        abort(400, str(exc))
+    return jsonify({"imported_players": added}), 201
+
+
+@flask_app.route("/draft/orders", methods=["POST"])
+def draft_orders_upload():
+    aid = _web_draft_aid()
+    try:
+        rows = _sheet_rows(request.files.get("file"))
+        _require_columns(rows, DRAFT_ORDER_COLUMNS)
+        for row in rows:
+            db.add_draft_order(aid, int(row["round_no"]), int(row["pick_no"]), row["tier"],
+                               str(row["team_name"]), str(row.get("owner_name", "")), int(row["owner_tag_id"]))
+    except (ValueError, KeyError, TypeError, AttributeError) as exc:
+        abort(400, f"Invalid draft-order row: {exc}")
+    return jsonify({"imported_orders": len(rows)}), 201
+
 @flask_app.route("/")
 def root(): return "IPL Auction Bot v4.0 is running!", 200
 
@@ -5473,6 +5690,7 @@ def build_app() -> Application:
     app.add_handler(CommandHandler(["mybidhistory","bidhistory"], cmd_my_bid_history))
     app.add_handler(CommandHandler(["auctionhistory","auction_history"], cmd_auction_history))
     app.add_handler(CommandHandler("leaderboard", cmd_leaderboard))
+    app.add_handler(CommandHandler("pick", cmd_pick))
 
     # Admin: setup
     app.add_handler(CommandHandler(["create_auction","createauction"], cmd_create_auction))
