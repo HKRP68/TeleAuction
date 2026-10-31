@@ -36,7 +36,7 @@ async def help_command(bot, update, context):
             '/overseas off — Remove the overseas quota\n'
             '/arule Women 2_6 · /arule Rating<=84 4 — Category quotas\n'
             '/arules show · /areserve auto — Rules and purse reserve\n'
-            '/addplayer · /downloadtemplate — Add Player Database records\n'
+            '/addplayer · /downloadtemplate — Player fields including Base Price\n'
             '/uploaddata · /asetsimport — Preview CSV/JSON/XLSX imports\n'
             '/exportplayers csv · /asetsexport xlsx — Export all player fields\n'
             '/acancel confirm — Cancel; preserve completed sales and records\n'

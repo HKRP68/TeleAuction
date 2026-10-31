@@ -229,13 +229,13 @@ Create the draft on this page, then add each **Team Name**, **Owner**, and optio
 **Co-owner**. This setup is stored in the database and does not require creating an
 auction or registering teams in Telegram.
 
-The desk imports `.xlsx`, `.csv`, or `.json` player files and `.xlsx`/`.csv` draft orders. Player templates and exports use exactly these 14 public columns:
+The desk imports `.xlsx`, `.csv`, or `.json` player files and `.xlsx`/`.csv` draft orders. Player templates and exports use exactly these 15 public columns:
 
 ```text
-Set No,Set Name,Player Id,Player Name,Category,country,Overall,bat_hand,bowl_hand,bowl_style,bat_rating,bowl_rating,version,gender
+Set No,Set Name,Player Id,Player Name,Category,country,Overall,bat_hand,bowl_hand,bowl_style,bat_rating,bowl_rating,version,gender,Base Price
 ```
 
-Leave Player Id blank for new players; Set No defaults to 1 and Set Name defaults to the set's known label or `Set N`. Overall is the stored overall rating. Gender accepts Women/Men and Female/Male/F/M. Missing gender, country or ratings do not count toward the corresponding quota. New templates and player exports contain only the 14 columns above. Older internal tier/pricing/RTM fields remain in the database for compatibility and are preserved when updating an existing Player Id. Existing installations gain Set Name automatically at startup without removing player data.
+Leave Player Id blank for new players; Set No defaults to 1 and Set Name defaults to the set's known label or `Set N`. Overall is the stored overall rating. Gender accepts Women/Men and Female/Male/F/M. Missing gender, country or ratings do not count toward the corresponding quota. New templates and player exports contain only the 15 columns above. Older internal tier/RTM fields remain in the database for compatibility and are preserved when updating an existing Player Id. Existing installations gain Set Name automatically at startup without removing player data.
 
 Order sheets use:
 
@@ -466,8 +466,8 @@ Replace the sample row, keep its headers, and reply to the file with `/uploaddat
 review with `/asetsreview TOKEN`, then apply with `/asetsconfirm TOKEN`. The website
 provides the same CSV/JSON/XLSX import preview, template downloads and exports.
 
-Core columns are `Set No,Set Name,Player Id,Player Name,Category,country,Overall,bat_hand,bowl_hand,bowl_style,bat_rating,bowl_rating,version,gender`.
-Only the 14 public fields appear in new templates and exports. Older optional columns remain readable for compatibility; omitted internal fields retain their stored values when updating an existing player.
+Core columns are `Set No,Set Name,Player Id,Player Name,Category,country,Overall,bat_hand,bowl_hand,bowl_style,bat_rating,bowl_rating,version,gender,Base Price`.
+Only the 15 public fields appear in new templates and exports. Older optional columns remain readable for compatibility; omitted internal fields retain their stored values when updating an existing player.
 Only a name is required for a new player; blank Player IDs are generated, and Set No
 is 1 by default. Existing IDs update matching players in this auction; omitted fields
 keep stored values. Owned players remain protected. Foreign IDs are rejected; clear
@@ -475,7 +475,7 @@ the IDs to clone players to a different auction. All formats retain the public m
 reports are read-only during metadata imports and do not recreate ownership.
 
 ```text
-/addplayer 1,Pace Bowlers,,Example Player,Bowler,India,82,Right,Right,Fast,70,87,2026,Women
+/addplayer 1,Pace Bowlers,,Example Player,Bowler,India,82,Right,Right,Fast,70,87,2026,Women,20l
 /exportplayers xlsx
 /asetsexport csv
 /downloaddata
@@ -514,13 +514,15 @@ simulation, and the rules screen/live board show the same classification.
 The only public player columns, in order, are:
 
 ```text
-Set No,Set Name,Player Id,Player Name,Category,country,Overall,bat_hand,bowl_hand,bowl_style,bat_rating,bowl_rating,version,gender
+Set No,Set Name,Player Id,Player Name,Category,country,Overall,bat_hand,bowl_hand,bowl_style,bat_rating,bowl_rating,version,gender,Base Price
 ```
 
 `Catagory` is accepted as an alias of Category; Overall maps to the stored overall
 rating. New templates, CSV/JSON/XLSX exports and direct CSV player entry share this
-14-column format. Existing internal pricing/tier/RTM metadata is preserved in the
+15-column format. Existing internal tier/RTM metadata is preserved in the
 database and omitted from these player files. For full auction backups keep the
 SQLite database. Set Name defaults to the set's known name or `Set N`, appears in
 live lot cards, and is audited. A batch cannot give the same Set No conflicting
 names. See [COMMANDS.md](COMMANDS.md) for current examples.
+
+Base Price is the 15th public player field. It is included in all templates and player exports and controls the minimum opening bid. Use `20`, `50l`, or `2cr`; old 14-column files remain readable and preserve existing prices when the column is omitted.

@@ -7,7 +7,7 @@ from types import SimpleNamespace
 import pytest
 from test_auction_controls import setup,command
 
-EXPECTED = ('Set No','Set Name','Player Id','Player Name','Category','country','Overall','bat_hand','bowl_hand','bowl_style','bat_rating','bowl_rating','version','gender')
+EXPECTED = ('Set No','Set Name','Player Id','Player Name','Category','country','Overall','bat_hand','bowl_hand','bowl_style','bat_rating','bowl_rating','version','gender','Base Price')
 
 
 def test_home_sets_classification_without_enabling_a_quota(tmp_path):
@@ -99,13 +99,13 @@ def test_finisher_meets_configured_overseas_range(tmp_path):
         assert bot.auction_rules.origin_counts(players,'India')=={'Home':1,'Overseas':2,'Unclassified':0}
 
 
-def test_public_templates_and_exports_have_only_the_requested_14_fields(tmp_path):
+def test_public_templates_and_exports_have_only_the_requested_15_fields(tmp_path):
     bot,u,c=setup(tmp_path)
     sample=bot.player_io.sample()
     for fmt in ('json','csv','xlsx'):
         raw=bot.player_io.export_file([sample],fmt)
         parsed=bot.player_io.read_rows(raw,'players.'+fmt)[0]
-        assert set(parsed)=={'set_no','set_name','player_id','name','category','country','rating','bat_hand','bowl_hand','bowl_style','bat_rating','bowl_rating','version','gender'}
+        assert set(parsed)=={'set_no','set_name','player_id','name','category','country','rating','bat_hand','bowl_hand','bowl_style','bat_rating','bowl_rating','version','gender','base_price'}
         if fmt=='json': headers=tuple(json.loads(raw)[0])
         elif fmt=='csv': headers=tuple(next(csv.reader(io.StringIO(raw.decode('utf-8-sig')))))
         else:
@@ -113,7 +113,7 @@ def test_public_templates_and_exports_have_only_the_requested_14_fields(tmp_path
             wb=openpyxl.load_workbook(io.BytesIO(raw),data_only=True)
             headers=tuple(c.value for c in wb['Players'][1]);wb.close()
         assert headers==EXPECTED
-        assert 'tier' not in parsed and 'base_price' not in parsed and 'nationality' not in parsed
+        assert 'tier' not in parsed and 'base_price' in parsed and 'nationality' not in parsed
 
 
 def test_exact_user_headers_and_raw_addplayer_fields_preserve_set_name(tmp_path):

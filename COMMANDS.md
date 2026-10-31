@@ -236,15 +236,15 @@ be cancelled. The website has a **Cancel auction…** review step in `/draft`.
 | `/asetsreview token` | Download field-level preview details. | `/asetsreview TOKEN_FROM_PREVIEW` |
 | `/asetsconfirm token` | Apply the reviewed preview within 30 minutes. | `/asetsconfirm TOKEN_FROM_PREVIEW` |
 | `/findplayer query` | Search by name, role, former team or tier. | `/findplayer Bumrah` |
-| `/addplayer record` | Add a full Player Database record as the 14 database columns or JSON. | `/addplayer 1,Pace Bowlers,,Example Player,Bowler,India,82,Right,Right,Fast,70,87,2026,Women` |
-| `/add_player_list` | Add multiple detailed CSV rows, header-based CSV, or JSON records. | Put one 14-field player record per line after `/add_player_list`. |
+| `/addplayer record` | Add a full Player Database record as the 15 database columns or JSON. | `/addplayer 1,Pace Bowlers,,Example Player,Bowler,India,82,Right,Right,Fast,70,87,2026,Women,20l` |
+| `/add_player_list` | Add multiple detailed CSV rows, header-based CSV, or JSON records. | Put one 15-field player record per line after `/add_player_list`. |
 | `/bulkplayer records` | Add detailed CSV/JSON records, or just names for quick entries. | `/bulkplayer [{"name":"Player One","rating":84,"gender":"Women","category":"Bowler"}]` |
 | `/clearplayers` | Clear the auction's player list; super admin only. | `/clearplayers` |
 
-### Add players using exactly these 14 fields
+### Add players using exactly these 15 fields
 
 ```text
-Set No,Set Name,Player Id,Player Name,Category,country,Overall,bat_hand,bowl_hand,bowl_style,bat_rating,bowl_rating,version,gender
+Set No,Set Name,Player Id,Player Name,Category,country,Overall,bat_hand,bowl_hand,bowl_style,bat_rating,bowl_rating,version,gender,Base Price
 ```
 
 `Category` also accepts the spelling `Catagory`. `Overall` is the overall player
@@ -255,7 +255,7 @@ that set, or becomes `Set 1`, `Set 2`, etc. Conflicting names for the same Set N
 within a batch are rejected.
 
 1. Run `/downloadtemplate` (or `/downloadtemplate csv` / `json`).
-2. Replace the example row with your players, keeping the 14 headers.
+2. Replace the example row with your players, keeping the 15 headers.
 3. Leave Player Id empty for new players; keep existing IDs to update matching players in this auction.
 4. Send the file and reply `/uploaddata` or `/asetsimport` (a command in the file caption also works).
 5. Review with `/asetsreview TOKEN`, then apply with `/asetsconfirm TOKEN`.
@@ -263,30 +263,29 @@ within a batch are rejected.
 
 CSV, XLSX and JSON all use these fields. TSV copied from a spreadsheet is accepted
 as text too. Header names are case-insensitive, and legacy `name` / `rating` are
-accepted aliases for Player Name / Overall. Existing pricing, tier and other
+accepted aliases for Player Name / Overall. Existing tier and other
 internal auction data are preserved when an existing ID is imported, but those
 internal fields are not part of the new player template or exports. Older files
-remain readable for compatibility. New players use the auction's normal opening
-bid step; no per-player price field is required.
+remain readable for compatibility. Base Price accepts whole purse units (e.g. `20`), lakh suffixes (`50l`) or crore suffixes (`2cr`). It sets the minimum opening bid. Omit it on an existing Player Id to preserve its price; a blank value means an open/zero base price.
 
 Example CSV:
 
 ```csv
-Set No,Set Name,Player Id,Player Name,Category,country,Overall,bat_hand,bowl_hand,bowl_style,bat_rating,bowl_rating,version,gender
-1,Pace Bowlers,,Example Player,Bowler,India,82,Right,Right,Fast,70,87,2026,Women
+Set No,Set Name,Player Id,Player Name,Category,country,Overall,bat_hand,bowl_hand,bowl_style,bat_rating,bowl_rating,version,gender,Base Price
+1,Pace Bowlers,,Example Player,Bowler,India,82,Right,Right,Fast,70,87,2026,Women,20l
 ```
 
 Paste the same row after `/addplayer`:
 
 ```text
-/addplayer 1,Pace Bowlers,,Example Player,Bowler,India,82,Right,Right,Fast,70,87,2026,Women
+/addplayer 1,Pace Bowlers,,Example Player,Bowler,India,82,Right,Right,Fast,70,87,2026,Women,20l
 ```
 
 For multiple players, put one row per line after `/add_player_list`. JSON can use
 explicit field names:
 
 ```text
-/addplayer {"Set No":1,"Set Name":"Pace Bowlers","Player Name":"Example Player","Category":"Bowler","country":"India","Overall":82,"bat_hand":"Right","bowl_hand":"Right","bowl_style":"Fast","bat_rating":70,"bowl_rating":87,"version":"2026","gender":"Women"}
+/addplayer {"Set No":1,"Set Name":"Pace Bowlers","Player Name":"Example Player","Category":"Bowler","country":"India","Overall":82,"bat_hand":"Right","bowl_hand":"Right","bowl_style":"Fast","bat_rating":70,"bowl_rating":87,"version":"2026","gender":"Women","Base Price":"20l"}
 ```
 
 Only Player Name is required to create a record. Missing gender, country or Overall
@@ -298,7 +297,7 @@ values. Sold/drafted squad members are protected. Foreign Player IDs are rejecte
 clear IDs to clone player metadata into another auction. Metadata imports do not
 recreate sales; full database backups remain the way to restore auction results.
 
-The Players sheet in `/downloaddata` uses the same 14 columns, followed by read-only
+The Players sheet in `/downloaddata` uses the same 15 columns, followed by read-only
 sale/status columns; those extra report fields are ignored when re-imported.
 
 ## Teams, purses, communication and reporting

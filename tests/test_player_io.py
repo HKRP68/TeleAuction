@@ -202,4 +202,40 @@ def test_paste_canonical_database_row_without_headers(tmp_path):
     u.message.text='/addplayer '+out.getvalue()
     asyncio.run(bot.cmd_add_player(u,c))
     p=bot.db.get_player_by_name(bot.live.auction_id,'Example Player')
-    assert p['gender']=='Women' and p['bowl_rating']=='87' and p['base_price']==0
+    assert p['gender']=='Women' and p['bowl_rating']=='87' and p['base_price']==20
+
+
+@pytest.mark.parametrize('price,expected',[('20',20),('50l',50),('2cr',200)])
+def test_public_base_price_sets_opening_bid_and_survives_every_export(tmp_path,price,expected):
+    bot,u,c=setup(tmp_path)
+    u.message.text='/addplayer 1,Pace Bowlers,70,Priced Player,Bowler,India,84,Right,Right,Fast,70,87,2026,Women,'+price
+    asyncio.run(bot.cmd_add_player(u,c))
+    player=bot.db.get_player(70)
+    assert player['base_price']==expected
+    bot.live.current_player_id=70
+    assert bot.auction_controls.next_amount()==expected
+    assert bot.validate_bid(bot.db.get_part(bot.live.auction_id,1),player,expected-1,bot.db.get_auction(bot.live.auction_id))
+    for fmt in ('json','csv','xlsx'):
+        raw=bot.player_io.export_file(bot.player_io.export_rows(bot,bot.live.auction_id),fmt)
+        rows=bot.player_io.read_rows(raw,'players.'+fmt)
+        assert int(rows[0]['base_price'])==expected
+
+
+def test_old_14_column_entry_is_supported_and_sparse_updates_keep_base_price(tmp_path):
+    bot,u,c=setup(tmp_path)
+    u.message.text='/addplayer 1,Pace Bowlers,70,Old Player,Bowler,India,84,Right,Right,Fast,70,87,2026,Women'
+    asyncio.run(bot.cmd_add_player(u,c))
+    assert bot.db.get_player(70)['base_price']==0
+    bot.auction_controls.import_rows([{'Player Id':70,'Player Name':'Old Player','Base Price':'2cr'}])
+    bot.auction_controls.import_rows([{'Player Id':70,'Player Name':'Old Player','Overall':85}])
+    assert bot.db.get_player(70)['base_price']==200
+    bot.auction_controls.import_rows([{'Player Id':70,'Player Name':'Old Player','Base Price':''}])
+    assert bot.db.get_player(70)['base_price']==0
+
+
+@pytest.mark.parametrize('price',['-1','nancr','infcr','1e100cr','wrong'])
+def test_invalid_public_base_price_rejects_entire_batch(tmp_path,price):
+    bot,u,c=setup(tmp_path)
+    with pytest.raises(ValueError):
+        bot.auction_controls.import_rows([{'Player Name':'Good','Base Price':20},{'Player Name':'Bad','Base Price':price}])
+    assert not bot.db.get_available(bot.live.auction_id)

@@ -1,2 +1,2 @@
-Set No,Set Name,Player Id,Player Name,Category,country,Overall,bat_hand,bowl_hand,bowl_style,bat_rating,bowl_rating,version,gender
-1,Pace Bowlers,,Example Player,Bowler,India,82,Right,Right,Fast,70,87,2026,Women
+Set No,Set Name,Player Id,Player Name,Category,country,Overall,bat_hand,bowl_hand,bowl_style,bat_rating,bowl_rating,version,gender,Base Price
+1,Pace Bowlers,,Example Player,Bowler,India,82,Right,Right,Fast,70,87,2026,Women,20

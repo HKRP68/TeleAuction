@@ -8,25 +8,25 @@ from flask import request, abort
 import auction_rules
 
 CORE_COLUMNS = ('set_no','set_name','player_id','name','category','country','rating','bat_hand',
-                'bowl_hand','bowl_style','bat_rating','bowl_rating','version','gender')
+                'bowl_hand','bowl_style','bat_rating','bowl_rating','version','gender','base_price')
 # Storage compatibility only: new templates, entry guidance and exports expose CORE_COLUMNS.
-EXTRA_COLUMNS = ('tier','icon_eligible','indian_status','base_price','role','nationality','ipl_team')
+EXTRA_COLUMNS = ('tier','icon_eligible','indian_status','role','nationality','ipl_team')
 PLAYER_COLUMNS = CORE_COLUMNS
 WRITE_COLUMNS = tuple(k for k in CORE_COLUMNS if k!='player_id') + EXTRA_COLUMNS
 FIELD_LABELS = ('Set No','Set Name','Player Id','Player Name','Category','country','Overall','bat_hand',
-                'bowl_hand','bowl_style','bat_rating','bowl_rating','version','gender')
+                'bowl_hand','bowl_style','bat_rating','bowl_rating','version','gender','Base Price')
 LABELS = dict(zip(CORE_COLUMNS,FIELD_LABELS))
 ENTRY_COLUMNS = CORE_COLUMNS
 OLD_ENTRY_COLUMNS = ('name','rating','category','gender','country','bat_hand','bowl_hand',
                      'bowl_style','bat_rating','bowl_rating','version','set_no','player_id','base_price')
 OLD_COLUMNS = ('player_id','set_no','name','rating','category','gender','country','bat_hand',
-               'bowl_hand','bowl_style','bat_rating','bowl_rating','version') + EXTRA_COLUMNS
+               'bowl_hand','bowl_style','bat_rating','bowl_rating','version') + ('tier','icon_eligible','indian_status','base_price','role','nationality','ipl_team')
 READ_ONLY = {'auction_id','status','sold_to','sold_price','sold_msg_id','sold_chat_id','buyer_team','sold_price_cr'}
 ALIASES = {'player_name':'name','player':'name','playerid':'player_id','id':'player_id',
            'set':'set_no','set_number':'set_no','setno':'set_no','batting_hand':'bat_hand',
            'bowling_hand':'bowl_hand','bowling_style':'bowl_style','batting_rating':'bat_rating',
            'bowling_rating':'bowl_rating','previous_team':'ipl_team','prev_team':'ipl_team','team':'ipl_team',
-           'price':'base_price','sex':'gender','catagory':'category','overall':'rating','overall_rating':'rating','setname':'set_name'}
+           'price':'base_price','baseprice':'base_price','sex':'gender','catagory':'category','overall':'rating','overall_rating':'rating','setname':'set_name'}
 
 
 def header(value):
@@ -93,14 +93,14 @@ def text_rows(text):
     data=[]
     for number,row in enumerate(csv.reader(io.StringIO(text),strict=True,delimiter=delimiter),1):
         if not row or not any(v.strip() for v in row): continue
-        if len(row)==len(CORE_COLUMNS) and (not row[0].strip() or row[0].strip().isdigit()) and (not row[2].strip() or row[2].strip().isdigit()):
+        if len(CORE_COLUMNS)-1<=len(row)<=len(CORE_COLUMNS) and (not row[0].strip() or row[0].strip().isdigit()) and (not row[2].strip() or row[2].strip().isdigit()):
             data.append(dict(zip(CORE_COLUMNS,row)))
         elif 13<=len(row)<=len(OLD_COLUMNS) and (not row[0].strip() or row[0].strip().isdigit()) and row[1].strip().isdigit():
             data.append(dict(zip(OLD_COLUMNS,row)))
         elif 11<=len(row)<=len(OLD_ENTRY_COLUMNS):
             data.append(dict(zip(OLD_ENTRY_COLUMNS,row)))
         else:
-            raise ValueError(f'Line {number}: use the 14 Player Database fields: '+','.join(FIELD_LABELS)+'. Or paste JSON with field names.')
+            raise ValueError(f'Line {number}: use the 15 Player Database fields: '+','.join(FIELD_LABELS)+'. Or paste JSON with field names.')
     return records(data)
 
 
@@ -132,8 +132,13 @@ def normalize(bot,row,old=None):
                 if not math.isfinite(rating) or rating<0: raise ValueError
             except ValueError: raise ValueError(f'{field} must be a non-negative numeric rating or blank.')
     if values['base_price']:
-        price=bot.parse_price(values['base_price'])
-        if price is None or price<0: raise ValueError('Invalid base_price. Use 2cr, 50l or a non-negative integer in purse units.')
+        try:
+            price=bot.parse_price(values['base_price'])
+            if price is None:
+                numeric=float(values['base_price'])
+                if math.isfinite(numeric) and numeric.is_integer(): price=int(numeric)
+        except (ValueError,OverflowError): price=None
+        if price is None or price<0 or price>2**63-1: raise ValueError('Invalid base_price. Use 2cr, 50l or a non-negative integer in purse units.')
     else: price=0
     values['base_price']=price
     # Preserve both auction and draft tiers across export/import.
@@ -212,7 +217,7 @@ def export_file(rows,fmt):
 def sample():
     row={k:'' for k in PLAYER_COLUMNS}
     row.update(set_no=1,set_name='Pace Bowlers',name='Example Player',rating='82',category='Bowler',gender='Women',country='India',bat_hand='Right',
-               bowl_hand='Right',bowl_style='Fast',bat_rating='70',bowl_rating='87',version='2026')
+               bowl_hand='Right',bowl_style='Fast',bat_rating='70',bowl_rating='87',version='2026',base_price=20)
     return row
 
 
@@ -271,7 +276,7 @@ async def add_command(bot,update,context,mode='single'):
     if not bot.live.auction_id: await update.message.reply_text('Create or restore an auction first.');return
     text=payload(update.message)
     if not text:
-        await update.message.reply_text('Add a player with the 14 database fields:\n/addplayer 1,Pace Bowlers,,Example Player,Bowler,India,82,Right,Right,Fast,70,87,2026,Women\n\nFor spreadsheets: /downloadtemplate → fill fields → reply /uploaddata → /asetsconfirm TOKEN. JSON records and CSV with database headers are also accepted.');return
+        await update.message.reply_text('Add a player with the 15 database fields:\n/addplayer 1,Pace Bowlers,,Example Player,Bowler,India,82,Right,Right,Fast,70,87,2026,Women,20l\n\nFor spreadsheets: /downloadtemplate → fill fields → reply /uploaddata → /asetsconfirm TOKEN. JSON records and CSV with database headers are also accepted.');return
     try:
         if mode=='single' and ',' not in text and '\t' not in text and not text.startswith(('{','[')):
             parts=text.split()

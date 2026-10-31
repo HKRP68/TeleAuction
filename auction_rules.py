@@ -239,7 +239,7 @@ def init_schema(cx):
         json_object('player_id',OLD.player_id,'amount',OLD.bid_amount,'won',OLD.won));
     END;
     ''')
-    fields = ('player_id','name','rating','category','gender','country','bat_hand','bowl_hand',
+    fields = ('player_id','base_price','name','rating','category','gender','country','bat_hand','bowl_hand',
               'bowl_style','bat_rating','bowl_rating','version','set_no','set_name','status','sold_to','sold_price')
     def snapshot(prefix):
         return "json_object(" + ",".join("'"+k+"',"+prefix+"."+k for k in fields) + ")"
