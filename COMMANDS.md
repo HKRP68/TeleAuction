@@ -59,6 +59,33 @@ Amounts: `2cr` = 200 lakhs, `50l` = 50 lakhs, and bare `200` = 200 lakhs.
 | `/playercard player` | Player details. | `/playercard Jasprit Bumrah` |
 | `/mystats` | Your bidding and squad statistics. | `/mystats` |
 
+## Add teams and owners in bulk
+
+Auction admins can add one team per line with `/addteams` (alias `/addusers`):
+
+```text
+/addteams
+Royal Tigers, 123456789, 234567890
+Blue Hawks, 345678901, 456789012, 567890123
+```
+
+Format: `TEAMNAME, PRIMARY_OWNER_ID, CO_OWNER_ID, CO_OWNER_ID, …`.
+The first ID is the primary owner; every additional ID is a co-owner. A team may
+have only one owner. All listed owners share one squad and purse and can bid or
+make the team's scheduled draft picks. Use positive numeric Telegram user IDs;
+they do not need to send `/start` before being added. They must start the bot
+before it can DM them.
+
+You can also paste the team list in a separate message and reply with `/addteams`.
+The website `/draft` has an **Add teams in bulk** box for the same format. Team
+editing accepts comma-separated co-owner IDs and preserves multiple co-owners.
+
+Each new team receives the auction's starting purse once, regardless of the number
+of owners. The whole batch is checked before saving: duplicate team names, IDs
+repeated across teams, IDs already assigned in this auction, malformed rows and
+team-capacity overflow reject the batch without adding any teams. Existing teams
+and their budgets are preserved. Use the team editor to modify existing teams.
+
 ## Admin assignment
 
 | Command | Access | Purpose / example |
@@ -276,6 +303,7 @@ Slash commands are supported for every command in this guide.
 | --- | --- |
 | `/start` | `/registration` |
 | `/commands` | `/helpmd` |
+| `/addteams` | `/addusers` |
 | `/setteamname` | `/stn` |
 | `/purse` | `/bal`, `/balance` |
 | `/rtm` | `/right_to_match` |

@@ -26,6 +26,7 @@ async def help_command(bot, update, context):
     if bot.db.is_admin(update.effective_user.id):
         text += (
             '\n\nAUCTION ADMIN\n'
+            '/addteams — Add Team Name, owner_id, co_owner_id per line\n'
             '/astart · /anext · /apause · /aresume — Run the clock\n'
             '/asold · /aunsold · /aforce · /arecall · /aundobid — Manage lots\n'
             '/atimer 60 40 20 10 5 — Staged clock\n'

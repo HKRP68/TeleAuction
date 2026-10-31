@@ -12,6 +12,7 @@ IPL Cricket Auction Bot — v4.0
 import asyncio
 import auction_rules
 import help_admin
+import team_management
 from html import escape
 import json
 import logging
@@ -3434,6 +3435,10 @@ async def cmd_teamup(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not p1:
         await update.message.reply_text(f"{context.args[0]} is not in this auction.")
         return
+    existing_primary = db.get_primary(live.auction_id, proxy)
+    if proxy == primary or db.get_part(live.auction_id, proxy) or (existing_primary and existing_primary != primary):
+        await update.message.reply_text("That user is already an owner or co-owner of a team.")
+        return
     db.link_co_owner(live.auction_id, primary, proxy)
     live.team_links[proxy] = primary
     await update.message.reply_text(
@@ -4953,8 +4958,8 @@ async def _handle_callback_inner(update, context, query, data, uid):
         if count >= ar["max_teams"]:
             await query.answer("Auction is full!", show_alert=True)
             return
-        if db.get_part(aid, uid):
-            await query.answer("Already registered!", show_alert=True)
+        if db.get_part(aid, uid) or db.get_primary(aid, uid):
+            await query.answer("Already registered as an owner or co-owner!", show_alert=True)
             return
         u     = db.get_user(uid)
         uname = u["username"] if u and u["username"] else ""
@@ -5525,6 +5530,7 @@ import sys
 import auction_controls
 AUCTION_COMMANDS = auction_controls.install(sys.modules[__name__])
 AUCTION_COMMANDS.update(auction_rules.install(sys.modules[__name__]))
+AUCTION_COMMANDS.update(team_management.install(sys.modules[__name__]))
 
 DOT_MAP = {
     "setteamname": cmd_set_team_name, "stn": cmd_set_team_name,
@@ -5652,7 +5658,7 @@ def draft_desk():
     display_columns = ("player_id", "set_no", "gender") + DRAFT_PLAYER_COLUMNS
     headers = "".join(f"<th>{DRAFT_PLAYER_LABELS[c]}</th>" for c in display_columns)
     rows = "".join("<tr>"+"".join(f"<td>{escape(str(player[c] or '—'))}</td>" for c in display_columns)+"</tr>" for player in players) or f"<tr><td colspan={len(display_columns)}>No available players.</td></tr>"
-    return f"""<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1"><title>{escape(auction['name'])}</title><style>:root{{--navy:#14213d;--blue:#246bdf;--paper:#f5f7fc;--line:#dbe2ef}}*{{box-sizing:border-box}}body{{margin:0;background:var(--paper);font:15px system-ui;color:#18233a}}header{{background:linear-gradient(120deg,var(--navy),#2459a8);color:#fff;padding:2.5rem max(1.25rem,calc((100% - 1160px)/2))}}header p,small{{color:#68738a}}header p{{color:#dbe8ff}}main{{max-width:1160px;margin:auto;padding:1.5rem}}.notice,.panel,.team{{background:#fff;border:1px solid var(--line);border-radius:12px;padding:1.25rem;margin-bottom:1rem}}.notice{{border-left:4px solid #f5b700}}.grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(290px,1fr));gap:1rem}}.grid .panel{{margin:0}}label{{display:block;font-weight:600;margin:.6rem 0}}input{{display:block;width:100%;padding:.6rem;margin-top:.25rem;border:1px solid #bdc8dc;border-radius:7px}}button,a{{display:inline-block;background:var(--blue);color:#fff;border:0;border-radius:7px;padding:.65rem .9rem;text-decoration:none;font-weight:700}}.team{{display:flex;justify-content:space-between;align-items:center}}.scroll{{overflow:auto;border:1px solid var(--line);border-radius:10px}}table{{border-collapse:collapse;width:100%;white-space:nowrap}}th,td{{padding:.65rem .75rem;text-align:left;border-bottom:1px solid var(--line)}}th{{background:#edf3ff;text-transform:uppercase;font-size:.75rem}}@media(max-width:600px){{.team{{align-items:flex-start;gap:1rem;flex-direction:column}}}}</style></head><body><header><h1>🏏 {escape(auction['name'])}</h1><p>Draft control room · {len(teams)}/{auction['max_teams']} teams · {len(players)} imported players</p></header><main><nav class="panel"><a href="/draft/rules">Squad rules</a> <a href="/watch">Live spectator board</a> <a href="/draft/audit">Audit log</a></nav><div class="notice"><b>Current turn</b><br>{current}</div><div class="grid"><section class="panel"><h2>Add team</h2><p><small>Only the owner or co-owner tag ID for a team can make that team’s pick.</small></p><form action="/draft/teams" method="post"><label>Team name<input name="team_name" required></label><label>Owner tag ID<input name="owner_tag_id" inputmode="numeric" required></label><label>Co-owner tag ID (optional)<input name="co_owner_tag_id" inputmode="numeric"></label><button>Add team</button></form></section><section class="panel"><h2>Import data</h2><form action="/draft/players/preview" method="post" enctype="multipart/form-data"><label>Players spreadsheet (.xlsx / .csv)<input type="file" name="file" accept=".xlsx,.csv" required></label><small>All spreadsheet columns are visible below.</small><p><label><input type="checkbox" name="replace" value="1"> Replace queue (withdraw unlisted available players)</label><button>Preview player import</button></p></form><form action="/draft/orders" method="post" enctype="multipart/form-data"><label>Draft order (.xlsx / .csv)<input type="file" name="file" accept=".xlsx,.csv" required></label><button>Import order</button></form></section></div><section class="panel"><h2>Teams</h2>{cards}</section><section class="panel"><h2>Draft order</h2><div class="scroll"><table><thead><tr><th>Turn</th><th>Team</th><th>Tier</th><th>Status</th></tr></thead><tbody>{turns}</tbody></table></div></section><section class="panel"><h2>Players — full spreadsheet details</h2><div class="scroll"><table><thead><tr>{headers}</tr></thead><tbody>{rows}</tbody></table></div></section></main></body></html>"""
+    return f"""<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1"><title>{escape(auction['name'])}</title><style>:root{{--navy:#14213d;--blue:#246bdf;--paper:#f5f7fc;--line:#dbe2ef}}*{{box-sizing:border-box}}body{{margin:0;background:var(--paper);font:15px system-ui;color:#18233a}}header{{background:linear-gradient(120deg,var(--navy),#2459a8);color:#fff;padding:2.5rem max(1.25rem,calc((100% - 1160px)/2))}}header p,small{{color:#68738a}}header p{{color:#dbe8ff}}main{{max-width:1160px;margin:auto;padding:1.5rem}}.notice,.panel,.team{{background:#fff;border:1px solid var(--line);border-radius:12px;padding:1.25rem;margin-bottom:1rem}}.notice{{border-left:4px solid #f5b700}}.grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(290px,1fr));gap:1rem}}.grid .panel{{margin:0}}label{{display:block;font-weight:600;margin:.6rem 0}}input,textarea{{display:block;width:100%;padding:.6rem;margin-top:.25rem;border:1px solid #bdc8dc;border-radius:7px}}button,a{{display:inline-block;background:var(--blue);color:#fff;border:0;border-radius:7px;padding:.65rem .9rem;text-decoration:none;font-weight:700}}.team{{display:flex;justify-content:space-between;align-items:center}}.scroll{{overflow:auto;border:1px solid var(--line);border-radius:10px}}table{{border-collapse:collapse;width:100%;white-space:nowrap}}th,td{{padding:.65rem .75rem;text-align:left;border-bottom:1px solid var(--line)}}th{{background:#edf3ff;text-transform:uppercase;font-size:.75rem}}@media(max-width:600px){{.team{{align-items:flex-start;gap:1rem;flex-direction:column}}}}</style></head><body><header><h1>🏏 {escape(auction['name'])}</h1><p>Draft control room · {len(teams)}/{auction['max_teams']} teams · {len(players)} imported players</p></header><main><nav class="panel"><a href="/draft/rules">Squad rules</a> <a href="/watch">Live spectator board</a> <a href="/draft/audit">Audit log</a></nav><div class="notice"><b>Current turn</b><br>{current}</div><div class="grid"><section class="panel"><h2>Add team</h2><p><small>Only the owner or co-owner tag ID for a team can make that team’s pick.</small></p><form action="/draft/teams" method="post"><label>Team name<input name="team_name" required></label><label>Owner tag ID<input name="owner_tag_id" inputmode="numeric" required></label><label>Co-owner tag IDs (optional, comma-separated)<input name="co_owner_tag_id" inputmode="numeric"></label><button>Add team</button></form></section><section class="panel"><h2>Add teams in bulk</h2><p>One team per line. First ID is the primary owner; additional IDs are co-owners.</p><form action="/draft/teams/bulk" method="post"><label>Teams and owner IDs<textarea name="teams" rows="6" placeholder="Royal Tigers, 123456789, 234567890&#10;Blue Hawks, 345678901, 456789012, 567890123" required></textarea></label><button>Add all teams</button></form></section><section class="panel"><h2>Import data</h2><form action="/draft/players/preview" method="post" enctype="multipart/form-data"><label>Players spreadsheet (.xlsx / .csv)<input type="file" name="file" accept=".xlsx,.csv" required></label><small>All spreadsheet columns are visible below.</small><p><label><input type="checkbox" name="replace" value="1"> Replace queue (withdraw unlisted available players)</label><button>Preview player import</button></p></form><form action="/draft/orders" method="post" enctype="multipart/form-data"><label>Draft order (.xlsx / .csv)<input type="file" name="file" accept=".xlsx,.csv" required></label><button>Import order</button></form></section></div><section class="panel"><h2>Teams</h2>{cards}</section><section class="panel"><h2>Draft order</h2><div class="scroll"><table><thead><tr><th>Turn</th><th>Team</th><th>Tier</th><th>Status</th></tr></thead><tbody>{turns}</tbody></table></div></section><section class="panel"><h2>Players — full spreadsheet details</h2><div class="scroll"><table><thead><tr>{headers}</tr></thead><tbody>{rows}</tbody></table></div></section></main></body></html>"""
 
 
 @flask_app.route("/draft/auction", methods=["POST"])
@@ -5668,21 +5674,28 @@ def draft_create_auction():
 
 def _save_draft_team(aid, existing_owner=None):
     name = (request.form.get("team_name") or "").strip(); owner = _tag_id(request.form.get("owner_tag_id") or request.form.get("owner"), "Owner tag ID")
-    co_raw = request.form.get("co_owner_tag_id") or request.form.get("co_owner"); co = _tag_id(co_raw, "Co-owner tag ID") if co_raw else None
+    co_raw = request.form.get("co_owner_tag_id") or request.form.get("co_owner")
+    try: co_ids = team_management.owner_ids(co_raw) if co_raw and co_raw.strip() else []
+    except ValueError as exc: abort(400, str(exc))
     if not name: abort(400, "Team name is required.")
-    if co == owner: abort(400, "Owner and co-owner tag IDs must be different.")
+    if owner in co_ids: abort(400, "Owner and co-owner tag IDs must be different.")
+    other_owners = {t["user_id"] for t in db.get_all_parts(aid) if t["user_id"] != existing_owner}
+    other_owners.update(r[0] for r in db.cx.execute("SELECT linked_user_id FROM team_co_owners WHERE auction_id=? AND primary_user_id IS NOT ?",(aid,existing_owner)))
+    if set([owner]+co_ids).intersection(other_owners): abort(400, "An owner ID is already assigned to another team.")
     if existing_owner is None:
         if db.count_participants(aid) >= db.get_auction(aid)["max_teams"]: abort(400, "This draft already has the maximum number of teams.")
         if not db.join(aid, owner, str(owner), name, db.get_auction(aid)["purse"]): abort(400, "That owner tag ID is already assigned to a team.")
     elif owner != existing_owner:
         if db.get_part(aid, owner): abort(400, "That owner tag ID is already assigned to a team.")
         db.cx.execute("UPDATE participants SET user_id=?,username=? WHERE auction_id=? AND user_id=?", (owner, str(owner), aid, existing_owner)); db.cx.execute("UPDATE team_co_owners SET primary_user_id=? WHERE auction_id=? AND primary_user_id=?", (owner, aid, existing_owner))
-    db.upsert_user(owner, "", str(owner)); db.update_part(aid, owner, team_name=name, username=str(owner))
+    existing = db.get_user(owner)
+    if not existing: db.upsert_user(owner, "", str(owner))
+    db.update_part(aid, owner, team_name=name, username=existing["username"] if existing and existing["username"] else str(owner))
     db.cx.execute("DELETE FROM team_co_owners WHERE auction_id=? AND primary_user_id=?", (aid, owner))
-    if co is not None:
-        db.upsert_user(co, "", str(co))
-        try: db.link_co_owner(aid, owner, co)
-        except sqlite3.IntegrityError: abort(400, "That co-owner tag ID is already linked to another team.")
+    for co in co_ids:
+        existing = db.get_user(co)
+        if not existing: db.upsert_user(co, "", str(co))
+        db.link_co_owner(aid, owner, co)
     db.cx.commit()
 
 
@@ -5696,8 +5709,8 @@ def draft_edit_team(owner_id):
     aid = _web_draft_aid(); team = db.get_part(aid, owner_id)
     if not team: abort(404, "Team not found.")
     if request.method == "POST": _save_draft_team(aid, owner_id); return redirect(url_for("draft_desk"))
-    co = db.get_co_owners(aid, owner_id); co_id = co[0]["linked_user_id"] if co else ""
-    return f"""<!doctype html><title>Edit team</title><style>body{{font:16px system-ui;max-width:600px;margin:2rem auto;padding:0 1rem}}label{{display:block;margin:.8rem 0;font-weight:600}}input{{display:block;width:100%;padding:.6rem;box-sizing:border-box}}</style><h1>Edit {escape(team['team_name'])}</h1><form method="post"><label>Team name<input name="team_name" value="{escape(team['team_name'])}" required></label><label>Owner tag ID<input name="owner_tag_id" value="{owner_id}" required></label><label>Co-owner tag ID<input name="co_owner_tag_id" value="{co_id}"></label><button>Save team</button> <a href="/draft">Cancel</a></form>"""
+    co = db.get_co_owners(aid, owner_id); co_id = ", ".join(str(c["linked_user_id"]) for c in co)
+    return f"""<!doctype html><title>Edit team</title><style>body{{font:16px system-ui;max-width:600px;margin:2rem auto;padding:0 1rem}}label{{display:block;margin:.8rem 0;font-weight:600}}input{{display:block;width:100%;padding:.6rem;box-sizing:border-box}}</style><h1>Edit {escape(team['team_name'])}</h1><form method="post"><label>Team name<input name="team_name" value="{escape(team['team_name'])}" required></label><label>Owner tag ID<input name="owner_tag_id" value="{owner_id}" required></label><label>Co-owner tag IDs (comma-separated)<input name="co_owner_tag_id" value="{co_id}"></label><button>Save team</button> <a href="/draft">Cancel</a></form>"""
 
 
 @flask_app.route("/draft/players", methods=["POST"])

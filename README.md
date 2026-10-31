@@ -435,3 +435,24 @@ use `/admin @user` to grant global access or `/clearplayers` to clear all player
 Removing an auction-specific grant does not revoke an existing global grant.
 The website retains its existing control-room access model; Telegram role grants
 apply to the bot's permission checks.
+
+
+### Bulk team registration
+
+Admins can add teams with comma-separated numeric owner IDs, one team per line:
+
+```text
+/addteams
+Royal Tigers, 123456789, 234567890
+Blue Hawks, 345678901, 456789012, 567890123
+```
+
+`/addusers` is an alias. The first ID is the primary owner and the remaining IDs
+are co-owners. Every owner acts for the same team; the team gets one starting
+purse and one squad. The command also accepts a reply to a team-list message.
+Users can be added by ID before sending `/start` (but must start the bot for DMs).
+
+The control room `/draft` offers the same bulk-entry box and supports editing
+multiple comma-separated co-owners. Validation rejects the entire batch for bad
+rows, duplicate names/IDs, IDs already used by another team in this auction, or
+team-capacity overflow. Existing team budgets remain intact. Additions are audited.
