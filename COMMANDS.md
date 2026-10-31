@@ -138,6 +138,37 @@ players needed to meet minimums and checks individual quota availability. It can
 promise other teams will leave those players available. Automatic completion does
 a complete allocation search before applying simulated sales.
 
+## Home country and optional overseas quota
+
+There is **no Home/Indian or Overseas nationality minimum/cap by default**. The
+home-country setting defaults to India for classification only; it does not enable
+any nationality quota. Configure the optional overseas requirement with:
+
+```text
+/home India
+/overseas 7_8
+```
+
+This means Home = India, and each squad must have **at least 7 and at most 8 players
+from other countries**. Home players have no separate nationality cap. Overall
+squad limits and any role/gender/rating rules still apply.
+
+```text
+/home Australia
+/overseas
+/overseas off
+```
+
+Bare `/home` reads the country, and bare `/overseas` reads the quota. `/overseas off`
+(or `0_0`) removes the quota. New auctions start with nationality quotas off. Country
+classification is based on each player's `country`, not their name or a historical
+Indian/Overseas flag. Blank countries are Unclassified and do not count toward
+either nationality quota. Changing home recomputes classification and is rejected
+if it would violate an existing squad or standing bid. The rule is stored per
+auction, persists across restarts, and is used in bidding, draft picks, reserve
+checks and automatic completion. `/draft/rules` has matching controls, while the
+live board displays Home/Overseas/Unclassified counts.
+
 ## Clock and bidding
 
 | Command | Purpose | Example |
@@ -205,74 +236,70 @@ be cancelled. The website has a **Cancel auction…** review step in `/draft`.
 | `/asetsreview token` | Download field-level preview details. | `/asetsreview TOKEN_FROM_PREVIEW` |
 | `/asetsconfirm token` | Apply the reviewed preview within 30 minutes. | `/asetsconfirm TOKEN_FROM_PREVIEW` |
 | `/findplayer query` | Search by name, role, former team or tier. | `/findplayer Bumrah` |
-| `/addplayer record` | Add a full Player Database record as name-first CSV or JSON. | `/addplayer Example Player,82,Bowler,Women,India,Right,Right,Fast,70,87,2026,1` |
-| `/add_player_list` | Add multiple detailed CSV rows, header-based CSV, or JSON records. | Put one name-first player record per line after `/add_player_list`. |
+| `/addplayer record` | Add a full Player Database record as the 14 database columns or JSON. | `/addplayer 1,Pace Bowlers,,Example Player,Bowler,India,82,Right,Right,Fast,70,87,2026,Women` |
+| `/add_player_list` | Add multiple detailed CSV rows, header-based CSV, or JSON records. | Put one 14-field player record per line after `/add_player_list`. |
 | `/bulkplayer records` | Add detailed CSV/JSON records, or just names for quick entries. | `/bulkplayer [{"name":"Player One","rating":84,"gender":"Women","category":"Bowler"}]` |
 | `/clearplayers` | Clear the auction's player list; super admin only. | `/clearplayers` |
 
-### Recommended way to add players
-
-1. Run `/downloadtemplate` for XLSX (or `/downloadtemplate csv` / `json`).
-2. Replace the example row with your players; keep the field headers. There is no notes row to delete.
-3. Leave `player_id` empty for new players; supply existing IDs to update matching players in this auction. `set_no` defaults to 1.
-4. Send the file and reply with `/uploaddata` (or `/asetsimport`). A command in the file caption also works.
-5. Review the returned changes with `/asetsreview TOKEN`, then run `/asetsconfirm TOKEN`.
-6. Download the result with `/exportplayers xlsx`, `/asetsexport csv`, or `/downloaddata` for the full report.
-
-Every import/export uses the same fields. The core fields are listed below; templates
-and exports also include `tier,icon_eligible,indian_status,base_price,role,nationality,ipl_team`.
-Only `name` is required for a new record; omitted metadata gets defaults. For updates
-with an existing Player ID, omitted fields keep their stored values. Explicit blanks
-clear optional fields. Pricing accepts `2cr`, `50l`, or integers in purse units.
-Legacy role/price entry remains accepted and is normalized through this same schema.
-Sold/drafted players and squad members are protected during imports.
-
-To clone players into another auction, clear the Player IDs first; an ID belonging
-to another auction is rejected. Metadata imports never recreate sales from exported
-status/sold-to/price columns; use the existing database backup to restore a complete
-auction. Report Players sheets can be imported without dropping metadata.
-
-Chat entry uses this name-first order (trailing fields are optional):
+### Add players using exactly these 14 fields
 
 ```text
-name,rating,category,gender,country,bat_hand,bowl_hand,bowl_style,bat_rating,bowl_rating,version[,set_no,player_id,base_price]
+Set No,Set Name,Player Id,Player Name,Category,country,Overall,bat_hand,bowl_hand,bowl_style,bat_rating,bowl_rating,version,gender
 ```
 
-Example:
+`Category` also accepts the spelling `Catagory`. `Overall` is the overall player
+rating used by `Rating<=…` rules. These are the only columns in the new player
+entry template and player exports. Set names appear in the player table and live
+lot cards. Blank Set No defaults to 1; a blank Set Name reuses the known name for
+that set, or becomes `Set 1`, `Set 2`, etc. Conflicting names for the same Set No
+within a batch are rejected.
 
-```text
-/addplayer Example Player,82,Bowler,Women,India,Right,Right,Fast,70,87,2026,1
-```
+1. Run `/downloadtemplate` (or `/downloadtemplate csv` / `json`).
+2. Replace the example row with your players, keeping the 14 headers.
+3. Leave Player Id empty for new players; keep existing IDs to update matching players in this auction.
+4. Send the file and reply `/uploaddata` or `/asetsimport` (a command in the file caption also works).
+5. Review with `/asetsreview TOKEN`, then apply with `/asetsconfirm TOKEN`.
+6. Export using `/exportplayers xlsx`, `/asetsexport csv`, or `/exportplayers json`.
 
-Raw rows in the exported database column order are also accepted; leave the first Player ID cell blank to create a new record.
+CSV, XLSX and JSON all use these fields. TSV copied from a spreadsheet is accepted
+as text too. Header names are case-insensitive, and legacy `name` / `rating` are
+accepted aliases for Player Name / Overall. Existing pricing, tier and other
+internal auction data are preserved when an existing ID is imported, but those
+internal fields are not part of the new player template or exports. Older files
+remain readable for compatibility. New players use the auction's normal opening
+bid step; no per-player price field is required.
 
-You may also use JSON with explicit field names to avoid remembering the order:
-
-```text
-/addplayer {"name":"Example Player","rating":82,"category":"Bowler","gender":"Women","country":"India","version":"2026","set_no":1,"base_price":"20l"}
-```
-
-The detailed database fields are:
-
-```text
-player_id,set_no,name,rating,category,gender,country,bat_hand,bowl_hand,bowl_style,bat_rating,bowl_rating,version
-```
-
-Example row:
+Example CSV:
 
 ```csv
-player_id,set_no,name,rating,category,gender,country,bat_hand,bowl_hand,bowl_style,bat_rating,bowl_rating,version
-67,1,Example Player,82,Bowler,Women,India,Right,Right,Fast,70,87,2026
+Set No,Set Name,Player Id,Player Name,Category,country,Overall,bat_hand,bowl_hand,bowl_style,bat_rating,bowl_rating,version,gender
+1,Pace Bowlers,,Example Player,Bowler,India,82,Right,Right,Fast,70,87,2026,Women
 ```
 
-`player_id` is generated when omitted; `set_no` defaults to 1. Gender accepts
-Women/Men and Female/Male/F/M aliases. Optional fields include tier, icon_eligible,
-indian_status, role, nationality, base_price and ipl_team. Import/export is the
-recommended way to manage detailed metadata and gender/rating quotas.
+Paste the same row after `/addplayer`:
 
-Replacement withdraws unlisted available players. Owned players are protected.
-If the player pool or team state changes after review, generate a fresh preview.
-The website `/draft` offers the same preview workflow for CSV/JSON/XLSX uploads.
+```text
+/addplayer 1,Pace Bowlers,,Example Player,Bowler,India,82,Right,Right,Fast,70,87,2026,Women
+```
+
+For multiple players, put one row per line after `/add_player_list`. JSON can use
+explicit field names:
+
+```text
+/addplayer {"Set No":1,"Set Name":"Pace Bowlers","Player Name":"Example Player","Category":"Bowler","country":"India","Overall":82,"bat_hand":"Right","bowl_hand":"Right","bowl_style":"Fast","bat_rating":70,"bowl_rating":87,"version":"2026","gender":"Women"}
+```
+
+Only Player Name is required to create a record. Missing gender, country or Overall
+does not satisfy the corresponding quota, and import previews warn about missing
+country when nationality quotas are configured. Use Women/Men (Female/Male/F/M
+are accepted). Known country abbreviations such as IND/AUS/ENG are normalized.
+For updates, omitted fields preserve stored values; explicit blanks clear optional
+values. Sold/drafted squad members are protected. Foreign Player IDs are rejected;
+clear IDs to clone player metadata into another auction. Metadata imports do not
+recreate sales; full database backups remain the way to restore auction results.
+
+The Players sheet in `/downloaddata` uses the same 14 columns, followed by read-only
+sale/status columns; those extra report fields are ignored when re-imported.
 
 ## Teams, purses, communication and reporting
 

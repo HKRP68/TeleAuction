@@ -14,6 +14,47 @@ ROLES = {'bat':'Bat', 'batsman':'Bat', 'batsmen':'Bat', 'batter':'Bat',
          'wk':'WK', 'wicketkeeper':'WK', 'wicketkeepers':'WK'}
 
 
+COUNTRIES = {'ind':'India','india':'India','aus':'Australia','australia':'Australia',
+             'eng':'England','england':'England','pak':'Pakistan','pakistan':'Pakistan',
+             'nz':'New Zealand','newzealand':'New Zealand','sa':'South Africa','southafrica':'South Africa',
+             'sl':'Sri Lanka','srilanka':'Sri Lanka','ban':'Bangladesh','bangladesh':'Bangladesh',
+             'wi':'West Indies','westindies':'West Indies','afg':'Afghanistan','afghanistan':'Afghanistan',
+             'ire':'Ireland','ireland':'Ireland','zim':'Zimbabwe','zimbabwe':'Zimbabwe',
+             'sco':'Scotland','scotland':'Scotland','ned':'Netherlands','netherlands':'Netherlands'}
+
+
+def country_name(value):
+    text=' '.join(str(value or '').strip().split())
+    if not text: return ''
+    return COUNTRIES.get(re.sub(r'[^a-z]','',text.casefold()),text.title())
+
+
+def home_country(bot):
+    return country_name(bot.db.get_setting(f'auction:{bot.live.auction_id}:home_country','India'))
+
+
+def origin(player,home):
+    country=country_name(dict(player).get('country'))
+    if not country: return 'Unclassified'
+    return 'Home' if country.casefold()==country_name(home).casefold() else 'Overseas'
+
+
+def origin_counts(players,home):
+    return {kind:sum(origin(p,home)==kind for p in players if p) for kind in ('Home','Overseas','Unclassified')}
+
+
+def set_home(bot,value):
+    home=country_name(value)
+    if not home or len(home)>80 or any(ch in home for ch in ('\n',',','<','>')):
+        raise ValueError('Use /home followed by a country name, for example /home India.')
+    if bot.auction_lifecycle.closed(bot): raise ValueError('This auction is cancelled.')
+    if bot.auction_controls.finish_task and not bot.auction_controls.finish_task.done(): raise ValueError('Finish playback is running.')
+    old=home_country(bot)
+    save(bot,current(bot),home=home)
+    audit(bot,'home_country_changed',{'before':old,'after':home})
+    return home
+
+
 def role(value):
     return ROLES.get(re.sub(r'[\s_-]+', '', str(value or '').lower()), str(value or ''))
 
@@ -30,7 +71,7 @@ def key(value):
     if raw in ('woman','women','female'): return 'Women'
     if raw in ('man','men','male'): return 'Men'
     if raw in ('os','overseas'): return 'OS'
-    if raw == 'indian': return 'Indian'
+    if raw in ('home','indian','domestic'): return 'Home'
     match = re.fullmatch(r'(?:rating<=([0-9]+(?:\.[0-9]+)?)|([0-9]+(?:\.[0-9]+)?)rating)',raw)
     if match:
         number = float(match.group(1) or match.group(2))
@@ -39,13 +80,14 @@ def key(value):
     raise ValueError(f'Unknown category: {value}. Use Batsman, Bowler, Allrounder, Wicketkeeper, Women, Men, Overseas or Rating<=84.')
 
 
-def matches(player, category):
+def matches(player, category, home=None):
     p = dict(player)
     if category in ('Bat','Bowl','AR','WK'):
         return role(p.get('category')) == category or (role(p.get('category')) not in ('Bat','Bowl','AR','WK') and role(p.get('role')) == category)
     if category in ('Women','Men'): return gender(p.get('gender')) == category
-    if category in ('OS','Indian'):
-        return (p.get('nationality') == 'Overseas') if category == 'OS' else p.get('nationality') == 'Indian'
+    if category in ('OS','Home','Indian'):
+        if home is None: home='India'
+        return origin(p,home)==('Overseas' if category=='OS' else 'Home')
     if category.startswith('Rating<='):
         try:
             rating = float(p.get('rating',''))
@@ -54,29 +96,29 @@ def matches(player, category):
     return False
 
 
-def counts(players, limits):
-    return {k: sum(matches(p,k) for p in players if p) for k in limits}
+def counts(players, limits, home=None):
+    return {k: sum(matches(p,k,home) for p in players if p) for k in limits}
 
 
 def needed(size, counted, limits, minimum):
     deficits = {k: max(0,lo-counted.get(k,0)) for k,(_,lo) in limits.items()}
     return max([0, minimum-size, sum(deficits.get(k,0) for k in ('Bat','Bowl','AR','WK')),
                 sum(deficits.get(k,0) for k in ('Women','Men')),
-                sum(deficits.get(k,0) for k in ('OS','Indian'))] + list(deficits.values()))
+                sum(deficits.get(k,0) for k in ('OS','Home'))] + list(deficits.values()))
 
 
 def current(bot):
     saved = bot.db.get_setting(f'auction:{bot.live.auction_id}:rules')
-    if saved is not None: return json.loads(saved)
-    return bot.live.squad_limits if bot.live.rules_auction_id in (None,bot.live.auction_id) else {}
+    limits=json.loads(saved) if saved is not None else (bot.live.squad_limits if bot.live.rules_auction_id in (None,bot.live.auction_id) else {})
+    return {('Home' if k=='Indian' else k):value for k,value in limits.items()}
 
 
 def validate(limits, minimum, maximum):
     if not 1 <= minimum <= maximum <= 100: raise ValueError('Squad size must be 1–100 and minimum ≤ maximum.')
     for k,(hi,lo) in limits.items():
         if key(k) != k: raise ValueError('Use normalized category names.')
-        if lo < 0 or hi < 0 or (hi and lo > hi) or lo > maximum:
-            raise ValueError(f'{k}: use minimum_maximum, with maximum ≥ minimum. Maximum 0 means no category cap.')
+        if lo < 0 or hi < 0 or (hi and lo > hi) or lo > maximum or hi > maximum:
+            raise ValueError(f'{k}: use minimum_maximum, with minimum ≤ maximum ≤ squad maximum. Maximum 0 means no category cap.')
     rating_rules = [(float(k.split('<=')[1]),hi,lo) for k,(hi,lo) in limits.items() if k.startswith('Rating<=')]
     if any(a<=c and d>0 and lo>d for a,hi,lo in rating_rules for c,d,mn in rating_rules):
         raise ValueError('Nested rating minimums conflict with a broader rating maximum.')
@@ -100,38 +142,44 @@ def parse(text, existing=None):
     return limits
 
 
-def save(bot, limits, minimum=None, maximum=None):
+def save(bot, limits, minimum=None, maximum=None, home=None):
     if hasattr(bot,'auction_controls') and bot.auction_controls.finish_task and not bot.auction_controls.finish_task.done():
         raise ValueError('Finish playback is running.')
     aid = bot.live.auction_id; ar = bot.db.get_auction(aid)
-    before = {"squad":[ar["min_players"],ar["max_players"]],"rules":current(bot)}
+    candidate_home=country_name(home) if home is not None else home_country(bot)
+    if not candidate_home or len(candidate_home)>80: raise ValueError("Enter a valid home country name.")
+    before = {"squad":[ar["min_players"],ar["max_players"]],"rules":current(bot),"home_country":home_country(bot)}
     minimum = ar['min_players'] if minimum is None else minimum
     maximum = ar['max_players'] if maximum is None else maximum
     validate(limits,minimum,maximum)
     for team in bot.db.get_all_parts(aid):
         players = [bot.db.get_player(p) for p in json.loads(team['squad'])]
-        c = counts(players,limits)
+        if bot.live.highest_bidder_id==team['user_id'] and bot.live.current_player_id and bot.live.current_player_id not in json.loads(team['squad']):
+            pending=bot.db.get_player(bot.live.current_player_id)
+            if pending: players.append(pending)
+        c = counts(players,limits,candidate_home)
         if len(players)>maximum or any(hi and c[k]>hi for k,(hi,lo) in limits.items()) or len(players)+needed(len(players),c,limits,minimum)>maximum:
             raise ValueError(f'Rules conflict with the existing squad for {team["team_name"]}.')
     with bot.db.cx:
         bot.db.cx.execute('UPDATE auctions SET min_players=?,max_players=? WHERE auction_id=?',(minimum,maximum,aid))
         bot.db.cx.execute('INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)',(f'auction:{aid}:rules',json.dumps(limits)))
+        if home is not None: bot.db.cx.execute('INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)',(f'auction:{aid}:home_country',candidate_home))
     bot.live.squad_limits = limits
     bot.live.rules_auction_id = aid
-    audit(bot,"rules_changed",{"before":before,"after":{"squad":[minimum,maximum],"rules":limits}})
+    audit(bot,"rules_changed",{"before":before,"after":{"squad":[minimum,maximum],"rules":limits,"home_country":candidate_home}})
     bot.save_live_state()
 
 
 def describe(bot):
     ar = bot.db.get_auction(bot.live.auction_id)
-    labels = {'Bat':'Batsman','Bowl':'Bowler','AR':'Allrounder','WK':'Wicketkeeper'}
-    return f"Squad {ar['min_players']}_{ar['max_players']}\n" + '\n'.join(f'{labels.get(k,k)}: {lo}_{hi or ar["max_players"]}' for k,(hi,lo) in current(bot).items())
+    labels = {'Bat':'Batsman','Bowl':'Bowler','AR':'Allrounder','WK':'Wicketkeeper','OS':'Overseas','Home':'Home'}
+    return f"Home country: {home_country(bot)} · Home and overseas quotas are off unless set.\nSquad {ar['min_players']}_{ar['max_players']}\n" + '\n'.join(f'{labels.get(k,k)}: {lo}_{hi or ar["max_players"]}' for k,(hi,lo) in current(bot).items())
 
 
 def bid_error(bot, team, player, amount, auction):
     limits = current(bot)
     players = [bot.db.get_player(p) for p in json.loads(team['squad'])] + [player]
-    c = counts(players,limits)
+    c = counts(players,limits,home_country(bot))
     for k,(hi,lo) in limits.items():
         if hi and c[k]>hi: return f'{k} maximum is {hi}.'
     slots = auction['max_players']-len(players)
@@ -140,10 +188,10 @@ def bid_error(bot, team, player, amount, auction):
     reserve_mode = bot.db.get_setting(f'auction:{bot.live.auction_id}:reserve','auto')
     if reserve_mode != 'off' and required:
         pool = [p for p in bot.db.cx.execute("SELECT * FROM players WHERE auction_id=? AND status IN ('available','unsold') AND player_id!=?",(team['auction_id'],player['player_id']))
-                if not bot.auction_controls.in_squad(p['player_id']) and all(not hi or c[k]<hi or not matches(p,k) for k,(hi,lo) in limits.items())]
+                if not bot.auction_controls.in_squad(p['player_id']) and all(not hi or c[k]<hi or not matches(p,k,home_country(bot)) for k,(hi,lo) in limits.items())]
         if len(pool)<required: return 'Not enough eligible players remain to complete this squad.'
         for k,(_,lo) in limits.items():
-            if c[k]+sum(matches(p,k) for p in pool)<lo: return f'Not enough {k} players remain to meet the minimum.'
+            if c[k]+sum(matches(p,k,home_country(bot)) for p in pool)<lo: return f'Not enough {k} players remain to meet the minimum.'
         floor = 1 if reserve_mode == 'auto' else int(reserve_mode)
         reserve = sum(sorted(max(floor,p['base_price']) for p in pool)[:required])
         if team['purse']-amount < reserve: return f'Keep at least {reserve} purse units reserved for {required} more players. Maximum bid: {max(0,team["purse"]-reserve)}.'
@@ -192,7 +240,7 @@ def init_schema(cx):
     END;
     ''')
     fields = ('player_id','name','rating','category','gender','country','bat_hand','bowl_hand',
-              'bowl_style','bat_rating','bowl_rating','version','set_no','status','sold_to','sold_price')
+              'bowl_style','bat_rating','bowl_rating','version','set_no','set_name','status','sold_to','sold_price')
     def snapshot(prefix):
         return "json_object(" + ",".join("'"+k+"',"+prefix+"."+k for k in fields) + ")"
     cx.executescript("DROP TRIGGER IF EXISTS audit_player_update; CREATE TRIGGER audit_player_update AFTER UPDATE ON players BEGIN "
@@ -237,6 +285,8 @@ def preview(bot, rows, replace=False, actor=None):
     warnings=[f'Duplicate name: {n}; use Player IDs.' for n,count in names.items() if count>1]
     limits=current(bot)
     for player_id,values in prepared:
+        if 'OS' in limits or 'Home' in limits:
+            if not values.get('country'): warnings.append(f"{values['name']}: country is blank; cannot count toward Home/Overseas quotas.")
         if any(k in limits for k in ('Women','Men')) and gender(values.get('gender')) not in ('Women','Men'):
             warnings.append(f"{values['name']}: gender is unspecified or does not match a gender quota.")
         if any(k.startswith('Rating<=') for k in limits):
@@ -276,12 +326,16 @@ def page(title, body):
 
 def rules_form(bot, error=''):
     ar=bot.db.get_auction(bot.live.auction_id)
-    text='\n'.join(f'{k} {lo}_{hi}' for k,(hi,lo) in current(bot).items())
+    limits=current(bot)
+    text='\n'.join(f'{k} {lo}_{hi}' for k,(hi,lo) in limits.items() if k!='OS')
+    overseas=limits.get('OS')
+    overseas_value=f'{overseas[1]}_{overseas[0]}' if overseas else ''
     reserve=bot.db.get_setting(f'auction:{bot.live.auction_id}:reserve','auto')
     intro = '<section class="panel"><h2>Build a balanced squad</h2><p>Choose a squad range, then set category minimums and maximums. A single number is a minimum. Category maximum 0 means no cap.</p>'
     if error: intro += '<p class="error">'+escape(error)+'</p>'
     intro += '</section>'
     return page('Squad rules',intro + f'''<section class="panel"><form method="post"><div class="grid"><label>Squad minimum<input type="number" name="minimum" min="1" max="100" value="{ar['min_players']}" required></label><label>Squad maximum<input type="number" name="maximum" min="1" max="100" value="{ar['max_players']}" required></label></div>
+    <div class="grid"><label>Home country<input name="home_country" value="{escape(home_country(bot))}" required></label><label>Overseas minimum_maximum (optional)<input name="overseas" value="{escape(overseas_value)}" placeholder="No overseas cap — e.g. 7_8"></label></div><p class="muted">No home or overseas quota by default. A foreign country counts as Overseas. A blank country is Unclassified and does not satisfy either nationality quota.</p>
     <label>Category rules<textarea name="rules" placeholder="Batsman 4&#10;Bowler 4&#10;Allrounder 4&#10;Wicketkeeper 2&#10;Women 2&#10;Rating&lt;=84 4">{escape(text)}</textarea></label><p class="muted">Format: Category minimum_maximum. Example: Women 2_6. Rating&lt;=84 means any rating of 84 or lower; change 84 to any number. Clear the field to remove all category rules.</p>
     <label>Purse reserve<select name="reserve"><option value="auto" {'selected' if reserve=='auto' else ''}>Auto — reserve cheapest remaining players</option><option value="off" {'selected' if reserve=='off' else ''}>Off</option></select></label>
     <button>Save rules</button></form></section><section class="panel"><h2>How categories overlap</h2><p>A woman bowler rated 82 counts toward Bowler, Women and Rating ≤84. Role minimums add together; gender and rating quotas can overlap those roles.</p><p>Your example needs at least 14 players by role. A squad range of 15–17 has room for it. Availability and purse budgets still matter.</p><p>Fill player <b>category</b> with Batsman, Bowler, Allrounder or Wicketkeeper, and <b>gender</b> with Women or Men. Female/Male aliases are accepted. Missing ratings and gender never satisfy those quotas.</p></section>''')
@@ -297,9 +351,18 @@ def install(bot):
             await update.message.reply_text('Create an auction first.'); return
         arg=' '.join(context.args).strip(); actor=update.effective_user.id
         try:
-            if name in ('arule','arules','asquad','areserve','asetsconfirm') and bot.auction_controls.finish_task and not bot.auction_controls.finish_task.done():
+            if name in ('arule','arules','asquad','areserve','asetsconfirm','home','overseas') and bot.auction_controls.finish_task and not bot.auction_controls.finish_task.done():
                 raise ValueError('Finish playback is running.')
-            if name in ('arule','arules'):
+            if name=='home':
+                if arg: set_home(bot,arg)
+                await update.message.reply_text('Home country: '+home_country(bot)+'\nForeign countries count as Overseas; blank countries are Unclassified. /overseas 7_8 sets a 7–8 overseas quota. No nationality cap is enabled by /home itself.')
+            elif name=='overseas':
+                if arg:
+                    if arg.lower() not in ('off','clear') and not re.fullmatch(r'\d+_\d+',arg): raise ValueError('Use /overseas minimum_maximum or /overseas off.')
+                    save(bot,parse('Overseas '+arg,current(bot)))
+                quota=current(bot).get('OS')
+                await update.message.reply_text('Home country: '+home_country(bot)+'\nOverseas: '+(f'min {quota[1]}, max {quota[0] or bot.db.get_auction(bot.live.auction_id)["max_players"]}' if quota else 'no minimum or cap')+'\nHome players have no nationality cap unless you set a Home rule.')
+            elif name in ('arule','arules'):
                 if arg.lower()=='clear': save(bot,{})
                 elif arg and arg.lower()!='show': save(bot,parse(arg,current(bot)))
                 await update.message.reply_text(describe(bot)+'\nUse /arule Women 2_6 or /arule Rating<=84 4. A single number is a minimum.');
@@ -341,7 +404,12 @@ def install(bot):
             try:
                 reserve=request.form.get('reserve','auto')
                 if reserve not in ('auto','off'): raise ValueError('Reserve must be auto or off.')
-                save(bot,parse(request.form.get('rules','')),int(request.form['minimum']),int(request.form['maximum']))
+                limits=parse(request.form.get('rules',''))
+                if 'overseas' in request.form:
+                    value=request.form.get('overseas','').strip()
+                    if value and not re.fullmatch(r'\d+_\d+',value): raise ValueError('Overseas must be minimum_maximum, e.g. 7_8, or blank for no quota.')
+                    limits=parse('Overseas '+(value or 'off'),limits)
+                save(bot,limits,int(request.form['minimum']),int(request.form['maximum']),home=request.form.get('home_country',home_country(bot)))
                 bot.db.set_setting(f'auction:{bot.live.auction_id}:reserve',reserve)
                 audit(bot,'rules_saved',{'rules':current(bot),'reserve':reserve,'squad':[int(request.form['minimum']),int(request.form['maximum'])]})
                 return redirect('/draft/rules')
@@ -384,14 +452,14 @@ def install(bot):
         teams=[]
         for t in bot.db.get_all_parts(bot.live.auction_id):
             players=[dict(p) for p in (bot.db.get_player(i) for i in json.loads(t['squad'])) if p]
-            counted=counts(players,limits)
-            teams.append({'name':t['team_name'],'purse':t['purse'],'spent':t['total_spent'],'size':len(players),
+            counted=counts(players,limits,home_country(bot))
+            teams.append({'name':t['team_name'],'origin':origin_counts(players,home_country(bot)),'purse':t['purse'],'spent':t['total_spent'],'size':len(players),
                           'rules':[{'category':k,'count':counted[k],'minimum':lo,'maximum':hi or ar['max_players']} for k,(hi,lo) in limits.items()],
                           'players':[{k:p[k] for k in ('player_id','name','category','gender','rating','bat_rating','bowl_rating','sold_price')} for p in players]})
         p=bot.db.get_player(bot.live.current_player_id) if bot.live.current_player_id else None
         seconds=math.ceil(bot.live.paused_remaining if bot.live.paused else max(0,(bot.live.timer_ends_at or time.time())-time.time()))
         result={'available':True,'auction':ar['name'],'active':bot.live.active,'paused':bot.live.paused,'seconds':seconds,'bid':bot.live.current_bid,
-                'leader':bot.live.highest_bidder_name,'status':ar['status'],'player':{k:p[k] for k in ('player_id','name','set_no','category','gender','rating')} if p else None,
+                'leader':bot.live.highest_bidder_name,'status':ar['status'],'home_country':home_country(bot),'player':{k:p[k] for k in ('player_id','name','set_no','set_name','category','country','gender','rating')} if p else None,
                 'minimum':ar['min_players'],'maximum':ar['max_players'],'teams':teams,'queued':len(bot.live.player_queue)}
         response=jsonify(result); response.headers['Cache-Control']='no-store'; return response
 
@@ -402,8 +470,8 @@ def install(bot):
 const put=(id,value)=>document.getElementById(id).textContent=value;
 function node(tag,text){const el=document.createElement(tag);if(text!==undefined)el.textContent=text;return el;}
 async function refresh(){try{const response=await fetch('/watch/data',{cache:'no-store'});if(!response.ok)throw Error();const d=await response.json();if(!d.available){put('connection','No auction created');return;}
-put('connection','Live · '+new Date().toLocaleTimeString());put('auction',d.auction);put('player',d.player?d.player.name:'Waiting for a lot');put('details',d.player?'#'+d.player.player_id+' · Set '+d.player.set_no+' · '+(d.player.category||'')+' · '+(d.player.gender||'Unspecified')+' · Rating '+(d.player.rating||'—'):'Queued: '+d.queued);put('bid',d.bid||'No bids');put('leader',d.leader||'Open bidding');put('clock',d.player?d.seconds+'s':'—');put('state',d.paused?'Paused':d.active?'Auction running':d.status==='cancelled'?'Auction cancelled':'Auction not running');
-const container=document.getElementById('teams');container.replaceChildren();for(const t of d.teams){const card=node('section');card.className='panel';card.append(node('h2',t.name),node('p',t.size+' / '+d.maximum+' players · minimum '+d.minimum),node('p','Purse '+t.purse+' · spent '+t.spent));const progress=node('progress');progress.max=d.maximum;progress.value=t.size;card.append(progress);for(const rule of t.rules)card.append(node('p',rule.category+': '+rule.count+' (min '+rule.minimum+', max '+rule.maximum+')'));const details=node('details');details.append(node('summary','Full squad ('+t.players.length+')'));for(const p of t.players)details.append(node('p','#'+p.player_id+' '+p.name+' · '+(p.category||'')+' · '+(p.gender||'Unspecified')+' · Rating '+(p.rating||'—')+' · Bat '+(p.bat_rating||'—')+' · Bowl '+(p.bowl_rating||'—')));card.append(details);container.append(card);}}
+put('connection','Live · '+new Date().toLocaleTimeString());put('auction',d.auction);put('player',d.player?d.player.name:'Waiting for a lot');put('details',d.player?'#'+d.player.player_id+' · Set '+d.player.set_no+' '+(d.player.set_name||'')+' · '+(d.player.country||'Country unassigned')+' · '+(d.player.category||'')+' · '+(d.player.gender||'Unspecified')+' · Rating '+(d.player.rating||'—'):'Queued: '+d.queued);put('bid',d.bid||'No bids');put('leader',d.leader||'Open bidding');put('clock',d.player?d.seconds+'s':'—');put('state',d.paused?'Paused':d.active?'Auction running':d.status==='cancelled'?'Auction cancelled':'Auction not running');
+const container=document.getElementById('teams');container.replaceChildren();for(const t of d.teams){const card=node('section');card.className='panel';card.append(node('h2',t.name),node('p',t.size+' / '+d.maximum+' players · minimum '+d.minimum),node('p','Purse '+t.purse+' · spent '+t.spent),node('p','Home ('+d.home_country+'): '+t.origin.Home+' · Overseas: '+t.origin.Overseas+' · Unclassified: '+t.origin.Unclassified));const progress=node('progress');progress.max=d.maximum;progress.value=t.size;card.append(progress);for(const rule of t.rules)card.append(node('p',rule.category+': '+rule.count+' (min '+rule.minimum+', max '+rule.maximum+')'));const details=node('details');details.append(node('summary','Full squad ('+t.players.length+')'));for(const p of t.players)details.append(node('p','#'+p.player_id+' '+p.name+' · '+(p.category||'')+' · '+(p.gender||'Unspecified')+' · Rating '+(p.rating||'—')+' · Bat '+(p.bat_rating||'—')+' · Bowl '+(p.bowl_rating||'—')));card.append(details);container.append(card);}}
 catch(e){put('connection','Connection lost — retrying…');}finally{setTimeout(refresh,2000);}}refresh();
 </script>''')
-    return {name:handler(name) for name in ('arule','arules','asquad','areserve','aaudit','asetsconfirm','asetsreview')}
+    return {name:handler(name) for name in ('arule','arules','asquad','areserve','aaudit','asetsconfirm','asetsreview','home','overseas')}

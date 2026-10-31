@@ -32,6 +32,8 @@ async def help_command(bot, update, context):
             '/atimer 60 40 20 10 5 — Staged clock\n'
             '/abidgap off · /adirect on — Bid controls\n'
             '/asquad 15_17 — Squad size\n'
+            '/home India · /overseas 7_8 — Optional nationality quota\n'
+            '/overseas off — Remove the overseas quota\n'
             '/arule Women 2_6 · /arule Rating<=84 4 — Category quotas\n'
             '/arules show · /areserve auto — Rules and purse reserve\n'
             '/addplayer · /downloadtemplate — Add Player Database records\n'

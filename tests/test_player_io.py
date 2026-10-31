@@ -58,7 +58,7 @@ def test_report_players_sheet_and_squad_details_use_full_schema(tmp_path):
     bot.db.set_player_status(70,'sold',1,200);bot.db.add_to_squad(aid,1,70)
     raw=bot._build_auction_excel(aid)
     wb=openpyxl.load_workbook(io.BytesIO(raw),data_only=True)
-    assert tuple(cell.value for cell in wb['Players'][1])[:len(bot.player_io.PLAYER_COLUMNS)]==bot.player_io.PLAYER_COLUMNS
+    assert tuple(cell.value for cell in wb['Players'][1])[:len(bot.player_io.PLAYER_COLUMNS)]==bot.player_io.FIELD_LABELS
     assert 'gender' in [cell.value for cell in wb['Squad Details'][1]]
     rows=bot.player_io.read_rows(raw,'report.xlsx')
     assert 'status' not in rows[0] and rows[0]['gender']=='Women'
@@ -183,7 +183,7 @@ def test_bundled_examples_are_accepted_by_the_shared_schema(tmp_path):
         assert bot.player_io.prepare(bot,rows)[0][1]['gender']=='Women'
     u.message.text=(root/'sample_players.txt').read_text()
     asyncio.run(bot.cmd_add_player_list(u,c))
-    assert bot.db.get_player_by_name(bot.live.auction_id,'Example Bowler')['base_price']==20
+    assert bot.db.get_player_by_name(bot.live.auction_id,'Example Player')['set_name']=='Pace Bowlers'
 
 
 def test_malformed_uploads_return_clear_errors_without_mutation(tmp_path):
@@ -202,4 +202,4 @@ def test_paste_canonical_database_row_without_headers(tmp_path):
     u.message.text='/addplayer '+out.getvalue()
     asyncio.run(bot.cmd_add_player(u,c))
     p=bot.db.get_player_by_name(bot.live.auction_id,'Example Player')
-    assert p['gender']=='Women' and p['bowl_rating']=='87' and p['base_price']==20
+    assert p['gender']=='Women' and p['bowl_rating']=='87' and p['base_price']==0

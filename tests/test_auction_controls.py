@@ -195,7 +195,7 @@ def test_sets_export_contains_stable_ids_and_all_sets(tmp_path):
         command(bot,u,c,'asetsexport',fmt)
         kwargs = u.message.reply_document.call_args.kwargs
         raw = kwargs['document'].getvalue().decode()
-        assert 'player_id' in raw and 'set_no' in raw and '70' in raw and '71' in raw
+        assert 'Player Id' in raw and 'Set No' in raw and '70' in raw and '71' in raw
         assert kwargs['filename'].endswith('.'+fmt)
 
 

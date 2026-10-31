@@ -1,2 +1,2 @@
-﻿player_id,set_no,name,rating,category,gender,country,bat_hand,bowl_hand,bowl_style,bat_rating,bowl_rating,version,tier,icon_eligible,indian_status,base_price,role,nationality,ipl_team
-,1,Example Player,82,Bowler,Women,India,Right,Right,Fast,70,87,2026,Gold,,,20,Bowl,Indian,
+Set No,Set Name,Player Id,Player Name,Category,country,Overall,bat_hand,bowl_hand,bowl_style,bat_rating,bowl_rating,version,gender
+1,Pace Bowlers,,Example Player,Bowler,India,82,Right,Right,Fast,70,87,2026,Women

@@ -315,11 +315,12 @@ class DB:
         # SQLite's CREATE TABLE cannot add fields to existing installations.
         existing = {row[1] for row in c.execute("PRAGMA table_info(players)")}
         for column in ("rating", "icon_eligible", "gender", "indian_status", "category",
-                       "country", "bat_hand", "bowl_hand", "bowl_style", "bat_rating", "bowl_rating", "version", "set_no"):
+                       "country", "bat_hand", "bowl_hand", "bowl_style", "bat_rating", "bowl_rating", "version", "set_no", "set_name"):
             if column not in existing:
                 default_value = "1" if column == "set_no" else ""
                 c.execute(f"ALTER TABLE players ADD COLUMN {column} TEXT DEFAULT '{default_value}'")
         c.execute("UPDATE players SET set_no='1' WHERE set_no='' OR set_no IS NULL")
+        c.execute("UPDATE players SET set_name='Set ' || set_no WHERE set_name='' OR set_name IS NULL")
         auction_rules.init_schema(c)
         c.commit()
         c.close()
@@ -542,8 +543,8 @@ class DB:
                    role: str = "Batsman", nat: str = "Indian",
                    ipl_team: str = "", tier: str = "C") -> int:
         cur = self.cx.execute(
-            "INSERT INTO players(auction_id,name,base_price,role,nationality,ipl_team,tier,set_no)"
-            " VALUES(?,?,?,?,?,?,?,'1')",
+            "INSERT INTO players(auction_id,name,base_price,role,nationality,ipl_team,tier,set_no,set_name)"
+            " VALUES(?,?,?,?,?,?,?,'1','Set 1')",
             (aid, name, base_price, role, nat, ipl_team, tier),
         )
         self.cx.commit()
@@ -1192,9 +1193,9 @@ def player_card(row) -> str:
     return (
         f"{'─'*28}\n"
         f"{r_emoji(row['role'])} *{flag(row['nationality'])} {row['name']}*\n"
-        f"Role: {row['role']}  |  {row['nationality']}\n"
-        f"Player ID: {row['player_id']} | Set No: {row['set_no'] or 1}\n"
-        f"Gender: {row['gender'] or 'Unspecified'} | Rating: {row['rating'] or '—'}\n"
+        f"Category: {row['category'] or row['role']} | {row['country'] or 'Country unassigned'} · {auction_rules.origin(row,auction_rules.home_country(sys.modules[__name__]))}\n"
+        f"Player ID: {row['player_id']} | Set {row['set_no'] or 1}: {row['set_name']}\n"
+        f"Gender: {row['gender'] or 'Unspecified'} | Overall: {row['rating'] or '—'}\n"
         f"Tier: {tier_s(row['tier'])}\n"
         f"Base: *{base}*  |  Prev Team: *{row['ipl_team'] or 'None'}*"
         f"{rtm}\n"
@@ -1984,6 +1985,7 @@ async def _do_next(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
         return
 
     live.lot_bid_floor = db.cx.execute("SELECT COALESCE(MAX(id),0) FROM bid_history").fetchone()[0]
+    live.set_number = int(fresh["set_no"] or 1)
     live.current_player_id   = fresh["player_id"]
     live.current_bid         = 0
     live.highest_bidder_id   = None
@@ -2348,7 +2350,8 @@ async def cmd_purse(update: Update, context: ContextTypes.DEFAULT_TYPE):
     sq  = json.loads(row["squad"])
     sq_rows = [db.get_player(p) for p in sq]
     sq_rows = [p for p in sq_rows if p]
-    ov  = sum(1 for p in sq_rows if p["nationality"] == "Overseas")
+    origins = auction_rules.origin_counts(sq_rows, auction_rules.home_country(sys.modules[__name__]))
+    ov = origins["Overseas"]
     roles: dict = {}
     for p in sq_rows:
         roles[p["role"]] = roles.get(p["role"], 0) + 1
@@ -2358,7 +2361,7 @@ async def cmd_purse(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Purse: *{fmt(row['purse'],aid)}*\n"
         f"Spent: {fmt(row['total_spent'],aid)}\n"
         f"Squad: {len(sq)}/{ar['max_players']}\n"
-        f"Indian: {len(sq)-ov}  |  Overseas: {ov}\n"
+        f"Home ({auction_rules.home_country(sys.modules[__name__])}): {origins['Home']} | Overseas: {ov} | Unclassified: {origins['Unclassified']}\n"
         f"RTM Cards: {row['rtm_cards']}  (team: {row['rtm_team'] or 'N/A'})\n"
         f"Muted: {'Yes 🔇' if row['is_muted'] else 'No'}\n\nBy Role:"
     ]
@@ -3143,7 +3146,7 @@ async def cmd_player_card(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"📊 Status: *{status_icon}*"
         f"{buyer_line}{queue_line}"
     )
-    text += "\n" + "\n".join(f"{field}: {md_safe(str(r[field] if r[field] is not None else ''))}" for field in player_io.CORE_COLUMNS if field != "name")
+    text += "\n" + "\n".join(f"{player_io.LABELS[field]}: {md_safe(str(r[field] if r[field] is not None else ''))}" for field in player_io.CORE_COLUMNS if field != "name")
     await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
 
 
@@ -3179,8 +3182,8 @@ async def cmd_my_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for p in sq_players:
         role_counts[p["role"]] = role_counts.get(p["role"], 0) + 1
 
-    os_count  = sum(1 for p in sq_players if p["nationality"] == "Overseas")
-    ind_count = sum(1 for p in sq_players if p["nationality"] == "Indian")
+    origins = auction_rules.origin_counts(sq_players, auction_rules.home_country(sys.modules[__name__]))
+    os_count, ind_count = origins["Overseas"], origins["Home"]
 
     ar = db.get_auction(aid)
     max_sq = ar["max_players"] if ar else 25
@@ -3193,7 +3196,7 @@ async def cmd_my_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"💰 *Purse:* {fmt(part['purse'], aid)} remaining\n"
         f"💸 *Total Spent:* {fmt(part['total_spent'], aid)}\n\n"
         f"🏏 *Squad:* {len(sq)}/{max_sq} players\n"
-        f"  🇮🇳 Indian: {ind_count}  🌏 Overseas: {os_count}\n"
+        f"  Home ({auction_rules.home_country(sys.modules[__name__])}): {ind_count} | Overseas: {os_count} | Unclassified: {origins['Unclassified']}\n"
         f"  Roles: {role_line}\n\n"
         f"📋 *Bid History:*\n"
         f"  🟢 Won: {len(won_bids)} players\n"
@@ -4013,7 +4016,7 @@ async def _do_end_auction(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
         sq  = json.loads(r["squad"])
         sqs = [db.get_player(p) for p in sq]
         sqs = [p for p in sqs if p]
-        ov  = sum(1 for p in sqs if p["nationality"] == "Overseas")
+        ov  = sum(1 for p in sqs if auction_rules.origin(p,auction_rules.home_country(sys.modules[__name__])) == "Overseas")
         m   = medals[i-1] if i <= 3 else f"#{i}"
         lines.append(
             f"{m} {md_safe(team_display(r))}\n"
@@ -4149,14 +4152,14 @@ def _build_auction_excel(aid: int) -> bytes:
 
     # ── Sheet 3: Players ──
     ws3 = wb.create_sheet("Players")
-    style_header(ws3, list(player_io.PLAYER_COLUMNS) + ["status", "sold_to", "sold_price"])
+    style_header(ws3, list(player_io.FIELD_LABELS) + ["status", "sold_to", "sold_price"])
     for p in players:
         ws3.append([p[k] for k in player_io.PLAYER_COLUMNS] + [p["status"],p["sold_to"],p["sold_price"]])
     alt_rows(ws3); autofit(ws3)
 
     # ── Sheet 4: Squad Details ──
     ws4 = wb.create_sheet("Squad Details")
-    style_header(ws4, ["team_name"] + list(player_io.PLAYER_COLUMNS) + ["sold_price"])
+    style_header(ws4, ["team_name"] + list(player_io.FIELD_LABELS) + ["sold_price"])
     pmap = {p["player_id"]: p for p in players}
     for r in parts:
         for pid in json.loads(r["squad"]):
@@ -5327,6 +5330,8 @@ def _require_columns(rows, columns):
 
 DRAFT_PLAYER_LABELS = {"name": "Name", "rating": "Rating", "tier": "Tier", "icon_eligible": "Icon eligible", "gender": "Gender", "indian_status": "Indian status", "category": "Category", "country": "Country", "bat_hand": "Bat hand", "bowl_hand": "Bowl hand", "bowl_style": "Bowl style", "bat_rating": "Bat rating", "bowl_rating": "Bowl rating", "version": "Version", "set_no": "Set No", "player_id": "Player ID"}
 
+DRAFT_PLAYER_LABELS.update({"set_name":"Set Name","rating":"Overall","name":"Player Name"})
+
 
 def _tag_id(value, field_name):
     try:
@@ -5340,7 +5345,7 @@ def draft_desk():
     if not live.auction_id:
         return """<!doctype html><title>Draft Desk</title><style>body{font:16px system-ui;max-width:700px;margin:2rem auto;padding:0 1rem}form{padding:1rem;margin:1rem 0;background:#f3f6fa}input{margin:.25rem;width:100%;box-sizing:border-box}</style><h1>🏏 Draft Desk</h1><p>Create the draft here. Telegram and an access token are not required.</p><form action='/draft/auction' method='post'><h2>Create draft</h2><label>Draft name <input name=name required></label><label>Maximum teams <input name=max_teams type=number min=1 value=8 required></label><label>Starting purse <input name=purse type=number min=1 value=1000 required></label><label>Minimum players <input name=min_players type=number min=1 value=11 required></label><label>Maximum players <input name=max_players type=number min=1 value=25 required></label><button>Create draft</button></form>"""
     aid = _web_draft_aid(); auction = db.get_auction(aid); order = db.current_draft_order(aid)
-    players = db.cx.execute("SELECT * FROM players WHERE auction_id=? ORDER BY player_id", (aid,)).fetchall(); teams = db.get_all_parts(aid)
+    players = db.cx.execute("SELECT * FROM players WHERE auction_id=? ORDER BY CAST(set_no AS INTEGER),player_id", (aid,)).fetchall(); teams = db.get_all_parts(aid)
     orders = db.cx.execute("SELECT * FROM draft_orders WHERE auction_id=? ORDER BY round_no,pick_no", (aid,)).fetchall()
     current = "No current turn" if not order else f"Round {order['round_no']} · Pick {order['pick_no']} · {escape(order['team_name'])} · {escape(order['tier'])}"
     cards = "".join(f"""<article class="team"><div><b>{escape(t['team_name'])}</b><br><small>Owner tag ID: {t['user_id']} · Co-owner tag ID: {', '.join(str(x['linked_user_id']) for x in db.get_co_owners(aid,t['user_id'])) or '—'}</small></div><a href="/draft/teams/{t['user_id']}/edit">Edit team</a></article>""" for t in teams) or "<p>No teams added yet.</p>"

@@ -59,7 +59,7 @@ def test_cancelled_auction_cannot_resume_start_bid_or_import_but_exports_work(tm
     with pytest.raises(ValueError,match='cancelled'):bot.auction_controls.import_rows([{'name':'New'}])
     with pytest.raises(ValueError,match='cancelled'):bot.auction_rules.preview(bot,[{'name':'New'}])
     command(bot,u,c,'asetsexport','json')
-    assert json.loads(u.message.reply_document.call_args.kwargs['document'].getvalue())[0]['name']=='Saved'
+    assert bot.player_io.read_rows(u.message.reply_document.call_args.kwargs['document'].getvalue(),'players.json')[0]['name']=='Saved'
     bot.live.active=True;bot.live.current_player_id=p
     asyncio.run(bot.process_bid(u,c,2,10))
     assert bot.live.current_bid==0

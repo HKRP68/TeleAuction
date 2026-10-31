@@ -229,13 +229,13 @@ Create the draft on this page, then add each **Team Name**, **Owner**, and optio
 **Co-owner**. This setup is stored in the database and does not require creating an
 auction or registering teams in Telegram.
 
-The desk imports `.xlsx`, `.csv`, or `.json` player files and `.xlsx`/`.csv` draft orders. Player templates and exports use these core columns (plus the optional fields described below):
+The desk imports `.xlsx`, `.csv`, or `.json` player files and `.xlsx`/`.csv` draft orders. Player templates and exports use exactly these 14 public columns:
 
 ```text
-player_id,set_no,name,rating,category,gender,country,bat_hand,bowl_hand,bowl_style,bat_rating,bowl_rating,version
+Set No,Set Name,Player Id,Player Name,Category,country,Overall,bat_hand,bowl_hand,bowl_style,bat_rating,bowl_rating,version,gender
 ```
 
-Player records also include `player_id` (the stable numeric Player ID / lot number) and `set_no` (Set No, default 1). Include these columns to preserve IDs and set ordering during imports. New IDs are generated when omitted. The optional player columns `tier`, `icon_eligible`, `gender`, and `indian_status` are also stored when provided. Gender is shown in the player table/cards: use `Women` or `Men` (`Female`/`Male`, `F`/`M` are accepted aliases). Add `gender` to the sheet for mixed-gender squad quotas. Missing gender/rating does not count toward those quotas. Tier defaults to Bronze. Existing databases gain the `version` field automatically at startup without removing player data.
+Leave Player Id blank for new players; Set No defaults to 1 and Set Name defaults to the set's known label or `Set N`. Overall is the stored overall rating. Gender accepts Women/Men and Female/Male/F/M. Missing gender, country or ratings do not count toward the corresponding quota. New templates and player exports contain only the 14 columns above. Older internal tier/pricing/RTM fields remain in the database for compatibility and are preserved when updating an existing Player Id. Existing installations gain Set Name automatically at startup without removing player data.
 
 Order sheets use:
 
@@ -466,17 +466,16 @@ Replace the sample row, keep its headers, and reply to the file with `/uploaddat
 review with `/asetsreview TOKEN`, then apply with `/asetsconfirm TOKEN`. The website
 provides the same CSV/JSON/XLSX import preview, template downloads and exports.
 
-Core columns are `player_id,set_no,name,rating,category,gender,country,bat_hand,bowl_hand,bowl_style,bat_rating,bowl_rating,version`.
-Optional columns are `tier,icon_eligible,indian_status,base_price,role,nationality,ipl_team`.
+Core columns are `Set No,Set Name,Player Id,Player Name,Category,country,Overall,bat_hand,bowl_hand,bowl_style,bat_rating,bowl_rating,version,gender`.
+Only the 14 public fields appear in new templates and exports. Older optional columns remain readable for compatibility; omitted internal fields retain their stored values when updating an existing player.
 Only a name is required for a new player; blank Player IDs are generated, and Set No
 is 1 by default. Existing IDs update matching players in this auction; omitted fields
 keep stored values. Owned players remain protected. Foreign IDs are rejected; clear
-the IDs to clone players to a different auction. All formats retain every metadata
-field and preserve both auction and draft tiers. Status and sale columns in full
+the IDs to clone players to a different auction. All formats retain the public metadata fields. Stored auction/draft tiers are preserved for existing IDs and are not exposed in the streamlined template. Status and sale columns in full
 reports are read-only during metadata imports and do not recreate ownership.
 
 ```text
-/addplayer Example Player,82,Bowler,Women,India,Right,Right,Fast,70,87,2026,1
+/addplayer 1,Pace Bowlers,,Example Player,Bowler,India,82,Right,Right,Fast,70,87,2026,Women
 /exportplayers xlsx
 /asetsexport csv
 /downloaddata
@@ -499,3 +498,29 @@ reset with `/arestart confirm`. Completed auctions cannot be cancelled. The cont
 room also provides a cancellation review screen.
 
 Ready-to-edit examples: [sample_players.csv](sample_players.csv), [sample_players.json](sample_players.json), and [sample_players.txt](sample_players.txt). The samples use fictional player data.
+
+
+### Home country, overseas quotas and the streamlined player template
+
+By default there is no Home/Indian or Overseas nationality quota. `/home India`
+selects the home country without imposing a cap. `/overseas 7_8` then requires
+7–8 overseas players per squad; `/overseas off` removes that requirement. Home
+players have no nationality cap unless an explicit Home rule is added. Bare
+commands read the settings. Countries are compared against Home dynamically,
+not against a legacy Indian/Overseas flag. Missing countries are Unclassified.
+These per-auction settings are enforced in live bids, reserve checks, picks and
+simulation, and the rules screen/live board show the same classification.
+
+The only public player columns, in order, are:
+
+```text
+Set No,Set Name,Player Id,Player Name,Category,country,Overall,bat_hand,bowl_hand,bowl_style,bat_rating,bowl_rating,version,gender
+```
+
+`Catagory` is accepted as an alias of Category; Overall maps to the stored overall
+rating. New templates, CSV/JSON/XLSX exports and direct CSV player entry share this
+14-column format. Existing internal pricing/tier/RTM metadata is preserved in the
+database and omitted from these player files. For full auction backups keep the
+SQLite database. Set Name defaults to the set's known name or `Set N`, appears in
+live lot cards, and is audited. A batch cannot give the same Set No conflicting
+names. See [COMMANDS.md](COMMANDS.md) for current examples.

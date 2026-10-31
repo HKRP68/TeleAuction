@@ -353,7 +353,7 @@ def finish_plan():
     pool = [dict(p) for p in b.db.cx.execute("SELECT * FROM players WHERE auction_id=? AND status IN ('available','unsold') ORDER BY CAST(set_no AS INTEGER),player_id", (aid,)) if not in_squad(p['player_id'])]
     limits = auction_rules.current(b)
     def counts(players):
-        return auction_rules.counts(players, limits)
+        return auction_rules.counts(players, limits, auction_rules.home_country(b))
     states = {}
     for team in teams:
         squad = [b.db.get_player(x) for x in json.loads(team['squad'])]
@@ -374,7 +374,7 @@ def finish_plan():
     def needs(state):
         return auction_rules.needed(state['size'], state['counts'], limits, ar['min_players'])
     def eligible(state, p):
-        keys = [k for k in limits if auction_rules.matches(p,k)]
+        keys = [k for k in limits if auction_rules.matches(p,k,auction_rules.home_country(b))]
         price = max(1, p['base_price'])
         if state['size'] >= ar['max_players'] or state['purse'] < price: return False
         for k in keys:
@@ -388,17 +388,17 @@ def finish_plan():
         if not pending: return True
         if sum(needs(s) for _,s in pending) > len(remaining): return False
         for k,(_,lo) in limits.items():
-            if sum(max(0,lo-s['counts'].get(k,0)) for _,s in pending) > sum(auction_rules.matches(p,k) for p in remaining): return False
+            if sum(max(0,lo-s['counts'].get(k,0)) for _,s in pending) > sum(auction_rules.matches(p,k,auction_rules.home_country(b)) for p in remaining): return False
         uid, state = min(pending, key=lambda pair: sum(eligible(pair[1], p) for p in remaining)-needs(pair[1]))
         if state['size']+needs(state) > ar['max_players']: return False
         candidates = [p for p in remaining if eligible(state,p)]
         if len(candidates)<needs(state) or sum(sorted(max(1,p['base_price']) for p in candidates)[:needs(state)])>state['purse']: return False
-        candidates.sort(key=lambda p: (-sum(state['counts'].get(k,0)<limits[k][1] for k in limits if auction_rules.matches(p,k)), max(1,p['base_price']), p['player_id']))
+        candidates.sort(key=lambda p: (-sum(state['counts'].get(k,0)<limits[k][1] for k in limits if auction_rules.matches(p,k,auction_rules.home_country(b))), max(1,p['base_price']), p['player_id']))
         for p in candidates:
             price = max(1,p['base_price']); old_counts = state['counts'].copy()
             state['size'] += 1; state['purse'] -= price
             for k in limits:
-                if auction_rules.matches(p,k): state['counts'][k] = state['counts'].get(k,0)+1
+                if auction_rules.matches(p,k,auction_rules.home_country(b)): state['counts'][k] = state['counts'].get(k,0)+1
             plan.append((p['player_id'], uid, price))
             if search([x for x in remaining if x['player_id']!=p['player_id']]): return True
             plan.pop(); state['size'] -= 1; state['purse'] += price; state['counts'] = old_counts

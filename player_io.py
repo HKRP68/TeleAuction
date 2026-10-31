@@ -7,19 +7,26 @@ import re
 from flask import request, abort
 import auction_rules
 
-CORE_COLUMNS = ('player_id','set_no','name','rating','category','gender','country','bat_hand',
-                'bowl_hand','bowl_style','bat_rating','bowl_rating','version')
+CORE_COLUMNS = ('set_no','set_name','player_id','name','category','country','rating','bat_hand',
+                'bowl_hand','bowl_style','bat_rating','bowl_rating','version','gender')
+# Storage compatibility only: new templates, entry guidance and exports expose CORE_COLUMNS.
 EXTRA_COLUMNS = ('tier','icon_eligible','indian_status','base_price','role','nationality','ipl_team')
-PLAYER_COLUMNS = CORE_COLUMNS + EXTRA_COLUMNS
-WRITE_COLUMNS = tuple(k for k in PLAYER_COLUMNS if k!='player_id')
-ENTRY_COLUMNS = ('name','rating','category','gender','country','bat_hand','bowl_hand',
-                 'bowl_style','bat_rating','bowl_rating','version','set_no','player_id','base_price')
+PLAYER_COLUMNS = CORE_COLUMNS
+WRITE_COLUMNS = tuple(k for k in CORE_COLUMNS if k!='player_id') + EXTRA_COLUMNS
+FIELD_LABELS = ('Set No','Set Name','Player Id','Player Name','Category','country','Overall','bat_hand',
+                'bowl_hand','bowl_style','bat_rating','bowl_rating','version','gender')
+LABELS = dict(zip(CORE_COLUMNS,FIELD_LABELS))
+ENTRY_COLUMNS = CORE_COLUMNS
+OLD_ENTRY_COLUMNS = ('name','rating','category','gender','country','bat_hand','bowl_hand',
+                     'bowl_style','bat_rating','bowl_rating','version','set_no','player_id','base_price')
+OLD_COLUMNS = ('player_id','set_no','name','rating','category','gender','country','bat_hand',
+               'bowl_hand','bowl_style','bat_rating','bowl_rating','version') + EXTRA_COLUMNS
 READ_ONLY = {'auction_id','status','sold_to','sold_price','sold_msg_id','sold_chat_id','buyer_team','sold_price_cr'}
 ALIASES = {'player_name':'name','player':'name','playerid':'player_id','id':'player_id',
            'set':'set_no','set_number':'set_no','setno':'set_no','batting_hand':'bat_hand',
            'bowling_hand':'bowl_hand','bowling_style':'bowl_style','batting_rating':'bat_rating',
            'bowling_rating':'bowl_rating','previous_team':'ipl_team','prev_team':'ipl_team','team':'ipl_team',
-           'price':'base_price','sex':'gender'}
+           'price':'base_price','sex':'gender','catagory':'category','overall':'rating','overall_rating':'rating','setname':'set_name'}
 
 
 def header(value):
@@ -41,7 +48,7 @@ def records(data):
                 if value not in (None,''): raise ValueError(f'Row {number}: a populated column has no header.')
                 continue
             if key in READ_ONLY: continue
-            if key not in PLAYER_COLUMNS: raise ValueError(f'Row {number}: unknown player field {field}. Download /downloadtemplate for the format.')
+            if key not in ('player_id',) + WRITE_COLUMNS: raise ValueError(f'Row {number}: unknown player field {field}. Download /downloadtemplate for the format.')
             if key in values: raise ValueError(f'Row {number}: duplicate column {key}.')
             values[key]=value
         result.append(values)
@@ -65,7 +72,8 @@ def read_rows(raw,filename):
     elif filename.endswith('.json'):
         data=json.loads(raw.decode('utf-8-sig'))
     elif filename.endswith('.csv'):
-        reader=csv.DictReader(io.StringIO(raw.decode('utf-8-sig')),strict=True)
+        text=raw.decode('utf-8-sig')
+        reader=csv.DictReader(io.StringIO(text),strict=True,delimiter='\t' if '\t' in text.splitlines()[0] else ',')
         hdrs=reader.fieldnames or []
         if len(set(header(h) for h in hdrs))!=len(hdrs): raise ValueError('Duplicate CSV headers.')
         data=list(reader)
@@ -76,20 +84,23 @@ def read_rows(raw,filename):
 
 
 def text_rows(text):
-    text=text.strip()
+    text=text.strip(' \r\n')
     if text.startswith(('[','{')): return records(json.loads(text))
-    first=next(csv.reader(io.StringIO(text)),[])
-    if 'name' in [header(v) for v in first]: return read_rows(text.encode(),'players.csv')
-    # Name-first records are convenient in chat; files use explicit database headers.
+    delimiter='\t' if '\t' in text.splitlines()[0] else ','
+    first=next(csv.reader(io.StringIO(text),delimiter=delimiter),[])
+    headers=[header(v) for v in first]
+    if 'name' in headers and (len(headers)==1 or sum(h in CORE_COLUMNS for h in headers)>=2): return read_rows(text.encode(),'players.csv')
     data=[]
-    for number,row in enumerate(csv.reader(io.StringIO(text),strict=True),1):
+    for number,row in enumerate(csv.reader(io.StringIO(text),strict=True,delimiter=delimiter),1):
         if not row or not any(v.strip() for v in row): continue
-        if len(CORE_COLUMNS)<=len(row)<=len(PLAYER_COLUMNS) and (not row[0].strip() or row[0].strip().isdigit()) and row[1].strip().isdigit():
-            data.append(dict(zip(PLAYER_COLUMNS,row)))
-            continue
-        if not 11<=len(row)<=len(ENTRY_COLUMNS):
-            raise ValueError(f'Line {number}: use name,rating,category,gender,country,bat_hand,bowl_hand,bowl_style,bat_rating,bowl_rating,version[,set_no,player_id,base_price], or JSON with field names.')
-        data.append(dict(zip(ENTRY_COLUMNS,row)))
+        if len(row)==len(CORE_COLUMNS) and (not row[0].strip() or row[0].strip().isdigit()) and (not row[2].strip() or row[2].strip().isdigit()):
+            data.append(dict(zip(CORE_COLUMNS,row)))
+        elif 13<=len(row)<=len(OLD_COLUMNS) and (not row[0].strip() or row[0].strip().isdigit()) and row[1].strip().isdigit():
+            data.append(dict(zip(OLD_COLUMNS,row)))
+        elif 11<=len(row)<=len(OLD_ENTRY_COLUMNS):
+            data.append(dict(zip(OLD_ENTRY_COLUMNS,row)))
+        else:
+            raise ValueError(f'Line {number}: use the 14 Player Database fields: '+','.join(FIELD_LABELS)+'. Or paste JSON with field names.')
     return records(data)
 
 
@@ -110,6 +121,9 @@ def normalize(bot,row,old=None):
     for k in WRITE_COLUMNS: values[k]='' if values[k] is None else str(values[k]).strip()
     if not values['name']: raise ValueError('Every player requires a name.')
     values['set_no']=str(integer(values['set_no'],'Set No',1,1))
+    if not values['set_name']:
+        known=bot.db.cx.execute("SELECT set_name FROM players WHERE auction_id=? AND set_no=? AND set_name!='' LIMIT 1",(bot.live.auction_id,values['set_no'])).fetchone()
+        values['set_name']=known['set_name'] if known else 'Set '+values['set_no']
     values['gender']=auction_rules.gender(values['gender'])
     for field in ('rating','bat_rating','bowl_rating'):
         if values[field]:
@@ -132,7 +146,8 @@ def normalize(bot,row,old=None):
         role=auction_rules.role(values['category'])
         values['role']=role if role in ('Bat','Bowl','AR','WK') else auction_rules.role(values['role']) or 'Bat'
         values['category']=values['category'] or values['role']
-    if not values['country'] and values['nationality'].lower() in ('indian','india'): values['country']='India'
+    values['country']=auction_rules.country_name(values['country'])
+    if 'country' not in supplied and not values['country'] and values['nationality'].lower() in ('indian','india'): values['country']='India'
     if not old or 'country' in supplied or 'nationality' in supplied:
         nat=values['nationality'].lower()
         if 'nationality' in supplied and nat:
@@ -143,7 +158,8 @@ def normalize(bot,row,old=None):
 
 
 def prepare(bot,rows):
-    rows=records(rows); seen=set(); prepared=[]
+    rows=records(rows); seen=set(); prepared=[]; set_names={}; planned=[]
+    # Collect set labels first so a label on any row also fills blank labels in its batch.
     for number,row in enumerate(rows,1):
         try:
             player_id=integer(row.get('player_id'),'Player ID',minimum=1)
@@ -151,8 +167,18 @@ def prepare(bot,rows):
             if player_id in seen or (old and old['auction_id']!=bot.live.auction_id):
                 raise ValueError('Duplicate or foreign Player ID. Leave player_id blank to create a new player.')
             if player_id: seen.add(player_id)
-            values=normalize(bot,row,old)
-            prepared.append((player_id,values))
+            no=str(integer(row.get('set_no'),'Set No',old['set_no'] if old else 1,1))
+            label=str(row.get('set_name') or '').strip()
+            if label:
+                if no in set_names and set_names[no].casefold()!=label.casefold(): raise ValueError(f'Set {no} has conflicting Set Names in this import.')
+                set_names[no]=label
+            planned.append((number,row,player_id,old,no))
+        except ValueError as exc: raise ValueError(f'Row {number}: {exc}') from exc
+    for number,row,player_id,old,no in planned:
+        try:
+            row=dict(row)
+            if not old and not str(row.get('set_name') or '').strip() and no in set_names: row['set_name']=set_names[no]
+            prepared.append((player_id,normalize(bot,row,old)))
         except ValueError as exc: raise ValueError(f'Row {number}: {exc}') from exc
     return prepared
 
@@ -163,10 +189,11 @@ def export_rows(bot,aid):
 
 
 def export_file(rows,fmt):
-    if fmt=='json': return json.dumps(rows,ensure_ascii=False,indent=2).encode()
+    public=[{label:row.get(k,'') for k,label in LABELS.items()} for row in rows]
+    if fmt=='json': return json.dumps(public,ensure_ascii=False,indent=2).encode()
     if fmt=='csv':
-        out=io.StringIO();writer=csv.DictWriter(out,fieldnames=PLAYER_COLUMNS)
-        writer.writeheader();writer.writerows(rows)
+        out=io.StringIO();writer=csv.DictWriter(out,fieldnames=FIELD_LABELS)
+        writer.writeheader();writer.writerows(public)
         return out.getvalue().encode('utf-8-sig')
     if fmt=='xlsx':
         import openpyxl
@@ -174,24 +201,24 @@ def export_file(rows,fmt):
         wb=openpyxl.Workbook(write_only=True); ws=wb.create_sheet('Players')
         def literal(value):
             cell=WriteOnlyCell(ws,value=value)
-            if isinstance(value,str): cell.data_type='s'  # Player text stays text, including names starting '='.
+            if isinstance(value,str): cell.data_type='s'
             return cell
-        ws.append([literal(k) for k in PLAYER_COLUMNS])
-        for row in rows: ws.append([literal(row[k]) for k in PLAYER_COLUMNS])
+        ws.append([literal(k) for k in FIELD_LABELS])
+        for row in public: ws.append([literal(row[k]) for k in FIELD_LABELS])
         out=io.BytesIO();wb.save(out);return out.getvalue()
     raise ValueError('Use json, csv or xlsx.')
 
 
 def sample():
     row={k:'' for k in PLAYER_COLUMNS}
-    row.update(set_no=1,name='Example Player',rating='82',category='Bowler',gender='Women',country='India',bat_hand='Right',
-               bowl_hand='Right',bowl_style='Fast',bat_rating='70',bowl_rating='87',version='2026',tier='Gold',base_price=20,role='Bowl',nationality='Indian')
+    row.update(set_no=1,set_name='Pace Bowlers',name='Example Player',rating='82',category='Bowler',gender='Women',country='India',bat_hand='Right',
+               bowl_hand='Right',bowl_style='Fast',bat_rating='70',bowl_rating='87',version='2026')
     return row
 
 
 def payload(message):
     raw=message.text or getattr(message,'caption',None) or ''
-    return re.split(r'\s+',raw.strip(),maxsplit=1)[1] if len(re.split(r'\s+',raw.strip(),maxsplit=1))>1 else ''
+    return re.split(r'\s+',raw.strip(' \r\n'),maxsplit=1)[1] if len(re.split(r'\s+',raw.strip(' \r\n'),maxsplit=1))>1 else ''
 
 
 async def input_rows(update):
@@ -244,14 +271,14 @@ async def add_command(bot,update,context,mode='single'):
     if not bot.live.auction_id: await update.message.reply_text('Create or restore an auction first.');return
     text=payload(update.message)
     if not text:
-        await update.message.reply_text('Add a detailed player:\n/addplayer Example Player,82,Bowler,Women,India,Right,Right,Fast,70,87,2026,1\n\nFor spreadsheets: /downloadtemplate → fill fields → reply /uploaddata → /asetsconfirm TOKEN. JSON records and CSV with database headers are also accepted.');return
+        await update.message.reply_text('Add a player with the 14 database fields:\n/addplayer 1,Pace Bowlers,,Example Player,Bowler,India,82,Right,Right,Fast,70,87,2026,Women\n\nFor spreadsheets: /downloadtemplate → fill fields → reply /uploaddata → /asetsconfirm TOKEN. JSON records and CSV with database headers are also accepted.');return
     try:
-        if mode=='single' and ',' not in text and not text.startswith(('{','[')):
+        if mode=='single' and ',' not in text and '\t' not in text and not text.startswith(('{','[')):
             parts=text.split()
             if len(parts) not in (5,6): raise ValueError('Use the detailed CSV/JSON format, or name role former_team nationality price [tier].')
             rows=[{'name':parts[0].replace('_',' '),'category':parts[1],'role':parts[1],'ipl_team':parts[2],
                    'nationality':bot.norm_nat(parts[3]),'base_price':parts[4],'tier':parts[5] if len(parts)>5 else 'C'}]
-        elif mode=='quick' and '\n' not in text and not text.startswith(('{','[')) and len(next(csv.reader([text])))<11:
+        elif mode=='quick' and '\n' not in text and '\t' not in text and not text.startswith(('{','[')) and len(next(csv.reader([text])))<11:
             rows=[{'name':name.strip(),'category':'Batsman','country':'India'} for name in next(csv.reader([text])) if name.strip()]
         elif mode=='list' and not text.startswith(('{','[')):
             parsed=list(csv.reader(io.StringIO(text)))
