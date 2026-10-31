@@ -215,6 +215,7 @@ def fingerprint(bot):
 
 
 def preview(bot, rows, replace=False, actor=None):
+    if bot.auction_lifecycle.closed(bot): raise ValueError('This auction is cancelled. Restart it before importing players.')
     prepared = bot.auction_controls.prepare_rows(rows)
     existing = [dict(p) for p in bot.db.cx.execute('SELECT * FROM players WHERE auction_id=?',(bot.live.auction_id,))]
     by_id = {p['player_id']:p for p in existing}
@@ -351,8 +352,8 @@ def install(bot):
     def players_preview():
         bot._web_draft_aid()
         try:
-            rows=bot._sheet_rows(request.files.get('file'))
-            bot._require_columns(rows,bot.DRAFT_PLAYER_COLUMNS)
+            upload=request.files.get('file')
+            rows=bot.player_io.read_rows(upload.read(),upload.filename)
             token,data=preview(bot,rows,replace=request.form.get('replace')=='1')
             changes=''.join('<tr><td>'+escape(str(p['player_id'] or 'New ID'))+'</td><td>'+escape(p['name'])+'</td><td>'+escape(p['action'])+'</td><td><pre>'+escape(json.dumps(p['changes'],indent=2))+'</pre></td></tr>' for p in data['changes'])
             withdrawn=', '.join(f"#{p['player_id']} {p['name']}" for p in data['withdrawn']) or 'None'
@@ -390,7 +391,7 @@ def install(bot):
         p=bot.db.get_player(bot.live.current_player_id) if bot.live.current_player_id else None
         seconds=math.ceil(bot.live.paused_remaining if bot.live.paused else max(0,(bot.live.timer_ends_at or time.time())-time.time()))
         result={'available':True,'auction':ar['name'],'active':bot.live.active,'paused':bot.live.paused,'seconds':seconds,'bid':bot.live.current_bid,
-                'leader':bot.live.highest_bidder_name,'player':{k:p[k] for k in ('player_id','name','set_no','category','gender','rating')} if p else None,
+                'leader':bot.live.highest_bidder_name,'status':ar['status'],'player':{k:p[k] for k in ('player_id','name','set_no','category','gender','rating')} if p else None,
                 'minimum':ar['min_players'],'maximum':ar['max_players'],'teams':teams,'queued':len(bot.live.player_queue)}
         response=jsonify(result); response.headers['Cache-Control']='no-store'; return response
 
@@ -401,7 +402,7 @@ def install(bot):
 const put=(id,value)=>document.getElementById(id).textContent=value;
 function node(tag,text){const el=document.createElement(tag);if(text!==undefined)el.textContent=text;return el;}
 async function refresh(){try{const response=await fetch('/watch/data',{cache:'no-store'});if(!response.ok)throw Error();const d=await response.json();if(!d.available){put('connection','No auction created');return;}
-put('connection','Live · '+new Date().toLocaleTimeString());put('auction',d.auction);put('player',d.player?d.player.name:'Waiting for a lot');put('details',d.player?'#'+d.player.player_id+' · Set '+d.player.set_no+' · '+(d.player.category||'')+' · '+(d.player.gender||'Unspecified')+' · Rating '+(d.player.rating||'—'):'Queued: '+d.queued);put('bid',d.bid||'No bids');put('leader',d.leader||'Open bidding');put('clock',d.player?d.seconds+'s':'—');put('state',d.paused?'Paused':d.active?'Auction running':'Auction not running');
+put('connection','Live · '+new Date().toLocaleTimeString());put('auction',d.auction);put('player',d.player?d.player.name:'Waiting for a lot');put('details',d.player?'#'+d.player.player_id+' · Set '+d.player.set_no+' · '+(d.player.category||'')+' · '+(d.player.gender||'Unspecified')+' · Rating '+(d.player.rating||'—'):'Queued: '+d.queued);put('bid',d.bid||'No bids');put('leader',d.leader||'Open bidding');put('clock',d.player?d.seconds+'s':'—');put('state',d.paused?'Paused':d.active?'Auction running':d.status==='cancelled'?'Auction cancelled':'Auction not running');
 const container=document.getElementById('teams');container.replaceChildren();for(const t of d.teams){const card=node('section');card.className='panel';card.append(node('h2',t.name),node('p',t.size+' / '+d.maximum+' players · minimum '+d.minimum),node('p','Purse '+t.purse+' · spent '+t.spent));const progress=node('progress');progress.max=d.maximum;progress.value=t.size;card.append(progress);for(const rule of t.rules)card.append(node('p',rule.category+': '+rule.count+' (min '+rule.minimum+', max '+rule.maximum+')'));const details=node('details');details.append(node('summary','Full squad ('+t.players.length+')'));for(const p of t.players)details.append(node('p','#'+p.player_id+' '+p.name+' · '+(p.category||'')+' · '+(p.gender||'Unspecified')+' · Rating '+(p.rating||'—')+' · Bat '+(p.bat_rating||'—')+' · Bowl '+(p.bowl_rating||'—')));card.append(details);container.append(card);}}
 catch(e){put('connection','Connection lost — retrying…');}finally{setTimeout(refresh,2000);}}refresh();
 </script>''')

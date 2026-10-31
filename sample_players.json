@@ -1,0 +1,24 @@
+[
+  {
+    "player_id": "",
+    "set_no": 1,
+    "name": "Example Player",
+    "rating": "82",
+    "category": "Bowler",
+    "gender": "Women",
+    "country": "India",
+    "bat_hand": "Right",
+    "bowl_hand": "Right",
+    "bowl_style": "Fast",
+    "bat_rating": "70",
+    "bowl_rating": "87",
+    "version": "2026",
+    "tier": "Gold",
+    "icon_eligible": "",
+    "indian_status": "",
+    "base_price": 20,
+    "role": "Bowl",
+    "nationality": "Indian",
+    "ipl_team": ""
+  }
+]

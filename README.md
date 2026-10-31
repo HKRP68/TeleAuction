@@ -229,10 +229,10 @@ Create the draft on this page, then add each **Team Name**, **Owner**, and optio
 **Co-owner**. This setup is stored in the database and does not require creating an
 auction or registering teams in Telegram.
 
-The desk imports `.xlsx` or `.csv` files for players and the draft order. Player sheets use these exact columns:
+The desk imports `.xlsx`, `.csv`, or `.json` player files and `.xlsx`/`.csv` draft orders. Player templates and exports use these core columns (plus the optional fields described below):
 
 ```text
-name,rating,category,country,bat_hand,bowl_hand,bowl_style,bat_rating,bowl_rating,version
+player_id,set_no,name,rating,category,gender,country,bat_hand,bowl_hand,bowl_style,bat_rating,bowl_rating,version
 ```
 
 Player records also include `player_id` (the stable numeric Player ID / lot number) and `set_no` (Set No, default 1). Include these columns to preserve IDs and set ordering during imports. New IDs are generated when omitted. The optional player columns `tier`, `icon_eligible`, `gender`, and `indian_status` are also stored when provided. Gender is shown in the player table/cards: use `Women` or `Men` (`Female`/`Male`, `F`/`M` are accepted aliases). Add `gender` to the sheet for mixed-gender squad quotas. Missing gender/rating does not count toward those quotas. Tier defaults to Bronze. Existing databases gain the `version` field automatically at startup without removing player data.
@@ -305,8 +305,8 @@ Set No, then Player ID.
 | `/atimer 45` | Classic clock: opens at 45 seconds and every bid resets to 45. Bare `/atimer` reads the policy. |
 | `/abidgap seconds` or `/abidgap off` | Optional auction-wide spacing between accepted bids; off by default. Every bidder has a separate one-second spam throttle. Bare command reads the setting. |
 | `/adirect on` or `/adirect off` | Allow arbitrary valid bid amounts, or restrict every bid to the next increment. Bare command reads the setting. `/bid` without an amount bids the next step. |
-| `/asetsexport [json\|csv]` | Download every set with stable IDs and player metadata. |
-| `/asetsimport [replace]` | Reply to an exported JSON/CSV document to generate a review. Use `/asetsreview token` to download its full changes and `/asetsconfirm token` to apply. `replace` withdraws unlisted available players. Owned players stay intact. |
+| `/asetsexport [json\|csv\|xlsx]` | Download every set with stable IDs and player metadata. |
+| `/asetsimport [replace]` | Reply to an exported JSON/CSV/XLSX document to generate a review. Use `/asetsreview token` to download its full changes and `/asetsconfirm token` to apply. `replace` withdraws unlisted available players. Owned players stay intact. |
 | `/awithdraw player` | Withdraw an unowned player; a standing bid prevents withdrawal. |
 | `/areinstate player, …` | Return withdrawn players to the queue. |
 | `/astart`, `/apause`, `/aresume` | Start the first lot, freeze its clock, or resume with the saved remaining time. Resolve RTM before pausing. |
@@ -392,7 +392,7 @@ records, protected squad members, field-level before/after changes, duplicate-na
 warnings, and players withdrawn by replacement. Review and apply within 30 minutes.
 A changed player pool or team state invalidates the preview. Telegram set imports
 use the same preview/confirmation process. The older `/draft/players` programmatic
-endpoint continues to accept direct imports for existing clients.
+endpoint accepts direct imports with the same schema for existing clients.
 
 **Audit trail:** `/draft/audit` shows the latest 200 events and exports the full log.
 `/aaudit` shows recent events; `/aaudit json` downloads the log. Database triggers
@@ -456,3 +456,46 @@ The control room `/draft` offers the same bulk-entry box and supports editing
 multiple comma-separated co-owners. Validation rejects the entire batch for bad
 rows, duplicate names/IDs, IDs already used by another team in this auction, or
 team-capacity overflow. Existing team budgets remain intact. Additions are audited.
+
+
+### Consistent player imports, exports and cancellation
+
+Use `/downloadtemplate [xlsx|csv|json]` to get the shared Player Database template.
+Replace the sample row, keep its headers, and reply to the file with `/uploaddata`
+(or `/asetsimport`). A command in the file caption also works. Imports show a preview:
+review with `/asetsreview TOKEN`, then apply with `/asetsconfirm TOKEN`. The website
+provides the same CSV/JSON/XLSX import preview, template downloads and exports.
+
+Core columns are `player_id,set_no,name,rating,category,gender,country,bat_hand,bowl_hand,bowl_style,bat_rating,bowl_rating,version`.
+Optional columns are `tier,icon_eligible,indian_status,base_price,role,nationality,ipl_team`.
+Only a name is required for a new player; blank Player IDs are generated, and Set No
+is 1 by default. Existing IDs update matching players in this auction; omitted fields
+keep stored values. Owned players remain protected. Foreign IDs are rejected; clear
+the IDs to clone players to a different auction. All formats retain every metadata
+field and preserve both auction and draft tiers. Status and sale columns in full
+reports are read-only during metadata imports and do not recreate ownership.
+
+```text
+/addplayer Example Player,82,Bowler,Women,India,Right,Right,Fast,70,87,2026,1
+/exportplayers xlsx
+/asetsexport csv
+/downloaddata
+```
+
+`/exportplayers` defaults to XLSX; `/asetsexport` defaults to JSON. Both accept
+XLSX/CSV/JSON and use identical headers. `/downloaddata` keeps its full Excel report,
+with an importable Players sheet and all metadata in Squad Details. An explicit
+format, e.g. `/downloaddata csv`, exports the player records. `/addplayer`,
+`/add_player_list` and `/bulkplayer` accept detailed CSV/JSON entry while retaining
+older short entry syntax. See [COMMANDS.md](COMMANDS.md) for worked examples.
+
+To cancel, run `/acancel` for details, then `/acancel confirm` (alias
+`/cancelauction confirm`). The clock and auto-next stop, the outstanding bid is
+voided without charging it, an unresolved RTM card is refunded, registration and
+bidding close, and import previews expire. Completed sales, squads, purses and
+player records stay available for export. Cancellation survives restarts and is
+audited. `/astart` and `/aresume` cannot reopen it; use a new auction or explicitly
+reset with `/arestart confirm`. Completed auctions cannot be cancelled. The control
+room also provides a cancellation review screen.
+
+Ready-to-edit examples: [sample_players.csv](sample_players.csv), [sample_players.json](sample_players.json), and [sample_players.txt](sample_players.txt). The samples use fictional player data.

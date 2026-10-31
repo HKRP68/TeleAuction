@@ -47,7 +47,7 @@ def add_teams(bot,aid,text,actor=None):
         cx.execute('BEGIN IMMEDIATE')
         auction=bot.db.get_auction(aid)
         if not auction: raise ValueError('Create or restore an auction first.')
-        if auction['status']=='completed': raise ValueError('This auction is completed. Create or restart an auction before adding teams.')
+        if auction['status'] in ('completed','cancelled'): raise ValueError('This auction is closed. Create or restart an auction before adding teams.')
         teams=bot.db.get_all_parts(aid)
         if len(teams)+len(rows)>auction['max_teams']:
             raise ValueError(f'Too many teams: {len(teams)} registered, {len(rows)} requested, maximum {auction["max_teams"]}.')

@@ -13,6 +13,8 @@ import asyncio
 import auction_rules
 import help_admin
 import team_management
+import player_io
+import auction_lifecycle
 from html import escape
 import json
 import logging
@@ -105,6 +107,8 @@ class LiveState:
     auto_sell_secs: Optional[int]     = None
     auto_next_secs: Optional[int]     = None
     auto_next_on: bool         = False
+
+    auto_next_epoch: int = 0
 
     # Queue
     player_queue: list         = field(default_factory=list)
@@ -679,8 +683,7 @@ db = DB()
 # DRAFT MODE
 # ─────────────────────────────────────────────────────────
 DRAFT_TIERS = ("Platinum", "Gold", "Silver", "Bronze")
-DRAFT_PLAYER_COLUMNS = ("name", "rating", "category", "country", "bat_hand", "bowl_hand",
-                        "bowl_style", "bat_rating", "bowl_rating", "version")
+DRAFT_PLAYER_COLUMNS = tuple(k for k in player_io.CORE_COLUMNS if k not in ("player_id", "set_no", "gender"))
 DRAFT_OPTIONAL_PLAYER_COLUMNS = ("tier", "icon_eligible", "gender", "indian_status", "set_no")
 DRAFT_ORDER_COLUMNS = ("round_no", "pick_no", "tier", "team_name", "owner_name", "owner_tag_id")
 
@@ -710,21 +713,10 @@ def is_draft_picker(aid: int, order, user_id: int) -> bool:
 
 
 def add_draft_player(aid: int, data: dict) -> int:
-    """Add a detailed player record used by both the website and /pick."""
-    columns = DRAFT_PLAYER_COLUMNS + DRAFT_OPTIONAL_PLAYER_COLUMNS
-    values = {field: str(data[field]).strip() if data.get(field) is not None else ""
-              for field in columns}
-    if not values["name"]:
-        raise ValueError("name is required")
-    values["tier"] = normalize_draft_tier(values["tier"])
-    values["gender"] = auction_rules.gender(values["gender"])
-    values["set_no"] = str(int(values["set_no"] or 1))
-    if int(values["set_no"]) < 1:
-        raise ValueError("Set No must be positive")
-    placeholders = ",".join("?" for _ in columns)
-    cur = db.cx.execute(
-        f"INSERT INTO players (auction_id,{','.join(columns)},status) "
-        f"VALUES(?,{placeholders}, 'available')", (aid, *(values[field] for field in columns)))
+    values = player_io.normalize(sys.modules[__name__], data)
+    player_id = player_io.integer(data.get("player_id"), "Player ID", minimum=1)
+    columns = player_io.WRITE_COLUMNS
+    cur = db.cx.execute(f"INSERT INTO players(auction_id,player_id,{','.join(columns)}) VALUES({','.join('?' for _ in range(len(columns)+2))})", (aid,player_id,*values.values()))
     db.cx.commit()
     return cur.lastrowid
 
@@ -932,6 +924,12 @@ def _apply_state_dict(state: dict) -> bool:
                 live.player_queue.append(row)
         if not live.player_queue:
             live.player_queue = [p for p in db.get_available(aid) if p["player_id"] != live.current_player_id]
+        if ar["status"] == "cancelled":
+            live.active = live.paused = False
+            live.current_player_id = live.highest_bidder_id = None
+            live.current_bid = 0
+            live.player_queue = []
+            live.auto_next_on = False
         return True
     except Exception as e:
         logger.error(f"_apply_state_dict: {e}", exc_info=True)
@@ -1933,8 +1931,9 @@ def _set_last_sold(pid, name, buyer_id, buyer_name, price):
 
 async def _try_auto_next(context: ContextTypes.DEFAULT_TYPE):
     if live.auto_next_on and live.auto_next_secs and live.active:
+        aid, epoch = live.auction_id, live.auto_next_epoch
         await asyncio.sleep(live.auto_next_secs)
-        if not live.current_player_id and not live.paused and live.active:
+        if live.auction_id == aid and live.auto_next_epoch == epoch and live.auto_next_on and not live.current_player_id and not live.paused and live.active:
             await _do_next(context, live.chat_id)
 
 
@@ -1942,7 +1941,7 @@ async def _try_auto_next(context: ContextTypes.DEFAULT_TYPE):
 # NEXT PLAYER
 # ─────────────────────────────────────────────────────────
 async def _do_next(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
-    if not live.active:
+    if not live.active or auction_lifecycle.closed(sys.modules[__name__]):
         return
     if live.current_player_id:
         await context.bot.send_message(
@@ -2033,7 +2032,7 @@ async def process_bid(update, context: ContextTypes.DEFAULT_TYPE,
     if not part:
         await err("You are not registered in this auction.")
         return
-    if not live.active or not live.current_player_id:
+    if not live.active or not live.current_player_id or auction_lifecycle.closed(sys.modules[__name__]):
         await err("No active auction right now.")
         return
     if live.paused:
@@ -2220,6 +2219,16 @@ async def cmd_auction_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await help_admin.auction_admin(sys.modules[__name__], update, context)
 
 
+async def cmd_player_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    caption = update.message.caption or ""
+    parts = caption.split()
+    if not parts: return
+    name = parts[0].split("@",1)[0].lower()
+    if name not in ("/uploaddata", "/importdata", "/asetsimport"): return
+    context.args = parts[1:]
+    await cmd_upload_data(update, context)
+
+
 # ── CREATE AUCTION ────────────────────────────────────────
 
 async def cmd_create_auction(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2264,6 +2273,7 @@ async def cmd_create_auction(update: Update, context: ContextTypes.DEFAULT_TYPE)
                               update.effective_chat.id)
 
     # ✅ Reset live state for this fresh auction
+    live.auto_next_epoch += 1
     live.auction_id   = aid
     live.auction_name = name
     live.player_queue.clear()
@@ -2406,6 +2416,10 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     aid = live.auction_id
     ar  = db.get_auction(aid)
+
+    if ar and ar["status"] == "cancelled":
+        await update.message.reply_text(f"{live.auction_name} — CANCELLED.\nCompleted sales, squads and purses are preserved. Export with /exportplayers or /downloaddata. Reopen only with /arestart confirm (resets sales/purses), or create a new auction.")
+        return
 
     # Auction exists but bot may have restarted — show state + guidance
     if not live.active:
@@ -2799,34 +2813,7 @@ async def cmd_force_auction(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ── BULK PLAYER ───────────────────────────────────────────
 
 async def cmd_bulk_player(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await _reg(update.effective_user)
-    if not db.is_admin(update.effective_user.id):
-        await update.message.reply_text("Admin only.")
-        return
-    if not live.auction_id:
-        await update.message.reply_text("Create an auction first.")
-        return
-
-    raw   = " ".join(context.args)
-    names = [n.strip() for n in raw.split(",") if n.strip()]
-    if not names:
-        await update.message.reply_text("Usage: /bulkplayer Player1,Player2,Player3...")
-        return
-
-    added = []
-    aid   = live.auction_id
-    for name in names:
-        pid = db.add_player(aid, name, 0, "Batsman", "Indian", "", "C")
-        if live.active:
-            live.player_queue.append(db.get_player(pid))
-        added.append(name)
-
-    note = f" ({len(added)} added to queue)" if live.active else ""
-    await update.message.reply_text(
-        f"✅ Added {len(added)} players{note}:\n" +
-        "\n".join(f"  • {n}" for n in added[:20]) +
-        (f"\n  ...and {len(added)-20} more" if len(added) > 20 else "")
-    )
+    await player_io.add_command(sys.modules[__name__], update, context, mode='quick')
 
 
 
@@ -3156,6 +3143,7 @@ async def cmd_player_card(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"📊 Status: *{status_icon}*"
         f"{buyer_line}{queue_line}"
     )
+    text += "\n" + "\n".join(f"{field}: {md_safe(str(r[field] if r[field] is not None else ''))}" for field in player_io.CORE_COLUMNS if field != "name")
     await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
 
 
@@ -3702,6 +3690,9 @@ async def cmd_view_queue(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_start_auction(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _reg(update.effective_user)
+    if auction_lifecycle.closed(sys.modules[__name__]):
+        await update.message.reply_text("This auction is cancelled. Create a new auction or use /arestart confirm to reset it.")
+        return
     if not db.is_admin(update.effective_user.id):
         await update.message.reply_text("Admin only.")
         return
@@ -3829,6 +3820,9 @@ async def cmd_pause(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_resume(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _reg(update.effective_user)
+    if auction_lifecycle.closed(sys.modules[__name__]):
+        await update.message.reply_text("This auction is cancelled. Create a new auction or use /arestart confirm to reset it.")
+        return
     if not db.is_admin(update.effective_user.id):
         return
 
@@ -3855,6 +3849,9 @@ async def cmd_resume(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Check if DB is wiped (auction_id restored from Telegram but DB gone)
     ar = db.get_auction(live.auction_id)
     db_missing = (ar is None)
+    if ar and ar["status"] == "cancelled":
+        await update.message.reply_text("This auction is cancelled. Create a new auction or use /arestart confirm.")
+        return
 
     live.paused  = False
     live.active  = True
@@ -4152,39 +4149,20 @@ def _build_auction_excel(aid: int) -> bytes:
 
     # ── Sheet 3: Players ──
     ws3 = wb.create_sheet("Players")
-    style_header(ws3, [
-        "#", "Player Name", "Role", "Nationality", "Prev Team (IPL)", "Tier",
-        "Base Price (L)", "Status", "Sold To", "Sold Price (L)", "Sold Price (Cr)"
-    ])
-    for i, p in enumerate(players, 1):
-        buyer = team_map.get(p["sold_to"], "") if p["sold_to"] else ""
-        sp_cr = round((p["sold_price"] or 0)/100, 2) if (p["sold_price"] or 0) >= 100 else ""
-        ws3.append([
-            i, p["name"], p["role"], p["nationality"],
-            p["ipl_team"] or "", p["tier"], p["base_price"],
-            p["status"].title(), buyer, p["sold_price"] or "", sp_cr
-        ])
-        fill = SOLD_FILL if p["status"]=="sold" else (UNSOLD_FILL if p["status"]=="unsold" else None)
-        if fill:
-            for cell in ws3[ws3.max_row]: cell.fill = fill
+    style_header(ws3, list(player_io.PLAYER_COLUMNS) + ["status", "sold_to", "sold_price"])
+    for p in players:
+        ws3.append([p[k] for k in player_io.PLAYER_COLUMNS] + [p["status"],p["sold_to"],p["sold_price"]])
     alt_rows(ws3); autofit(ws3)
 
     # ── Sheet 4: Squad Details ──
     ws4 = wb.create_sheet("Squad Details")
-    style_header(ws4, [
-        "Team Name", "Player Name", "Role", "Nationality",
-        "Prev Team", "Tier", "Price Paid (L)", "Price Paid (Cr)"
-    ])
+    style_header(ws4, ["team_name"] + list(player_io.PLAYER_COLUMNS) + ["sold_price"])
     pmap = {p["player_id"]: p for p in players}
     for r in parts:
         for pid in json.loads(r["squad"]):
             p = pmap.get(int(pid))
-            if not p: continue
-            sp_cr = round((p["sold_price"] or 0)/100, 2) if (p["sold_price"] or 0) >= 100 else ""
-            ws4.append([
-                r["team_name"], p["name"], p["role"], p["nationality"],
-                p["ipl_team"] or "", p["tier"], p["sold_price"] or "", sp_cr
-            ])
+            if p:
+                ws4.append([r["team_name"]] + [p[k] for k in player_io.PLAYER_COLUMNS] + [p["sold_price"]])
     alt_rows(ws4); autofit(ws4)
 
     # ── Sheet 5: Bid History ──
@@ -4204,6 +4182,10 @@ def _build_auction_excel(aid: int) -> bytes:
     alt_rows(ws5); autofit(ws5)
 
     buf = io.BytesIO()
+    for sheet in wb:
+        for row in sheet:
+            for cell in row:
+                if isinstance(cell.value, str): cell.data_type = "s"
     wb.save(buf)
     return buf.getvalue()
 
@@ -4214,6 +4196,9 @@ async def cmd_download_data(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not db.is_admin(update.effective_user.id):
         await update.message.reply_text("Admin only.")
         return
+
+    if context.args:
+        return await AUCTION_COMMANDS["exportplayers"](update, context)
 
     aid = live.auction_id
     if not aid:
@@ -4248,246 +4233,11 @@ async def cmd_download_data(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_download_template(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/downloadtemplate — Send the player upload template."""
-    await _reg(update.effective_user)
-    if not db.is_admin(update.effective_user.id):
-        await update.message.reply_text("Admin only.")
-        return
-
-    import io
-    from openpyxl import Workbook
-    from openpyxl.styles import Font, PatternFill, Alignment
-    from openpyxl.utils import get_column_letter
-
-    wb  = Workbook()
-    ws  = wb.active
-    ws.title = "Players"
-
-    HDR_FILL = PatternFill("solid", start_color="1F4E79")
-    HDR_FONT = Font(bold=True, color="FFFFFF", name="Arial", size=11)
-
-    headers = ["name", "role", "ipl_team", "nationality", "base_price", "tier"]
-    ws.append(headers)
-    for cell in ws[1]:
-        cell.font = HDR_FONT; cell.fill = HDR_FILL
-        cell.alignment = Alignment(horizontal="center")
-    ws.row_dimensions[1].height = 22
-
-    # Notes row (grey, italic)
-    notes = [
-        "Full player name",
-        "Bat / Bowl / AR / WK",
-        "Prev IPL team for RTM (blank = none)",
-        "Indian / Overseas",
-        "e.g. 2cr / 50l / 200 (lakhs)",
-        "Marquee / A / B / C / Uncapped"
-    ]
-    ws.append(notes)
-    for cell in ws[2]:
-        cell.font = Font(italic=True, color="808080", name="Arial", size=9)
-        cell.alignment = Alignment(wrap_text=True)
-    ws.row_dimensions[2].height = 30
-
-    samples = [
-        ["Virat Kohli",    "Bat",  "RCB", "Indian",   "2cr",   "Marquee"],
-        ["Pat Cummins",    "Bowl", "SRH", "Overseas", "3cr",   "A"],
-        ["Hardik Pandya",  "AR",   "MI",  "Indian",   "1.5cr", "A"],
-        ["Rishabh Pant",   "WK",   "DC",  "Indian",   "2cr",   "Marquee"],
-        ["Jasprit Bumrah", "Bowl", "MI",  "Indian",   "2cr",   "A"],
-    ]
-    for s in samples: ws.append(s)
-
-    for i, w in enumerate([22,10,20,12,14,12], 1):
-        ws.column_dimensions[get_column_letter(i)].width = w
-
-    # Instructions sheet
-    ws2 = wb.create_sheet("Instructions")
-    lines = [
-        ("IPL Auction Bot — Player Upload Template", True, 13),
-        ("", False, 11),
-        ("HOW TO USE", True, 11),
-        ("1. Fill the Players sheet. Delete the grey notes row before uploading.", False, 11),
-        ("2. Save as .xlsx, .csv, or .json", False, 11),
-        ("3. Send the file with command /uploaddata (attach file to message)", False, 11),
-        ("   OR paste CSV/JSON text after /uploaddata", False, 11),
-        ("", False, 11),
-        ("PRICE FORMAT", True, 11),
-        ("  2cr  → 2 Crore (= 200 lakhs)", False, 11),
-        ("  50l  → 50 Lakh", False, 11),
-        ("  200  → 200 Lakh (bare number = lakhs)", False, 11),
-        ("", False, 11),
-        ("JSON FORMAT", True, 11),
-        ('  [{"name":"Virat Kohli","role":"Bat","ipl_team":"RCB","nationality":"Indian","base_price":"2cr","tier":"Marquee"}]', False, 9),
-        ("", False, 11),
-        ("CSV FORMAT", True, 11),
-        ("  name,role,ipl_team,nationality,base_price,tier", False, 11),
-        ("  Virat Kohli,Bat,RCB,Indian,2cr,Marquee", False, 11),
-    ]
-    for text, bold, size in lines:
-        ws2.append([text])
-        ws2[ws2.max_row][0].font = Font(bold=bold, name="Arial", size=size)
-    ws2.column_dimensions["A"].width = 90
-
-    buf = io.BytesIO()
-    wb.save(buf)
-
-    await update.message.reply_document(
-        document=buf.getvalue(),
-        filename="PlayerTemplate.xlsx",
-        caption=(
-            "📋 *Player Upload Template*\n\n"
-            "• Fill the *Players* sheet\n"
-            "• Delete the grey notes row\n"
-            "• Send back with /uploaddata (attach file)\n\n"
-            "Also accepts: CSV text, JSON text, .csv file, .json file"
-        ),
-        parse_mode=ParseMode.MARKDOWN,
-    )
+    await player_io.template_command(sys.modules[__name__], update, context)
 
 
 async def cmd_upload_data(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/uploaddata — Import players from Excel, CSV, or JSON."""
-    await _reg(update.effective_user)
-    if not db.is_admin(update.effective_user.id):
-        await update.message.reply_text("Admin only.")
-        return
-    if not live.auction_id:
-        await update.message.reply_text(
-            "Create an auction first with /create\\_auction.",
-            parse_mode=ParseMode.MARKDOWN,
-        )
-        return
-
-    import io, csv as _csv_mod
-
-    def _parse_price(s: str) -> int:
-        s = str(s or "20").strip().lower()
-        try:
-            if s.endswith("cr"): return int(float(s[:-2]) * 100)
-            if s.endswith("l"):  return int(float(s[:-1]))
-            return int(float(s))
-        except Exception:
-            return 20
-
-    def _normalise(raw: dict) -> dict:
-        kv  = {k.strip().lower().replace(" ","_"): str(v or "").strip() for k,v in raw.items()}
-        name = kv.get("name") or kv.get("player_name") or kv.get("player") or ""
-        role = kv.get("role","bat").strip().upper()
-        role = {"BATSMAN":"Bat","BOWLER":"Bowl","ALLROUNDER":"AR","WICKETKEEPER":"WK",
-                "BAT":"Bat","BOWL":"Bowl","AR":"AR","WK":"WK"}.get(role, "Bat")
-        nat  = "Overseas" if "over" in kv.get("nationality","indian").lower() else "Indian"
-        ipl  = kv.get("ipl_team") or kv.get("prev_team") or kv.get("team") or ""
-        bp   = _parse_price(kv.get("base_price") or kv.get("price") or "20")
-        tier = kv.get("tier","C").strip().title()
-        tier = tier if tier in ("Marquee","A","B","C","Uncapped") else "C"
-        return {"name": name.strip(), "role": role, "nationality": nat,
-                "ipl_team": ipl.strip(), "base_price": bp, "tier": tier}
-
-    rows = []
-    doc  = update.message.document
-
-    if doc:
-        fname    = (doc.file_name or "").lower()
-        file_obj = await doc.get_file()
-        raw      = bytes(await file_obj.download_as_bytearray())
-
-        if fname.endswith((".xlsx",".xls")):
-            import openpyxl
-            wb = openpyxl.load_workbook(io.BytesIO(raw), data_only=True)
-            ws = wb["Players"] if "Players" in wb.sheetnames else wb.active
-            hdrs = None
-            for r in ws.iter_rows(values_only=True):
-                if not any(c is not None for c in r): continue
-                if hdrs is None:
-                    # Detect header row: must contain "name" or "player"
-                    row_strs = [str(c or "").strip().lower() for c in r]
-                    if any(x in row_strs for x in ("name","player","player_name")):
-                        hdrs = [str(c or "").strip().lower().replace(" ","_") for c in r]
-                    continue
-                d = _normalise(dict(zip(hdrs, r)))
-                if d["name"]: rows.append(d)
-
-        elif fname.endswith(".csv"):
-            text   = raw.decode("utf-8", errors="replace")
-            reader = _csv_mod.DictReader(io.StringIO(text))
-            for r in reader:
-                d = _normalise(r)
-                if d["name"]: rows.append(d)
-
-        elif fname.endswith(".json"):
-            import json as _j
-            data = _j.loads(raw.decode("utf-8"))
-            if isinstance(data, dict): data = [data]
-            for r in data:
-                d = _normalise(r)
-                if d["name"]: rows.append(d)
-
-        else:
-            await update.message.reply_text("Unsupported file type. Use .xlsx, .csv, or .json")
-            return
-
-    else:
-        body = (update.message.text or "").strip()
-        if body.lower().startswith("/uploaddata"): body = body[11:].strip()
-        if not body:
-            await update.message.reply_text(
-                "Attach a file (.xlsx / .csv / .json) to this command,\n"
-                "or paste JSON/CSV text after /uploaddata.\n\n"
-                "Use /downloadtemplate to get the template."
-            )
-            return
-        if body.startswith("[") or body.startswith("{"):
-            import json as _j
-            try:
-                data = _j.loads(body)
-                if isinstance(data, dict): data = [data]
-                for r in data:
-                    d = _normalise(r)
-                    if d["name"]: rows.append(d)
-            except Exception as e:
-                await update.message.reply_text(f"Invalid JSON: {e}")
-                return
-        else:
-            reader = _csv_mod.DictReader(io.StringIO(body))
-            for r in reader:
-                d = _normalise(r)
-                if d["name"]: rows.append(d)
-
-    if not rows:
-        await update.message.reply_text(
-            "No valid rows found. Make sure the file has a header row:\n"
-            "name, role, ipl_team, nationality, base_price, tier\n\n"
-            "Use /downloadtemplate for the correct format."
-        )
-        return
-
-    aid    = live.auction_id
-    added  = 0
-    skipped= []
-    for d in rows:
-        try:
-            db.cx.execute(
-                "INSERT INTO players(auction_id,name,role,nationality,ipl_team,base_price,tier,status)"
-                " VALUES(?,?,?,?,?,?,?,\'available\')",
-                (aid, d["name"], d["role"], d["nationality"],
-                 d["ipl_team"], d["base_price"], d["tier"])
-            )
-            added += 1
-        except Exception as e:
-            skipped.append(d["name"])
-    db.cx.commit()
-
-    if not live.active:
-        live.player_queue = list(db.get_available(aid))
-
-    skip_note = f"\n\u26a0\ufe0f Skipped {len(skipped)}: {', '.join(skipped[:5])}" if skipped else ""
-    await update.message.reply_text(
-        f"\u2705 *{added} players imported!*\n"
-        f"Auction: *{md_safe(live.auction_name)}*\n"
-        f"Available: {len(db.get_available(aid))} players{skip_note}\n\n"
-        f"Use /startauction when ready.",
-        parse_mode=ParseMode.MARKDOWN,
-    )
+    await player_io.import_command(sys.modules[__name__], update, context)
 
 
 async def cmd_auto_sell(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -4685,76 +4435,11 @@ async def cmd_rtm_decision(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ── PLAYER MANAGEMENT ────────────────────────────────────
 
 async def cmd_add_player(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await _reg(update.effective_user)
-    if not db.is_admin(update.effective_user.id): return
-    if not live.auction_id:
-        await update.message.reply_text("Create an auction first.")
-        return
-    if len(context.args) < 5:
-        await update.message.reply_text(
-            "Usage: /addplayer <n> <role> <team> <nat> <price> [tier]\n"
-            "e.g. /addplayer ViratKohli Bat RCB Indian 2cr Marquee"
-        )
-        return
-    name  = context.args[0].replace("_", " ")
-    role  = norm_role(context.args[1])
-    team  = context.args[2]
-    nat   = norm_nat(context.args[3])
-    price = parse_price(context.args[4])
-    tier  = context.args[5].capitalize() if len(context.args) > 5 else "C"
-    if price is None:
-        await update.message.reply_text("Invalid price.")
-        return
-    aid = live.auction_id
-    pid = db.add_player(aid, name, price, role, nat, team, tier)
-    if live.active:
-        r = db.get_player(pid)
-        if r: live.player_queue.append(r)
-        note = " — added to queue!"
-    else:
-        note = ""
-    await update.message.reply_text(
-        f"Added: *{flag(nat)} {name}* | {role} | "
-        f"{fmt(price,aid) if price else 'Open'} | {tier}{note}",
-        parse_mode=ParseMode.MARKDOWN,
-    )
+    await player_io.add_command(sys.modules[__name__], update, context, mode='single')
 
 
 async def cmd_add_player_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await _reg(update.effective_user)
-    if not db.is_admin(update.effective_user.id): return
-    if not live.auction_id:
-        await update.message.reply_text("Create an auction first.")
-        return
-    lines  = update.message.text.strip().split("\n")[1:]
-    added, failed = [], []
-    for line in lines:
-        line = re.sub(r"^\d+[.)\s]\s*", "", line.strip())
-        if not line: continue
-        parts = [p.strip() for p in line.split(",")]
-        if len(parts) < 5:
-            failed.append(line[:40])
-            continue
-        price = parse_price(parts[4])
-        if price is None:
-            failed.append(line[:40])
-            continue
-        tier = parts[5].capitalize() if len(parts) > 5 else "C"
-        pid  = db.add_player(live.auction_id, parts[0], price,
-                             norm_role(parts[1]), norm_nat(parts[3]), parts[2], tier)
-        if live.active:
-            r = db.get_player(pid)
-            if r: live.player_queue.append(r)
-        added.append(parts[0])
-
-    msg = f"Added {len(added)} players!"
-    if live.active and added: msg += f" ({len(added)} queued)"
-    if added:
-        msg += "\n" + "\n".join(f"  {n}" for n in added[:20])
-        if len(added) > 20: msg += f"\n  ...+{len(added)-20} more"
-    if failed:
-        msg += f"\n\nFailed:\n" + "\n".join(failed[:5])
-    await update.message.reply_text(msg)
+    await player_io.add_command(sys.modules[__name__], update, context, mode='list')
 
 
 async def cmd_clear_players(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -4936,6 +4621,9 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def _handle_callback_inner(update, context, query, data, uid):
+    if auction_lifecycle.closed(sys.modules[__name__]) and not data.startswith("snap_") and data != "my_purse":
+        await query.answer("This auction is cancelled.", show_alert=True)
+        return
     # Encoded RTM buttons may survive after a different auction is selected.
     if data.startswith(("rtm_use_btn|", "rtm_pass_btn|", "ry|", "rn|")):
         try:
@@ -5531,6 +5219,8 @@ import auction_controls
 AUCTION_COMMANDS = auction_controls.install(sys.modules[__name__])
 AUCTION_COMMANDS.update(auction_rules.install(sys.modules[__name__]))
 AUCTION_COMMANDS.update(team_management.install(sys.modules[__name__]))
+AUCTION_COMMANDS.update(player_io.install(sys.modules[__name__]))
+AUCTION_COMMANDS.update(auction_lifecycle.install(sys.modules[__name__]))
 
 DOT_MAP = {
     "setteamname": cmd_set_team_name, "stn": cmd_set_team_name,
@@ -5655,10 +5345,10 @@ def draft_desk():
     current = "No current turn" if not order else f"Round {order['round_no']} · Pick {order['pick_no']} · {escape(order['team_name'])} · {escape(order['tier'])}"
     cards = "".join(f"""<article class="team"><div><b>{escape(t['team_name'])}</b><br><small>Owner tag ID: {t['user_id']} · Co-owner tag ID: {', '.join(str(x['linked_user_id']) for x in db.get_co_owners(aid,t['user_id'])) or '—'}</small></div><a href="/draft/teams/{t['user_id']}/edit">Edit team</a></article>""" for t in teams) or "<p>No teams added yet.</p>"
     turns = "".join(f"<tr><td>R{o['round_no']} P{o['pick_no']}</td><td>{escape(o['team_name'])}</td><td>{escape(o['tier'])}</td><td>{'Picked' if o['picked_player_id'] else 'Waiting'}</td></tr>" for o in orders) or "<tr><td colspan=4>No draft order uploaded.</td></tr>"
-    display_columns = ("player_id", "set_no", "gender") + DRAFT_PLAYER_COLUMNS
+    display_columns = player_io.CORE_COLUMNS
     headers = "".join(f"<th>{DRAFT_PLAYER_LABELS[c]}</th>" for c in display_columns)
     rows = "".join("<tr>"+"".join(f"<td>{escape(str(player[c] or '—'))}</td>" for c in display_columns)+"</tr>" for player in players) or f"<tr><td colspan={len(display_columns)}>No available players.</td></tr>"
-    return f"""<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1"><title>{escape(auction['name'])}</title><style>:root{{--navy:#14213d;--blue:#246bdf;--paper:#f5f7fc;--line:#dbe2ef}}*{{box-sizing:border-box}}body{{margin:0;background:var(--paper);font:15px system-ui;color:#18233a}}header{{background:linear-gradient(120deg,var(--navy),#2459a8);color:#fff;padding:2.5rem max(1.25rem,calc((100% - 1160px)/2))}}header p,small{{color:#68738a}}header p{{color:#dbe8ff}}main{{max-width:1160px;margin:auto;padding:1.5rem}}.notice,.panel,.team{{background:#fff;border:1px solid var(--line);border-radius:12px;padding:1.25rem;margin-bottom:1rem}}.notice{{border-left:4px solid #f5b700}}.grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(290px,1fr));gap:1rem}}.grid .panel{{margin:0}}label{{display:block;font-weight:600;margin:.6rem 0}}input,textarea{{display:block;width:100%;padding:.6rem;margin-top:.25rem;border:1px solid #bdc8dc;border-radius:7px}}button,a{{display:inline-block;background:var(--blue);color:#fff;border:0;border-radius:7px;padding:.65rem .9rem;text-decoration:none;font-weight:700}}.team{{display:flex;justify-content:space-between;align-items:center}}.scroll{{overflow:auto;border:1px solid var(--line);border-radius:10px}}table{{border-collapse:collapse;width:100%;white-space:nowrap}}th,td{{padding:.65rem .75rem;text-align:left;border-bottom:1px solid var(--line)}}th{{background:#edf3ff;text-transform:uppercase;font-size:.75rem}}@media(max-width:600px){{.team{{align-items:flex-start;gap:1rem;flex-direction:column}}}}</style></head><body><header><h1>🏏 {escape(auction['name'])}</h1><p>Draft control room · {len(teams)}/{auction['max_teams']} teams · {len(players)} imported players</p></header><main><nav class="panel"><a href="/draft/rules">Squad rules</a> <a href="/watch">Live spectator board</a> <a href="/draft/audit">Audit log</a></nav><div class="notice"><b>Current turn</b><br>{current}</div><div class="grid"><section class="panel"><h2>Add team</h2><p><small>Only the owner or co-owner tag ID for a team can make that team’s pick.</small></p><form action="/draft/teams" method="post"><label>Team name<input name="team_name" required></label><label>Owner tag ID<input name="owner_tag_id" inputmode="numeric" required></label><label>Co-owner tag IDs (optional, comma-separated)<input name="co_owner_tag_id" inputmode="numeric"></label><button>Add team</button></form></section><section class="panel"><h2>Add teams in bulk</h2><p>One team per line. First ID is the primary owner; additional IDs are co-owners.</p><form action="/draft/teams/bulk" method="post"><label>Teams and owner IDs<textarea name="teams" rows="6" placeholder="Royal Tigers, 123456789, 234567890&#10;Blue Hawks, 345678901, 456789012, 567890123" required></textarea></label><button>Add all teams</button></form></section><section class="panel"><h2>Import data</h2><form action="/draft/players/preview" method="post" enctype="multipart/form-data"><label>Players spreadsheet (.xlsx / .csv)<input type="file" name="file" accept=".xlsx,.csv" required></label><small>All spreadsheet columns are visible below.</small><p><label><input type="checkbox" name="replace" value="1"> Replace queue (withdraw unlisted available players)</label><button>Preview player import</button></p></form><form action="/draft/orders" method="post" enctype="multipart/form-data"><label>Draft order (.xlsx / .csv)<input type="file" name="file" accept=".xlsx,.csv" required></label><button>Import order</button></form></section></div><section class="panel"><h2>Teams</h2>{cards}</section><section class="panel"><h2>Draft order</h2><div class="scroll"><table><thead><tr><th>Turn</th><th>Team</th><th>Tier</th><th>Status</th></tr></thead><tbody>{turns}</tbody></table></div></section><section class="panel"><h2>Players — full spreadsheet details</h2><div class="scroll"><table><thead><tr>{headers}</tr></thead><tbody>{rows}</tbody></table></div></section></main></body></html>"""
+    return f"""<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1"><title>{escape(auction['name'])}</title><style>:root{{--navy:#14213d;--blue:#246bdf;--paper:#f5f7fc;--line:#dbe2ef}}*{{box-sizing:border-box}}body{{margin:0;background:var(--paper);font:15px system-ui;color:#18233a}}header{{background:linear-gradient(120deg,var(--navy),#2459a8);color:#fff;padding:2.5rem max(1.25rem,calc((100% - 1160px)/2))}}header p,small{{color:#68738a}}header p{{color:#dbe8ff}}main{{max-width:1160px;margin:auto;padding:1.5rem}}.notice,.panel,.team{{background:#fff;border:1px solid var(--line);border-radius:12px;padding:1.25rem;margin-bottom:1rem}}.notice{{border-left:4px solid #f5b700}}.grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(290px,1fr));gap:1rem}}.grid .panel{{margin:0}}label{{display:block;font-weight:600;margin:.6rem 0}}input,textarea{{display:block;width:100%;padding:.6rem;margin-top:.25rem;border:1px solid #bdc8dc;border-radius:7px}}button,a{{display:inline-block;background:var(--blue);color:#fff;border:0;border-radius:7px;padding:.65rem .9rem;text-decoration:none;font-weight:700}}.team{{display:flex;justify-content:space-between;align-items:center}}.scroll{{overflow:auto;border:1px solid var(--line);border-radius:10px}}table{{border-collapse:collapse;width:100%;white-space:nowrap}}th,td{{padding:.65rem .75rem;text-align:left;border-bottom:1px solid var(--line)}}th{{background:#edf3ff;text-transform:uppercase;font-size:.75rem}}@media(max-width:600px){{.team{{align-items:flex-start;gap:1rem;flex-direction:column}}}}</style></head><body><header><h1>🏏 {escape(auction['name'])}</h1><p>Draft control room · {len(teams)}/{auction['max_teams']} teams · {len(players)} imported players</p></header><main><nav class="panel"><a href="/draft/rules">Squad rules</a> <a href="/watch">Live spectator board</a> <a href="/draft/audit">Audit log</a><form action="/draft/cancel" method="post" style="display:inline"><button>Cancel auction…</button></form><p>Status: {escape(auction["status"])}</p></nav><div class="notice"><b>Current turn</b><br>{current}</div><div class="grid"><section class="panel"><h2>Add team</h2><p><small>Only the owner or co-owner tag ID for a team can make that team’s pick.</small></p><form action="/draft/teams" method="post"><label>Team name<input name="team_name" required></label><label>Owner tag ID<input name="owner_tag_id" inputmode="numeric" required></label><label>Co-owner tag IDs (optional, comma-separated)<input name="co_owner_tag_id" inputmode="numeric"></label><button>Add team</button></form></section><section class="panel"><h2>Add teams in bulk</h2><p>One team per line. First ID is the primary owner; additional IDs are co-owners.</p><form action="/draft/teams/bulk" method="post"><label>Teams and owner IDs<textarea name="teams" rows="6" placeholder="Royal Tigers, 123456789, 234567890&#10;Blue Hawks, 345678901, 456789012, 567890123" required></textarea></label><button>Add all teams</button></form></section><section class="panel"><h2>Import data</h2><form action="/draft/players/preview" method="post" enctype="multipart/form-data"><p><a href="/draft/players/template">Download template</a> <a href="/draft/players/export?format=xlsx">Export XLSX</a> <a href="/draft/players/export?format=csv">Export CSV</a> <a href="/draft/players/export?format=json">Export JSON</a></p><label>Players (.xlsx / .csv / .json)<input type="file" name="file" accept=".xlsx,.csv,.json" required></label><small>All spreadsheet columns are visible below.</small><p><label><input type="checkbox" name="replace" value="1"> Replace queue (withdraw unlisted available players)</label><button>Preview player import</button></p></form><form action="/draft/orders" method="post" enctype="multipart/form-data"><label>Draft order (.xlsx / .csv)<input type="file" name="file" accept=".xlsx,.csv" required></label><button>Import order</button></form></section></div><section class="panel"><h2>Teams</h2>{cards}</section><section class="panel"><h2>Draft order</h2><div class="scroll"><table><thead><tr><th>Turn</th><th>Team</th><th>Tier</th><th>Status</th></tr></thead><tbody>{turns}</tbody></table></div></section><section class="panel"><h2>Players — full spreadsheet details</h2><div class="scroll"><table><thead><tr>{headers}</tr></thead><tbody>{rows}</tbody></table></div></section></main></body></html>"""
 
 
 @flask_app.route("/draft/auction", methods=["POST"])
@@ -5717,7 +5407,8 @@ def draft_edit_team(owner_id):
 def draft_players_upload():
     aid = _web_draft_aid()
     try:
-        rows = _sheet_rows(request.files.get("file")); _require_columns(rows, DRAFT_PLAYER_COLUMNS)
+        upload = request.files.get("file")
+        rows = player_io.read_rows(upload.read(), upload.filename)
         auction_controls.import_rows(rows)
     except (ValueError, AttributeError) as exc: abort(400, str(exc))
     return jsonify({"imported_players": len(rows)}), 201
@@ -5838,6 +5529,7 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("clearqueue", cmd_clear_queue))
     app.add_handler(CommandHandler(["queue","q"], cmd_view_queue))
 
+    app.add_handler(MessageHandler(filters.Document.ALL, cmd_player_document))
     app.add_handler(CallbackQueryHandler(handle_callback))
     app.add_handler(MessageHandler(filters.TEXT & filters.Regex(r"^."), dot_handler))
 

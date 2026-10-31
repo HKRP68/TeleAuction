@@ -7,6 +7,7 @@ import time
 from html import escape
 from telegram.error import TelegramError
 import auction_rules
+import player_io
 
 b = None
 finish_task = None
@@ -123,38 +124,12 @@ async def summary(update, context):
 
 async def sets_export(update, context):
     fmt = context.args[0].lower() if context.args else 'json'
-    if fmt not in ('json', 'csv'):
-        raise ValueError('Usage: /asetsexport [json|csv]')
-    columns = ('player_id',) + b.DRAFT_PLAYER_COLUMNS + b.DRAFT_OPTIONAL_PLAYER_COLUMNS + ('base_price', 'role', 'nationality', 'ipl_team')
-    rows = [dict(r) for r in b.db.cx.execute('SELECT * FROM players WHERE auction_id=? ORDER BY CAST(set_no AS INTEGER),player_id', (b.live.auction_id,))]
-    rows = [{k: r[k] for k in columns} for r in rows]
-    if fmt == 'json':
-        raw = json.dumps(rows, ensure_ascii=False, indent=2)
-    else:
-        out = io.StringIO(); writer = csv.DictWriter(out, fieldnames=columns)
-        writer.writeheader(); writer.writerows(rows); raw = out.getvalue()
-    await update.message.reply_document(document=io.BytesIO(raw.encode()), filename=f'auction_sets.{fmt}')
+    raw = player_io.export_file(player_io.export_rows(b,b.live.auction_id),fmt)
+    await update.message.reply_document(document=io.BytesIO(raw),filename=f'auction_sets.{fmt}')
 
 
 async def sets_import(update, context):
-    if context.args not in ([], ['replace']):
-        raise ValueError('Usage: /asetsimport [replace]')
-    message = update.message.reply_to_message
-    if not message or not message.document:
-        raise ValueError('Reply to a JSON or CSV document.')
-    if message.document.file_size and message.document.file_size > 5_000_000:
-        raise ValueError('Maximum import size is 5 MB.')
-    doc = message.document
-    raw = bytes(await (await doc.get_file()).download_as_bytearray()).decode('utf-8-sig')
-    if doc.file_name.lower().endswith('.json'):
-        rows = json.loads(raw)
-    elif doc.file_name.lower().endswith('.csv'):
-        rows = list(csv.DictReader(io.StringIO(raw)))
-    else:
-        raise ValueError('Use a .json or .csv file.')
-    token, data = auction_rules.preview(b, rows, replace=bool(context.args), actor=update.effective_user.id)
-    counts = {action: sum(p['action']==action for p in data['changes']) for action in ('new','updated','unchanged','protected')}
-    await update.message.reply_text(f"Preview: {counts}; withdraw {len(data['withdrawn'])}.\n" + '\n'.join(data['warnings']) + f'\nReview full changes: /asetsreview {token}\nApply within 30 minutes: /asetsconfirm {token}')
+    await player_io.preview_import(b,update,context)
 
 
 def import_rows(rows, replace=False):
@@ -165,7 +140,8 @@ def import_rows(rows, replace=False):
     if finish_task and not finish_task.done():
         raise ValueError('Finish playback is running.')
     aid = b.live.auction_id
-    columns = b.DRAFT_PLAYER_COLUMNS + b.DRAFT_OPTIONAL_PLAYER_COLUMNS + ('base_price', 'role', 'nationality', 'ipl_team')
+    if b.auction_lifecycle.closed(b): raise ValueError('This auction is cancelled. Restart it before adding or importing players.')
+    columns = player_io.WRITE_COLUMNS
     prepared = prepare_rows(rows)
     kept = set()
     with b.db.cx:
@@ -197,6 +173,8 @@ async def handle(command, update, context):
     try:
         if finish_task and not finish_task.done() and command not in ('afinish', 'ateamsummary', 'asummary'):
             raise ValueError('Finish playback is running. Use /afinish quick, slow or mute.')
+        if b.auction_lifecycle.closed(b) and command not in ('arestart','asetsexport','ateamsummary','asummary'):
+            raise ValueError('This auction is cancelled. Use /arestart confirm to reset it, or create a new auction.')
         auction_rules.audit(b, 'command_requested', {'command':command,'args':list(context.args)}, update.effective_user.id)
         args = context.args; arg = ' '.join(args).strip(); aid = b.live.auction_id
         if command == 'atimer':
@@ -480,29 +458,4 @@ async def finish(update, context):
 
 
 def prepare_rows(rows):
-    if not isinstance(rows, list) or not all(isinstance(r, dict) for r in rows):
-        raise ValueError('Expected a list of player records.')
-    aid = b.live.auction_id
-    columns = b.DRAFT_PLAYER_COLUMNS + b.DRAFT_OPTIONAL_PLAYER_COLUMNS + ('base_price', 'role', 'nationality', 'ipl_team')
-    seen = set(); prepared = []
-    for row in rows:
-        if not str(row.get('name') or '').strip():
-            raise ValueError('Every player requires a name.')
-        number = int(row.get('set_no') or 1)
-        if number < 1: raise ValueError('Set No must be positive.')
-        player_id = int(row['player_id']) if row.get('player_id') else None
-        if player_id is not None:
-            old = b.db.get_player(player_id)
-            if player_id < 1 or player_id in seen or (old and old['auction_id'] != aid):
-                raise ValueError('Duplicate, invalid or foreign Player ID.')
-            seen.add(player_id)
-        values = {k: str(row.get(k) or '').strip() for k in columns}
-        values['set_no'] = str(number)
-        values['base_price'] = int(row.get('base_price') or 0)
-        if values['base_price'] < 0: raise ValueError('Base price cannot be negative.')
-        values['gender'] = auction_rules.gender(values['gender'])
-        values['tier'] = b.normalize_draft_tier(values['tier'])
-        values['role'] = auction_rules.role(values['role'] or values['category']) or 'Bat'
-        values['nationality'] = values['nationality'] or ('Indian' if values['country'].lower() == 'india' else 'Overseas')
-        prepared.append((player_id, values))
-    return prepared
+    return player_io.prepare(b, rows)

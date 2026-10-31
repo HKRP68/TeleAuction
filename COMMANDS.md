@@ -181,19 +181,76 @@ least the squad minimum and all composition minimums within its purse and caps.
 Impossible or search-limit-exceeded completion applies no simulated sales. Results
 are committed together before playback so playback interruptions do not undo them.
 
+## Cancellation
+
+`/acancel` explains what cancellation does; `/acancel confirm` performs it.
+`/cancelauction confirm` is an alias. Auction admins may cancel the selected auction.
+
+Cancellation stops the clock and automatic next-lot scheduling, clears the current
+bid without charging it, returns an unresolved RTM card, closes bidding/registration,
+and invalidates pending import previews. Completed sales, squads, purse balances,
+player metadata and audit events are preserved and remain exportable. Cancellation
+is recorded in the audit log. `/astart` and `/aresume` cannot reopen a cancelled
+auction. Create a new auction or explicitly run `/arestart confirm` to reset the
+cancelled auction's sales and purses before reopening it. A completed auction cannot
+be cancelled. The website has a **Cancel auction…** review step in `/draft`.
+
 ## Player database and reviewed imports
 
 | Command | Purpose | Example |
 | --- | --- | --- |
-| `/asetsexport [json\|csv]` | Download all sets and stable player IDs. | `/asetsexport csv` |
-| `/asetsimport [replace]` | Reply to a JSON/CSV file to preview its changes. | Reply with `/asetsimport replace`. |
+| `/exportplayers [json\|csv\|xlsx]` | Download all player database fields. | `/exportplayers xlsx` |
+| `/asetsexport [json\|csv\|xlsx]` | Download all sets and stable player IDs. | `/asetsexport csv` |
+| `/asetsimport [replace]` | Reply to a JSON/CSV/XLSX file to preview its changes. | Reply with `/asetsimport replace`. |
 | `/asetsreview token` | Download field-level preview details. | `/asetsreview TOKEN_FROM_PREVIEW` |
 | `/asetsconfirm token` | Apply the reviewed preview within 30 minutes. | `/asetsconfirm TOKEN_FROM_PREVIEW` |
 | `/findplayer query` | Search by name, role, former team or tier. | `/findplayer Bumrah` |
-| `/addplayer name role team nationality price [tier]` | Legacy single-player entry; underscores in names become spaces. | `/addplayer Virat_Kohli Bat RCB Indian 2cr Marquee` |
-| `/add_player_list` | Paste a numbered, comma-separated legacy list. | `/add_player_list` followed by `1 Virat Kohli, Bat, RCB, Indian, 2cr, Marquee` on a new line. |
-| `/bulkplayer name,name,…` | Quick add names with default player metadata. | `/bulkplayer Player One,Player Two` |
+| `/addplayer record` | Add a full Player Database record as name-first CSV or JSON. | `/addplayer Example Player,82,Bowler,Women,India,Right,Right,Fast,70,87,2026,1` |
+| `/add_player_list` | Add multiple detailed CSV rows, header-based CSV, or JSON records. | Put one name-first player record per line after `/add_player_list`. |
+| `/bulkplayer records` | Add detailed CSV/JSON records, or just names for quick entries. | `/bulkplayer [{"name":"Player One","rating":84,"gender":"Women","category":"Bowler"}]` |
 | `/clearplayers` | Clear the auction's player list; super admin only. | `/clearplayers` |
+
+### Recommended way to add players
+
+1. Run `/downloadtemplate` for XLSX (or `/downloadtemplate csv` / `json`).
+2. Replace the example row with your players; keep the field headers. There is no notes row to delete.
+3. Leave `player_id` empty for new players; supply existing IDs to update matching players in this auction. `set_no` defaults to 1.
+4. Send the file and reply with `/uploaddata` (or `/asetsimport`). A command in the file caption also works.
+5. Review the returned changes with `/asetsreview TOKEN`, then run `/asetsconfirm TOKEN`.
+6. Download the result with `/exportplayers xlsx`, `/asetsexport csv`, or `/downloaddata` for the full report.
+
+Every import/export uses the same fields. The core fields are listed below; templates
+and exports also include `tier,icon_eligible,indian_status,base_price,role,nationality,ipl_team`.
+Only `name` is required for a new record; omitted metadata gets defaults. For updates
+with an existing Player ID, omitted fields keep their stored values. Explicit blanks
+clear optional fields. Pricing accepts `2cr`, `50l`, or integers in purse units.
+Legacy role/price entry remains accepted and is normalized through this same schema.
+Sold/drafted players and squad members are protected during imports.
+
+To clone players into another auction, clear the Player IDs first; an ID belonging
+to another auction is rejected. Metadata imports never recreate sales from exported
+status/sold-to/price columns; use the existing database backup to restore a complete
+auction. Report Players sheets can be imported without dropping metadata.
+
+Chat entry uses this name-first order (trailing fields are optional):
+
+```text
+name,rating,category,gender,country,bat_hand,bowl_hand,bowl_style,bat_rating,bowl_rating,version[,set_no,player_id,base_price]
+```
+
+Example:
+
+```text
+/addplayer Example Player,82,Bowler,Women,India,Right,Right,Fast,70,87,2026,1
+```
+
+Raw rows in the exported database column order are also accepted; leave the first Player ID cell blank to create a new record.
+
+You may also use JSON with explicit field names to avoid remembering the order:
+
+```text
+/addplayer {"name":"Example Player","rating":82,"category":"Bowler","gender":"Women","country":"India","version":"2026","set_no":1,"base_price":"20l"}
+```
 
 The detailed database fields are:
 
@@ -215,7 +272,7 @@ recommended way to manage detailed metadata and gender/rating quotas.
 
 Replacement withdraws unlisted available players. Owned players are protected.
 If the player pool or team state changes after review, generate a fresh preview.
-The website `/draft` offers the same preview workflow for CSV/XLSX uploads.
+The website `/draft` offers the same preview workflow for CSV/JSON/XLSX uploads.
 
 ## Teams, purses, communication and reporting
 
@@ -281,9 +338,9 @@ undo/refund behavior. These older commands remain available:
 | `/rtmwindow seconds` | RTM offer window: `/rtmwindow 30`. |
 | `/rtmcounter seconds` | RTM counter window: `/rtmcounter 20`. |
 | `/rtmdecision seconds` | RTM acceptance window: `/rtmdecision 15`. |
-| `/downloaddata` | Download the legacy full Excel report. |
-| `/downloadtemplate` | Download the legacy player spreadsheet template. |
-| `/uploaddata` | Reply to/paste legacy CSV/XLSX player data to import directly. For reviewed detailed imports use `/asetsimport` or the website. |
+| `/downloaddata [format]` | No argument: full Excel report with an importable Players sheet. With json/csv/xlsx: export all player fields. Example `/downloaddata csv`. |
+| `/downloadtemplate [format]` | Download the shared database template: `/downloadtemplate xlsx`, `/downloadtemplate csv`, or `/downloadtemplate json`. |
+| `/uploaddata [replace]` | Reply to a CSV/JSON/XLSX file (or put the command in its caption) to preview the full Player Database import. Then apply with `/asetsconfirm TOKEN`. Inline CSV/JSON is also supported. |
 
 ## Website pages
 
