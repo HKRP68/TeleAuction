@@ -152,6 +152,11 @@ def bid_error(bot, team, player, amount, auction):
 
 def init_schema(cx):
     cx.executescript('''
+    CREATE TABLE IF NOT EXISTS auction_admins (
+        auction_id INTEGER NOT NULL REFERENCES auctions(auction_id) ON DELETE CASCADE,
+        user_id INTEGER NOT NULL, granted_by INTEGER NOT NULL,
+        granted_at TEXT DEFAULT CURRENT_TIMESTAMP,
+        PRIMARY KEY(auction_id,user_id));
     CREATE TABLE IF NOT EXISTS auction_audit (
         id INTEGER PRIMARY KEY, auction_id INTEGER NOT NULL, actor_id INTEGER,
         action TEXT NOT NULL, detail TEXT NOT NULL, ts TEXT DEFAULT CURRENT_TIMESTAMP);

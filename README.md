@@ -406,3 +406,32 @@ prior history is not reconstructed.
 the current lot, clock, standing bid, queue size, team purses, full squads and each
 quota's current count. `/watch/data` supplies its read-only JSON snapshot. Player
 details are rendered as text, and owner/co-owner Telegram IDs are omitted.
+
+
+### Help guide and auction admins
+
+`/help` sends a short overview and attaches [COMMANDS.md](COMMANDS.md). `/commands`
+or `/helpmd` downloads the same Markdown file directly, even before an auction
+exists. The guide includes every registered slash command and its aliases,
+worked setup examples, gender/rating quotas, import confirmation and access levels.
+
+Global admins can assign operators to the currently selected auction:
+
+```text
+/auctionadmin @assistant
+/auctionadmin add 123456789
+/auctionadmin list
+/auctionadmin remove 123456789
+```
+
+Alternatively, reply to a person's message with `/auctionadmin` to grant access,
+or `/auctionadmin remove` to revoke it. Username lookup requires the person to
+have sent `/start`; raw positive Telegram user IDs are accepted directly.
+Grants persist in SQLite, are recorded in the audit log, and apply only to that
+auction. Auction admins can operate its rules, players, clock, queue, purses and
+results, but cannot assign other admins or create fresh auctions. Global admins
+may create auctions and manage auction-specific grants. Only `SUPER_ADMIN_ID` can
+use `/admin @user` to grant global access or `/clearplayers` to clear all players.
+Removing an auction-specific grant does not revoke an existing global grant.
+The website retains its existing control-room access model; Telegram role grants
+apply to the bot's permission checks.

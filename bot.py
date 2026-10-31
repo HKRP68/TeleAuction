@@ -11,6 +11,7 @@ IPL Cricket Auction Bot — v4.0
 
 import asyncio
 import auction_rules
+import help_admin
 from html import escape
 import json
 import logging
@@ -345,11 +346,19 @@ class DB:
         except ValueError:
             return None
 
-    def is_admin(self, uid: int) -> bool:
+    def is_global_admin(self, uid: int) -> bool:
         if uid == Config.SUPER_ADMIN_ID:
             return True
         r = self.cx.execute("SELECT is_admin FROM global_users WHERE user_id=?", (uid,)).fetchone()
         return bool(r and r["is_admin"])
+
+    def is_admin(self, uid: int, aid: Optional[int] = None) -> bool:
+        if self.is_global_admin(uid):
+            return True
+        aid = live.auction_id if aid is None else aid
+        return bool(aid and self.cx.execute(
+            "SELECT 1 FROM auction_admins WHERE auction_id=? AND user_id=?", (aid, uid)
+        ).fetchone())
 
     def set_admin(self, uid: int, val: bool):
         self.cx.execute(
@@ -2199,75 +2208,15 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid    = update.effective_user.id
-    is_adm = db.is_admin(uid)
+    await help_admin.help_command(sys.modules[__name__], update, context)
 
-    u = (
-        "*USER COMMANDS*\n"
-        "/start — Register\n"
-        "/setteamname <n> — Rename your team\n"
-        "/purse [@user] — Check purse & squad\n"
-        "/squad [@user] — View squad\n"
-        "/bid <amount> — Place bid\n"
-        "/rtm — Use RTM card (after bid timer expires, if you hold a matching card)\n"
-        "/myrtm — Check your RTM cards & assigned team\n"
-        "/status — Current auction status\n"
-        "/mybidhistory — Your bid results\n"
-        "/auctionhistory — Past auctions\n"
-        "/leaderboard — Top teams\n"
-        "/pick <player> — Make your scheduled draft selection\n"
-    )
-    a = ""
-    if is_adm:
-        a = (
-            "\n*ADMIN: SETUP*\n"
-            "/create\\_auction <teams>,<purse>,<min\\_max>\n"
-            "/setauctionname <n>\n"
-            "/setcurrency <symbol>\n"
-            "/admin @user — Grant admin\n"
-            "\n*ADMIN: PLAYERS*\n"
-            "/addplayer <n> <role> <team> <nat> <price> [tier]\n"
-            "/add\\_player\\_list — Bulk from list\n"
-            "/bulkplayer <P1>,<P2>,... — Quick bulk add\n"
-            "/clearplayers\n"
-            "/pick <player> — Pick for the current draft turn\n"
-            "\n*ADMIN: AUCTION*\n"
-            "/startauction — Begin bidding\n"
-            "/next — Next player\n"
-            "/pass — Mark unsold / skip\n"
-            "/forceauction <name|#n> — Force player now\n"
-            "/sold — Confirm sale\n"
-            "/forcesold — Force sell (skip RTM)\n"
-            "/pauseauction | /resumeauction\n"
-            "/endauction\n"
-            "/autosell <secs|off>\n"
-            "/autonext <enable|disable|secs>\n"
-            "\n*ADMIN: TEAMS*\n"
-            "/auctionowners — List all owners & usernames\n"
-            "/soldplayers — Sold list with jump links\n"
-            "/unsoldplayers — Unsold list\n"
-            "/setrtm @user <cards> <TEAM> — Assign RTM (TEAM = ipl_team in player list)\n"
-            "/mute\\_team @user | /unmute\\_team @user\n"
-            "/teamup @primary @proxy\n"
-            "/setpurse @user <amt>\n"
-            "/addpurse @user <amt>\n"
-            "/deductpurse @user <amt>\n"
-            "/addtosquad @user P1,P2\n"
-            "/removefromsquad @user 1,2\n"
-            "/clearsquad @user\n"
-            "/swap @u1 @u2\n"
-            "\n*ADMIN: QUEUE*\n"
-            "/addtoqueue P1,P2 (.atq)\n"
-            "/addtoqueueunsolds (.atqu)\n"
-            "/removefromqueue 1,2 (.rfq)\n"
-            "/shufflequeue (.sq)\n"
-            "/swapqueue 1 2\n"
-            "/clearqueue\n"
-            "/queue [page]\n"
-        )
-    await update.message.reply_text(u + a, parse_mode=ParseMode.MARKDOWN)
-    if db.is_admin(update.effective_user.id):
-        await update.message.reply_text("Auction controls: " + " ".join("/" + name for name in AUCTION_COMMANDS))
+
+async def cmd_commands(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await help_admin.send_guide(update)
+
+
+async def cmd_auction_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await help_admin.auction_admin(sys.modules[__name__], update, context)
 
 
 # ── CREATE AUCTION ────────────────────────────────────────
@@ -2275,8 +2224,8 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_create_auction(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     await _reg(user)
-    if not db.is_admin(user.id):
-        await update.message.reply_text("Admin only.")
+    if not db.is_global_admin(user.id):
+        await update.message.reply_text("Global admin only.")
         return
 
     raw = " ".join(context.args).replace(" ", "")
@@ -2896,6 +2845,10 @@ async def cmd_undo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     aid  = live.auction_id
     pid  = snap["player_id"]
     wid  = snap["winner_id"]
+    player = db.get_player(pid)
+    if not player or player["auction_id"] != aid:
+        await update.message.reply_text("That sale belongs to another auction.")
+        return
 
     # Reverse: restore player to available
     db.cx.execute(
@@ -4978,6 +4931,16 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def _handle_callback_inner(update, context, query, data, uid):
+    # Encoded RTM buttons may survive after a different auction is selected.
+    if data.startswith(("rtm_use_btn|", "rtm_pass_btn|", "ry|", "rn|")):
+        try:
+            player = db.get_player(int(data.split("|")[1]))
+        except (ValueError, IndexError):
+            player = None
+        if not player or player["auction_id"] != live.auction_id:
+            await query.answer("This button belongs to another auction or an unavailable player.", show_alert=True)
+            return
+
 
     # ── JOIN ─────────────────────────────────
     if data.startswith("join_"):
@@ -5449,6 +5412,10 @@ async def _handle_callback_inner(update, context, query, data, uid):
         if not pid:
             await query.answer("Nothing to re-auction.", show_alert=True)
             return
+        player = db.get_player(pid)
+        if not player or player["auction_id"] != live.auction_id:
+            await query.answer("That player belongs to another auction.", show_alert=True)
+            return
         # Refund buyer
         if live.last_sold_buyer_id and live.last_sold_price > 0:
             db.refund_purse(live.auction_id, live.last_sold_buyer_id, live.last_sold_price)
@@ -5591,6 +5558,8 @@ DOT_MAP = {
     "rtmcounter": cmd_rtm_counter,
     "rtmdecision": cmd_rtm_decision,
     "leaderboard": cmd_leaderboard, "help": cmd_help,
+    "commands": cmd_commands, "helpmd": cmd_commands,
+    "auctionadmin": cmd_auction_admin,
     "mute": cmd_mute, "unmute": cmd_unmute,
     "setrtm": cmd_set_rtm,
     "bulkplayer": cmd_bulk_player,
@@ -5771,6 +5740,8 @@ def build_app() -> Application:
     # User
     app.add_handler(CommandHandler(["start","registration"], cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
+    app.add_handler(CommandHandler(["commands","helpmd"], cmd_commands))
+    app.add_handler(CommandHandler("auctionadmin", cmd_auction_admin))
     app.add_handler(CommandHandler(["setteamname","stn"], cmd_set_team_name))
     app.add_handler(CommandHandler(["purse","bal","balance"], cmd_purse))
     app.add_handler(CommandHandler("squad", cmd_squad))
