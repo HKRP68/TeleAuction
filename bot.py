@@ -10,9 +10,11 @@ IPL Cricket Auction Bot — v4.0
 """
 
 import asyncio
+import auction_rules
 from html import escape
 import json
 import logging
+import math
 import os
 import random
 import re
@@ -90,6 +92,10 @@ class LiveState:
     highest_bidder_id: Optional[int]  = None
     highest_bidder_name: str   = ""
     last_bid_msg_id: Optional[int]    = None
+
+    rules_auction_id: Optional[int] = None
+    lot_bid_floor: int = 0
+    paused_remaining: float = 60
 
     # Timer
     timer_task: Optional[asyncio.Task] = None
@@ -303,9 +309,12 @@ class DB:
         # SQLite's CREATE TABLE cannot add fields to existing installations.
         existing = {row[1] for row in c.execute("PRAGMA table_info(players)")}
         for column in ("rating", "icon_eligible", "gender", "indian_status", "category",
-                       "country", "bat_hand", "bowl_hand", "bowl_style", "bat_rating", "bowl_rating"):
+                       "country", "bat_hand", "bowl_hand", "bowl_style", "bat_rating", "bowl_rating", "version", "set_no"):
             if column not in existing:
-                c.execute(f"ALTER TABLE players ADD COLUMN {column} TEXT DEFAULT ''")
+                default_value = "1" if column == "set_no" else ""
+                c.execute(f"ALTER TABLE players ADD COLUMN {column} TEXT DEFAULT '{default_value}'")
+        c.execute("UPDATE players SET set_no='1' WHERE set_no='' OR set_no IS NULL")
+        auction_rules.init_schema(c)
         c.commit()
         c.close()
 
@@ -519,8 +528,8 @@ class DB:
                    role: str = "Batsman", nat: str = "Indian",
                    ipl_team: str = "", tier: str = "C") -> int:
         cur = self.cx.execute(
-            "INSERT INTO players(auction_id,name,base_price,role,nationality,ipl_team,tier)"
-            " VALUES(?,?,?,?,?,?,?)",
+            "INSERT INTO players(auction_id,name,base_price,role,nationality,ipl_team,tier,set_no)"
+            " VALUES(?,?,?,?,?,?,?,'1')",
             (aid, name, base_price, role, nat, ipl_team, tier),
         )
         self.cx.commit()
@@ -537,7 +546,7 @@ class DB:
 
     def get_available(self, aid: int) -> list:
         return self.cx.execute(
-            "SELECT * FROM players WHERE auction_id=? AND status='available' ORDER BY player_id",
+            "SELECT * FROM players WHERE auction_id=? AND status='available' ORDER BY CAST(set_no AS INTEGER),player_id",
             (aid,),
         ).fetchall()
 
@@ -660,8 +669,9 @@ db = DB()
 # DRAFT MODE
 # ─────────────────────────────────────────────────────────
 DRAFT_TIERS = ("Platinum", "Gold", "Silver", "Bronze")
-DRAFT_PLAYER_COLUMNS = ("name", "rating", "tier", "icon_eligible", "gender", "indian_status", "category",
-                        "country", "bat_hand", "bowl_hand", "bowl_style", "bat_rating", "bowl_rating")
+DRAFT_PLAYER_COLUMNS = ("name", "rating", "category", "country", "bat_hand", "bowl_hand",
+                        "bowl_style", "bat_rating", "bowl_rating", "version")
+DRAFT_OPTIONAL_PLAYER_COLUMNS = ("tier", "icon_eligible", "gender", "indian_status", "set_no")
 DRAFT_ORDER_COLUMNS = ("round_no", "pick_no", "tier", "team_name", "owner_name", "owner_tag_id")
 
 
@@ -691,13 +701,20 @@ def is_draft_picker(aid: int, order, user_id: int) -> bool:
 
 def add_draft_player(aid: int, data: dict) -> int:
     """Add a detailed player record used by both the website and /pick."""
-    values = [str(data.get(field, "")).strip() for field in DRAFT_PLAYER_COLUMNS]
-    if not values[0]:
+    columns = DRAFT_PLAYER_COLUMNS + DRAFT_OPTIONAL_PLAYER_COLUMNS
+    values = {field: str(data[field]).strip() if data.get(field) is not None else ""
+              for field in columns}
+    if not values["name"]:
         raise ValueError("name is required")
-    values[2] = normalize_draft_tier(values[2])
-    cur = db.cx.execute("""INSERT INTO players
-        (auction_id,name,rating,tier,icon_eligible,gender,indian_status,category,country,bat_hand,bowl_hand,bowl_style,bat_rating,bowl_rating,status)
-        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?, 'available')""", (aid, *values))
+    values["tier"] = normalize_draft_tier(values["tier"])
+    values["gender"] = auction_rules.gender(values["gender"])
+    values["set_no"] = str(int(values["set_no"] or 1))
+    if int(values["set_no"]) < 1:
+        raise ValueError("Set No must be positive")
+    placeholders = ",".join("?" for _ in columns)
+    cur = db.cx.execute(
+        f"INSERT INTO players (auction_id,{','.join(columns)},status) "
+        f"VALUES(?,{placeholders}, 'available')", (aid, *(values[field] for field in columns)))
     db.cx.commit()
     return cur.lastrowid
 
@@ -723,6 +740,12 @@ async def cmd_pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not player or player["status"] != "available":
         await update.message.reply_text("That player is unavailable. Use the exact available player name.")
         return
+    team = db.cx.execute("SELECT * FROM participants WHERE auction_id=? AND team_name=?", (live.auction_id,order["team_name"])).fetchone()
+    if team:
+        rule_error = auction_rules.bid_error(sys.modules[__name__], team, player, 0, db.get_auction(live.auction_id))
+        if rule_error:
+            await update.message.reply_text(rule_error)
+            return
     if not draft_tier_allowed(player["tier"], order["tier"]):
         await update.message.reply_text(f"This is a {order['tier']} pick; choose {order['tier']} or a lower tier player.")
         return
@@ -730,6 +753,8 @@ async def cmd_pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("That pick was already completed. Please try again.")
         return
     db.set_player_status(player["player_id"], "drafted")
+    if team:
+        db.add_to_squad(live.auction_id,team["user_id"],player["player_id"])
     squad = db.draft_squad(live.auction_id, order["team_name"])
     by_tier = {tier: [] for tier in DRAFT_TIERS}
     for member in squad:
@@ -776,6 +801,12 @@ def save_live_state():
         "auto_next_on":   live.auto_next_on,
         "squad_limits":   live.squad_limits,
         "min_increment":  live.min_increment,
+        "current_player_id": live.current_player_id,
+        "current_bid": live.current_bid,
+        "highest_bidder_id": live.highest_bidder_id,
+        "highest_bidder_name": live.highest_bidder_name,
+        "lot_bid_floor": live.lot_bid_floor,
+        "paused_remaining": live.paused_remaining if live.paused else max(1, (live.timer_ends_at or _time.time()+60)-_time.time()),
         "player_queue":   [
             (r["player_id"] if hasattr(r, "keys") else int(r))
             for r in live.player_queue
@@ -873,15 +904,24 @@ def _apply_state_dict(state: dict) -> bool:
         live.auto_next_secs = state.get("auto_next_secs")
         live.auto_next_on   = state.get("auto_next_on", False)
         live.squad_limits   = state.get("squad_limits", {})
+        live.rules_auction_id = aid
         live.min_increment  = state.get("min_increment", 10)
+        live.current_player_id = state.get("current_player_id")
+        live.current_bid = state.get("current_bid", 0)
+        live.highest_bidder_id = state.get("highest_bidder_id")
+        live.highest_bidder_name = state.get("highest_bidder_name", "")
+        live.lot_bid_floor = state.get("lot_bid_floor", 0)
+        live.paused_remaining = state.get("paused_remaining", 60)
+        if live.current_player_id:
+            live.paused = True  # /aresume restarts the saved clock explicitly.
         pids = state.get("player_queue", [])
         live.player_queue = []
         for pid in pids:
             row = db.get_player(int(pid))
-            if row and row["status"] == "available":
+            if row and row["status"] == "available" and row["player_id"] != live.current_player_id:
                 live.player_queue.append(row)
         if not live.player_queue:
-            live.player_queue = list(db.get_available(aid))
+            live.player_queue = [p for p in db.get_available(aid) if p["player_id"] != live.current_player_id]
         return True
     except Exception as e:
         logger.error(f"_apply_state_dict: {e}", exc_info=True)
@@ -1132,59 +1172,7 @@ def validate_bid(row, player_row, bid_l: int, auction_row) -> Optional[str]:
                 f"Minimum raise is {fmt(live.min_increment, aid)}. "
                 f"Bid at least {fmt(live.current_bid + live.min_increment, aid)}."
             )
-    # Squad composition limits
-    if live.squad_limits:
-        lims = live.squad_limits
-        p_role = player_row["role"]    # Bat / Bowl / AR / WK
-        p_nat  = player_row["nationality"]  # Indian / Overseas
-
-        # Build current squad role counts
-        def _squad_counts(sq_ids):
-            counts = {"Bat": 0, "Bowl": 0, "AR": 0, "WK": 0, "OS": 0, "Indian": 0}
-            for pid in sq_ids:
-                pr = db.get_player(int(pid))
-                if not pr: continue
-                counts[pr["role"]]  = counts.get(pr["role"], 0) + 1
-                if pr["nationality"] == "Overseas":
-                    counts["OS"] += 1
-                else:
-                    counts["Indian"] += 1
-            return counts
-
-        counts = _squad_counts(sq)
-        remaining = auction_row["max_players"] - len(sq)  # slots left including this player
-
-        # Overseas cap
-        if p_nat == "Overseas" and "OS" in lims:
-            os_max, os_min = lims["OS"]
-            if counts["OS"] >= os_max:
-                return f"Overseas limit reached! Max {os_max} overseas players per squad."
-
-        # Role max cap
-        role_key = p_role  # Bat, Bowl, AR, WK
-        if role_key in lims:
-            r_max, r_min = lims[role_key]
-            if counts.get(role_key, 0) >= r_max:
-                return f"Role limit reached! Max {r_max} {role_key} players per squad."
-
-        # Check if buying this player would make min requirements for other roles impossible
-        # (only warn if squad is nearly full)
-        if remaining <= 3:
-            for chk_role, (chk_max, chk_min) in lims.items():
-                if chk_min <= 0 or chk_role == "OS":
-                    continue
-                chk_role_key = chk_role
-                current_count = counts.get(chk_role_key, 0)
-                if chk_role_key == p_role:
-                    current_count += 1  # this player would add one
-                slots_after = remaining - 1  # after buying this player
-                if current_count + slots_after < chk_min:
-                    return (
-                        f"⚠️ Buying this player makes {chk_role} minimum ({chk_min}) "
-                        f"impossible to reach with {slots_after} slots left."
-                    )
-
-    return None
+    return auction_rules.bid_error(sys.modules[__name__], row, player_row, bid_l, auction_row)
 
 
 # ─────────────────────────────────────────────────────────
@@ -1197,6 +1185,8 @@ def player_card(row) -> str:
         f"{'─'*28}\n"
         f"{r_emoji(row['role'])} *{flag(row['nationality'])} {row['name']}*\n"
         f"Role: {row['role']}  |  {row['nationality']}\n"
+        f"Player ID: {row['player_id']} | Set No: {row['set_no'] or 1}\n"
+        f"Gender: {row['gender'] or 'Unspecified'} | Rating: {row['rating'] or '—'}\n"
         f"Tier: {tier_s(row['tier'])}\n"
         f"Base: *{base}*  |  Prev Team: *{row['ipl_team'] or 'None'}*"
         f"{rtm}\n"
@@ -1220,10 +1210,10 @@ def bid_status_text(player_row, bid: int, bidder: str,
 def bid_keyboard(player_row, current_bid: int) -> InlineKeyboardMarkup:
     aid = player_row["auction_id"]
     if current_bid == 0:
-        b1 = player_row["base_price"] if player_row["base_price"] > 0 else Config.INCREMENT
+        b1 = player_row["base_price"] if player_row["base_price"] > 0 else max(1, live.min_increment)
     else:
-        b1 = current_bid + Config.INCREMENT
-    b2 = b1 + Config.INCREMENT
+        b1 = current_bid + max(1, live.min_increment)
+    b2 = b1 + max(1, live.min_increment)
     return InlineKeyboardMarkup([
         [
             InlineKeyboardButton(f"💰 Bid {fmt(b1,aid)}", callback_data=f"bid_{b1}"),
@@ -1455,19 +1445,19 @@ def reauction_confirm_keyboard() -> InlineKeyboardMarkup:
 async def bid_timer(context: ContextTypes.DEFAULT_TYPE):
     """
     Countdown timer — 1s ticks.
-    • Resets fully on every new bid (task cancelled + restarted in process_bid).
-    • Half-time: sends one warning message.
-    • Final 3-2-1: sends one new message per second.
+    • Uses the per-auction staged or classic /atimer policy.
+    • Staged warnings and final countdown use configured thresholds.
     • On expiry: calls _mark_unsold or _check_rtm.
     • Fully wrapped in try/except — crashes are logged, SOLD still fires.
     """
     try:
-        duration          = live.auto_sell_secs or Config.BID_TIMER
-        half              = max(3, duration // 2)
-        end               = _time.time() + duration
+        policy = auction_controls.clock()
+        duration = policy[0]
+        half = max(3, duration // 2)
+        warnings = policy[2:4] if len(policy) == 5 else [half]
+        warned = set()
+        end = live.timer_ends_at or (_time.time() + duration)
         live.timer_ends_at = end
-
-        half_sent = False
 
         while True:
             await asyncio.sleep(1)
@@ -1477,7 +1467,7 @@ async def bid_timer(context: ContextTypes.DEFAULT_TYPE):
             if not live.current_player_id:
                 return
 
-            remaining = max(0, int(live.timer_ends_at - _time.time()))
+            remaining = max(0, math.ceil(live.timer_ends_at - _time.time()))
             if remaining <= 0:
                 break
 
@@ -1491,7 +1481,7 @@ async def bid_timer(context: ContextTypes.DEFAULT_TYPE):
             leader = live.highest_bidder_name or "None"
 
             # ── 3-2-1 countdown ───────────────────────────
-            if remaining <= 3:
+            if remaining <= (policy[4] if len(policy) == 5 else 3):
                 urgency = {3: "Hurry! Final bids!", 2: "Last chance!", 1: "CLOSING NOW!"}
                 try:
                     await context.bot.send_message(
@@ -1510,8 +1500,8 @@ async def bid_timer(context: ContextTypes.DEFAULT_TYPE):
                 continue  # sleep 1s then next tick
 
             # ── Half-time warning (once per run) ──────────
-            if not half_sent and remaining <= half:
-                half_sent = True
+            if any(remaining <= threshold and threshold not in warned for threshold in warnings):
+                warned.update(threshold for threshold in warnings if remaining <= threshold)
                 try:
                     await context.bot.send_message(
                         chat_id=live.chat_id,
@@ -1957,7 +1947,9 @@ async def _do_next(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
     if not live.player_queue:
         unsold = db.get_unsold(live.auction_id)
         if unsold:
-            live.player_queue = list(unsold)
+            for player in unsold:
+                db.restore_player(player["player_id"])
+            live.player_queue = list(db.get_available(live.auction_id))
             await context.bot.send_message(
                 chat_id=chat_id,
                 text=f"♻️ Loading {len(unsold)} unsold players back into queue...",
@@ -1968,6 +1960,9 @@ async def _do_next(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
             )
             return
 
+    live.player_queue = [item for item in live.player_queue if db.get_player(auction_controls.pid(item)) and db.get_player(auction_controls.pid(item))["status"] == "available"]
+    if not live.player_queue:
+        return
     pr = live.player_queue.pop(0)
     # Re-fetch fresh
     if hasattr(pr, "keys"):
@@ -1979,6 +1974,7 @@ async def _do_next(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
         await _do_next(context, chat_id)
         return
 
+    live.lot_bid_floor = db.cx.execute("SELECT COALESCE(MAX(id),0) FROM bid_history").fetchone()[0]
     live.current_player_id   = fresh["player_id"]
     live.current_bid         = 0
     live.highest_bidder_id   = None
@@ -1995,7 +1991,7 @@ async def _do_next(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
         text=(
             f"🔨 *{live.auction_name}*\n"
             f"{player_card(fresh)}\n"
-            f"⏱ Timer starts on first bid\n"
+            f"⏱ Opening clock: {auction_controls.clock()[0]}s\n"
             f"📋 Remaining in queue: {queued}"
         ),
         parse_mode=ParseMode.MARKDOWN,
@@ -2003,6 +1999,9 @@ async def _do_next(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
     )
     live.last_bid_msg_id = msg.message_id
     live.chat_id         = chat_id
+    live.timer_ends_at = _time.time() + auction_controls.clock()[0]
+    live.timer_task = asyncio.create_task(bid_timer(context))
+    save_live_state()
 
 
 # ─────────────────────────────────────────────────────────
@@ -2081,11 +2080,11 @@ async def process_bid(update, context: ContextTypes.DEFAULT_TYPE,
         await err(v_err)
         return
 
-    # Anti-snipe
-    if live.timer_ends_at:
-        rem = live.timer_ends_at - _time.time()
-        if 0 < rem < Config.ANTI_SNIPE:
-            live.timer_ends_at = _time.time() + Config.ANTI_SNIPE
+    control_error = auction_controls.bid_error(caller_uid, uid, bid_l, not bool(update.callback_query))
+    if control_error:
+        await err(control_error)
+        return
+    auction_controls.note_bid(caller_uid, uid)
 
     # RTM counter scenario — original bidder raises bid → Step 3
     if live.rtm_state == RTM_ACTIVE and uid == live.rtm_orig_bidder_id:
@@ -2140,18 +2139,23 @@ async def process_bid(update, context: ContextTypes.DEFAULT_TYPE,
     live.highest_bidder_name = bid_display(part)
 
     db.record_bid(aid, uid, pr["player_id"], pr["name"], bid_l, won=False)
+    save_live_state()
 
-    # Cancel existing timer and start fresh — every bid resets to full duration
+    # Restart the task with the deadline dictated by staged/classic clock policy.
     if live.timer_task and not live.timer_task.done():
         live.timer_task.cancel()
         try:
             await asyncio.shield(asyncio.sleep(0))  # yield so cancel propagates
         except Exception:
             pass
-    live.timer_ends_at = None
+    policy = auction_controls.clock()
+    remaining = max(0, (live.timer_ends_at or _time.time()) - _time.time())
+    duration = policy[0] if len(policy) == 1 else max(remaining, policy[1])
+    live.timer_ends_at = _time.time() + duration
     live.timer_task = asyncio.create_task(bid_timer(context))
+    save_live_state()
 
-    duration = live.auto_sell_secs or Config.BID_TIMER
+    duration = max(0, int(live.timer_ends_at - _time.time()))
     outbid   = f"⬆️ Outbids: {prev_name}" if prev_name and prev_name != bid_display(part) else "🎯 Opening bid!"
 
     new_msg = await context.bot.send_message(
@@ -2262,6 +2266,8 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "/queue [page]\n"
         )
     await update.message.reply_text(u + a, parse_mode=ParseMode.MARKDOWN)
+    if db.is_admin(update.effective_user.id):
+        await update.message.reply_text("Auction controls: " + " ".join("/" + name for name in AUCTION_COMMANDS))
 
 
 # ── CREATE AUCTION ────────────────────────────────────────
@@ -2511,10 +2517,10 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_bid(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _reg(update.effective_user)
-    if not context.args:
-        await update.message.reply_text("Usage: /bid <amount>  e.g. /bid 2cr")
+    if not live.current_player_id:
+        await update.message.reply_text("No active player.")
         return
-    bid_l = parse_price(context.args[0])
+    bid_l = parse_price(context.args[0]) if context.args else auction_controls.next_amount()
     if bid_l is None:
         await update.message.reply_text("Invalid amount.")
         return
@@ -2830,7 +2836,7 @@ async def cmd_force_auction(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text=(
             f"🔨 *FORCE AUCTION* — *{live.auction_name}*\n"
             f"{player_card(pr)}\n"
-            f"⏱ Timer starts on first bid\n"
+            f"⏱ Opening clock: {auction_controls.clock()[0]}s\n"
             f"📋 Queue remaining: {len(live.player_queue)}"
         ),
         parse_mode=ParseMode.MARKDOWN,
@@ -2983,8 +2989,7 @@ async def cmd_set_limit(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
     if arg == "clear":
-        live.squad_limits = {}
-        save_live_state()
+        auction_rules.save(sys.modules[__name__], {})
         await update.message.reply_text("✅ All squad limits cleared.")
         return
 
@@ -3020,8 +3025,11 @@ async def cmd_set_limit(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(f"❌ Bad numbers for {key}: `{val}`")
             return
 
-    live.squad_limits = limits
-    save_live_state()
+    try:
+        auction_rules.save(sys.modules[__name__], limits)
+    except ValueError as exc:
+        await update.message.reply_text(str(exc))
+        return
     await update.message.reply_text(
         f"✅ *Squad Limits Set*\n{'─'*28}\n{_fmt_limits()}",
         parse_mode=ParseMode.MARKDOWN,
@@ -3797,6 +3805,9 @@ async def cmd_pass(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     if not live.current_player_id:
         await update.message.reply_text("No active player.")
+        return
+    if live.highest_bidder_id is not None:
+        await update.message.reply_text("A bid stands. Use /asold or /aundobid first.")
         return
     if live.timer_task and not live.timer_task.done():
         live.timer_task.cancel()
@@ -5543,6 +5554,11 @@ async def _handle_callback_inner(update, context, query, data, uid):
 # ─────────────────────────────────────────────────────────
 # DOT COMMAND ROUTER
 # ─────────────────────────────────────────────────────────
+import sys
+import auction_controls
+AUCTION_COMMANDS = auction_controls.install(sys.modules[__name__])
+AUCTION_COMMANDS.update(auction_rules.install(sys.modules[__name__]))
+
 DOT_MAP = {
     "setteamname": cmd_set_team_name, "stn": cmd_set_team_name,
     "purse": cmd_purse, "bal": cmd_purse, "balance": cmd_purse,
@@ -5584,6 +5600,8 @@ DOT_MAP = {
     "auctionsummary": cmd_auction_summary, "auction_summary": cmd_auction_summary,
     "right_to_match": cmd_rtm, "rtm": cmd_rtm,
 }
+
+DOT_MAP.update(AUCTION_COMMANDS)
 
 
 async def dot_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -5642,7 +5660,7 @@ def _require_columns(rows, columns):
         raise ValueError("Missing required columns: " + ", ".join(missing))
 
 
-DRAFT_PLAYER_LABELS = {"name": "Name", "rating": "Rating", "tier": "Tier", "icon_eligible": "Icon eligible", "gender": "Gender", "indian_status": "Indian status", "category": "Category", "country": "Country", "bat_hand": "Bat hand", "bowl_hand": "Bowl hand", "bowl_style": "Bowl style", "bat_rating": "Bat rating", "bowl_rating": "Bowl rating"}
+DRAFT_PLAYER_LABELS = {"name": "Name", "rating": "Rating", "tier": "Tier", "icon_eligible": "Icon eligible", "gender": "Gender", "indian_status": "Indian status", "category": "Category", "country": "Country", "bat_hand": "Bat hand", "bowl_hand": "Bowl hand", "bowl_style": "Bowl style", "bat_rating": "Bat rating", "bowl_rating": "Bowl rating", "version": "Version", "set_no": "Set No", "player_id": "Player ID"}
 
 
 def _tag_id(value, field_name):
@@ -5662,9 +5680,10 @@ def draft_desk():
     current = "No current turn" if not order else f"Round {order['round_no']} · Pick {order['pick_no']} · {escape(order['team_name'])} · {escape(order['tier'])}"
     cards = "".join(f"""<article class="team"><div><b>{escape(t['team_name'])}</b><br><small>Owner tag ID: {t['user_id']} · Co-owner tag ID: {', '.join(str(x['linked_user_id']) for x in db.get_co_owners(aid,t['user_id'])) or '—'}</small></div><a href="/draft/teams/{t['user_id']}/edit">Edit team</a></article>""" for t in teams) or "<p>No teams added yet.</p>"
     turns = "".join(f"<tr><td>R{o['round_no']} P{o['pick_no']}</td><td>{escape(o['team_name'])}</td><td>{escape(o['tier'])}</td><td>{'Picked' if o['picked_player_id'] else 'Waiting'}</td></tr>" for o in orders) or "<tr><td colspan=4>No draft order uploaded.</td></tr>"
-    headers = "".join(f"<th>{DRAFT_PLAYER_LABELS[c]}</th>" for c in DRAFT_PLAYER_COLUMNS)
-    rows = "".join("<tr>"+"".join(f"<td>{escape(str(player[c] or '—'))}</td>" for c in DRAFT_PLAYER_COLUMNS)+"</tr>" for player in players) or f"<tr><td colspan={len(DRAFT_PLAYER_COLUMNS)}>No available players.</td></tr>"
-    return f"""<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1"><title>{escape(auction['name'])}</title><style>:root{{--navy:#14213d;--blue:#246bdf;--paper:#f5f7fc;--line:#dbe2ef}}*{{box-sizing:border-box}}body{{margin:0;background:var(--paper);font:15px system-ui;color:#18233a}}header{{background:linear-gradient(120deg,var(--navy),#2459a8);color:#fff;padding:2.5rem max(1.25rem,calc((100% - 1160px)/2))}}header p,small{{color:#68738a}}header p{{color:#dbe8ff}}main{{max-width:1160px;margin:auto;padding:1.5rem}}.notice,.panel,.team{{background:#fff;border:1px solid var(--line);border-radius:12px;padding:1.25rem;margin-bottom:1rem}}.notice{{border-left:4px solid #f5b700}}.grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(290px,1fr));gap:1rem}}.grid .panel{{margin:0}}label{{display:block;font-weight:600;margin:.6rem 0}}input{{display:block;width:100%;padding:.6rem;margin-top:.25rem;border:1px solid #bdc8dc;border-radius:7px}}button,a{{display:inline-block;background:var(--blue);color:#fff;border:0;border-radius:7px;padding:.65rem .9rem;text-decoration:none;font-weight:700}}.team{{display:flex;justify-content:space-between;align-items:center}}.scroll{{overflow:auto;border:1px solid var(--line);border-radius:10px}}table{{border-collapse:collapse;width:100%;white-space:nowrap}}th,td{{padding:.65rem .75rem;text-align:left;border-bottom:1px solid var(--line)}}th{{background:#edf3ff;text-transform:uppercase;font-size:.75rem}}@media(max-width:600px){{.team{{align-items:flex-start;gap:1rem;flex-direction:column}}}}</style></head><body><header><h1>🏏 {escape(auction['name'])}</h1><p>Draft control room · {len(teams)}/{auction['max_teams']} teams · {len(players)} imported players</p></header><main><div class="notice"><b>Current turn</b><br>{current}</div><div class="grid"><section class="panel"><h2>Add team</h2><p><small>Only the owner or co-owner tag ID for a team can make that team’s pick.</small></p><form action="/draft/teams" method="post"><label>Team name<input name="team_name" required></label><label>Owner tag ID<input name="owner_tag_id" inputmode="numeric" required></label><label>Co-owner tag ID (optional)<input name="co_owner_tag_id" inputmode="numeric"></label><button>Add team</button></form></section><section class="panel"><h2>Import data</h2><form action="/draft/players" method="post" enctype="multipart/form-data"><label>Players spreadsheet (.xlsx / .csv)<input type="file" name="file" accept=".xlsx,.csv" required></label><small>All spreadsheet columns are visible below.</small><p><button>Import players</button></p></form><form action="/draft/orders" method="post" enctype="multipart/form-data"><label>Draft order (.xlsx / .csv)<input type="file" name="file" accept=".xlsx,.csv" required></label><button>Import order</button></form></section></div><section class="panel"><h2>Teams</h2>{cards}</section><section class="panel"><h2>Draft order</h2><div class="scroll"><table><thead><tr><th>Turn</th><th>Team</th><th>Tier</th><th>Status</th></tr></thead><tbody>{turns}</tbody></table></div></section><section class="panel"><h2>Players — full spreadsheet details</h2><div class="scroll"><table><thead><tr>{headers}</tr></thead><tbody>{rows}</tbody></table></div></section></main></body></html>"""
+    display_columns = ("player_id", "set_no", "gender") + DRAFT_PLAYER_COLUMNS
+    headers = "".join(f"<th>{DRAFT_PLAYER_LABELS[c]}</th>" for c in display_columns)
+    rows = "".join("<tr>"+"".join(f"<td>{escape(str(player[c] or '—'))}</td>" for c in display_columns)+"</tr>" for player in players) or f"<tr><td colspan={len(display_columns)}>No available players.</td></tr>"
+    return f"""<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1"><title>{escape(auction['name'])}</title><style>:root{{--navy:#14213d;--blue:#246bdf;--paper:#f5f7fc;--line:#dbe2ef}}*{{box-sizing:border-box}}body{{margin:0;background:var(--paper);font:15px system-ui;color:#18233a}}header{{background:linear-gradient(120deg,var(--navy),#2459a8);color:#fff;padding:2.5rem max(1.25rem,calc((100% - 1160px)/2))}}header p,small{{color:#68738a}}header p{{color:#dbe8ff}}main{{max-width:1160px;margin:auto;padding:1.5rem}}.notice,.panel,.team{{background:#fff;border:1px solid var(--line);border-radius:12px;padding:1.25rem;margin-bottom:1rem}}.notice{{border-left:4px solid #f5b700}}.grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(290px,1fr));gap:1rem}}.grid .panel{{margin:0}}label{{display:block;font-weight:600;margin:.6rem 0}}input{{display:block;width:100%;padding:.6rem;margin-top:.25rem;border:1px solid #bdc8dc;border-radius:7px}}button,a{{display:inline-block;background:var(--blue);color:#fff;border:0;border-radius:7px;padding:.65rem .9rem;text-decoration:none;font-weight:700}}.team{{display:flex;justify-content:space-between;align-items:center}}.scroll{{overflow:auto;border:1px solid var(--line);border-radius:10px}}table{{border-collapse:collapse;width:100%;white-space:nowrap}}th,td{{padding:.65rem .75rem;text-align:left;border-bottom:1px solid var(--line)}}th{{background:#edf3ff;text-transform:uppercase;font-size:.75rem}}@media(max-width:600px){{.team{{align-items:flex-start;gap:1rem;flex-direction:column}}}}</style></head><body><header><h1>🏏 {escape(auction['name'])}</h1><p>Draft control room · {len(teams)}/{auction['max_teams']} teams · {len(players)} imported players</p></header><main><nav class="panel"><a href="/draft/rules">Squad rules</a> <a href="/watch">Live spectator board</a> <a href="/draft/audit">Audit log</a></nav><div class="notice"><b>Current turn</b><br>{current}</div><div class="grid"><section class="panel"><h2>Add team</h2><p><small>Only the owner or co-owner tag ID for a team can make that team’s pick.</small></p><form action="/draft/teams" method="post"><label>Team name<input name="team_name" required></label><label>Owner tag ID<input name="owner_tag_id" inputmode="numeric" required></label><label>Co-owner tag ID (optional)<input name="co_owner_tag_id" inputmode="numeric"></label><button>Add team</button></form></section><section class="panel"><h2>Import data</h2><form action="/draft/players/preview" method="post" enctype="multipart/form-data"><label>Players spreadsheet (.xlsx / .csv)<input type="file" name="file" accept=".xlsx,.csv" required></label><small>All spreadsheet columns are visible below.</small><p><label><input type="checkbox" name="replace" value="1"> Replace queue (withdraw unlisted available players)</label><button>Preview player import</button></p></form><form action="/draft/orders" method="post" enctype="multipart/form-data"><label>Draft order (.xlsx / .csv)<input type="file" name="file" accept=".xlsx,.csv" required></label><button>Import order</button></form></section></div><section class="panel"><h2>Teams</h2>{cards}</section><section class="panel"><h2>Draft order</h2><div class="scroll"><table><thead><tr><th>Turn</th><th>Team</th><th>Tier</th><th>Status</th></tr></thead><tbody>{turns}</tbody></table></div></section><section class="panel"><h2>Players — full spreadsheet details</h2><div class="scroll"><table><thead><tr>{headers}</tr></thead><tbody>{rows}</tbody></table></div></section></main></body></html>"""
 
 
 @flask_app.route("/draft/auction", methods=["POST"])
@@ -5717,7 +5736,7 @@ def draft_players_upload():
     aid = _web_draft_aid()
     try:
         rows = _sheet_rows(request.files.get("file")); _require_columns(rows, DRAFT_PLAYER_COLUMNS)
-        for row in rows: add_draft_player(aid, row)
+        auction_controls.import_rows(rows)
     except (ValueError, AttributeError) as exc: abort(400, str(exc))
     return jsonify({"imported_players": len(rows)}), 201
 
@@ -5745,6 +5764,9 @@ def health():
 # ─────────────────────────────────────────────────────────
 def build_app() -> Application:
     app = Application.builder().token(Config.BOT_TOKEN).build()
+
+    for command, handler in AUCTION_COMMANDS.items():
+        app.add_handler(CommandHandler(command, handler))
 
     # User
     app.add_handler(CommandHandler(["start","registration"], cmd_start))

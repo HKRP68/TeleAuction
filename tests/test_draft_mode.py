@@ -50,8 +50,8 @@ def test_draft_desk_imports_csv_without_token(tmp_path):
     bot = load_bot(tmp_path)
     make_auction(bot)
     client = bot.flask_app.test_client()
-    csv = (b"name,rating,tier,icon_eligible,gender,indian_status,category,country,bat_hand,bowl_hand,bowl_style,bat_rating,bowl_rating\n"
-           b"Jasprit Bumrah,95,Platinum,yes,Male,Indian,Pace,India,Right,Right,Fast,80,98\n")
+    csv = (b"name,rating,tier,icon_eligible,gender,indian_status,category,country,bat_hand,bowl_hand,bowl_style,bat_rating,bowl_rating,version\n"
+           b"Jasprit Bumrah,95,Platinum,yes,Male,Indian,Pace,India,Right,Right,Fast,80,98,v1\n")
     response = client.post("/draft/players", data={
         "file": (io.BytesIO(csv), "players.csv"),
     })
@@ -82,3 +82,41 @@ def test_draft_desk_shows_full_players_and_edits_tag_ids(tmp_path):
     team = bot.db.get_part(aid, 101)
     assert team["team_name"] == "Lions"
     assert bot.is_draft_picker(aid, {"team_name": "Lions", "owner_tag_id": 101}, 404)
+
+
+def test_player_database_imports_requested_fields(tmp_path):
+    bot = load_bot(tmp_path)
+    aid = make_auction(bot)
+    fields = {
+        "name": "Auction Player", "rating": "95", "category": "Pace",
+        "country": "India", "bat_hand": "Right", "bowl_hand": "Right",
+        "bowl_style": "Fast", "bat_rating": "80", "bowl_rating": "98",
+        "version": "2026",
+    }
+    csv = ",".join(fields) + "\n" + ",".join(fields.values()) + "\n"
+    response = bot.flask_app.test_client().post("/draft/players", data={
+        "file": (io.BytesIO(csv.encode()), "players.csv"),
+    })
+    assert response.status_code == 201
+    player = bot.db.get_player_by_name(aid, fields["name"])
+    assert {field: player[field] for field in fields} == fields
+    assert player["tier"] == "Bronze"
+    page = bot.flask_app.test_client().get("/draft").get_data(as_text=True)
+    assert "Version" in page
+    assert "2026" in page
+
+
+def test_player_version_migration_preserves_existing_data(tmp_path):
+    bot = load_bot(tmp_path)
+    aid = make_auction(bot)
+    pid = bot.add_draft_player(aid, {"name": "Existing Player", "rating": "90"})
+    # Older installations predate the metadata audit trigger as well as version.
+    bot.db.cx.execute("DROP TRIGGER IF EXISTS audit_player_update")
+    bot.db.cx.execute("ALTER TABLE players DROP COLUMN version")
+    bot.db.cx.commit()
+    bot.db._init()
+    bot.db._init()
+    player = bot.db.cx.execute("SELECT * FROM players WHERE player_id=?", (pid,)).fetchone()
+    assert player["name"] == "Existing Player"
+    assert player["rating"] == "90"
+    assert player["version"] == ""

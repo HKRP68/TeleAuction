@@ -232,8 +232,10 @@ auction or registering teams in Telegram.
 The desk imports `.xlsx` or `.csv` files for players and the draft order. Player sheets use these exact columns:
 
 ```text
-name,rating,tier,icon_eligible,gender,indian_status,category,country,bat_hand,bowl_hand,bowl_style,bat_rating,bowl_rating
+name,rating,category,country,bat_hand,bowl_hand,bowl_style,bat_rating,bowl_rating,version
 ```
+
+Player records also include `player_id` (the stable numeric Player ID / lot number) and `set_no` (Set No, default 1). Include these columns to preserve IDs and set ordering during imports. New IDs are generated when omitted. The optional player columns `tier`, `icon_eligible`, `gender`, and `indian_status` are also stored when provided. Gender is shown in the player table/cards: use `Women` or `Men` (`Female`/`Male`, `F`/`M` are accepted aliases). Add `gender` to the sheet for mixed-gender squad quotas. Missing gender/rating does not count toward those quotas. Tier defaults to Bronze. Existing databases gain the `version` field automatically at startup without removing player data.
 
 Order sheets use:
 
@@ -288,3 +290,119 @@ ipl-auction-bot/
 ├── tests/                  # Automated tests
 └── auction.db              # SQLite database, created at runtime and ignored by git
 ```
+
+
+### Auction desk controls
+
+All `/a…` controls are admin commands and also accept a leading dot. Use exact
+player names or numeric Player IDs wherever a command accepts a player or lot.
+The player table and player cards show Player ID and Set No. Queue order follows
+Set No, then Player ID.
+
+| Command | Behavior |
+| --- | --- |
+| `/atimer 60 40 20 10 5` | Default staged clock: opens at 60 seconds; a bid below 40 resets to 40; warnings at 20 and 10; countdown 5–1. Earlier bids preserve remaining time. |
+| `/atimer 45` | Classic clock: opens at 45 seconds and every bid resets to 45. Bare `/atimer` reads the policy. |
+| `/abidgap seconds` or `/abidgap off` | Optional auction-wide spacing between accepted bids; off by default. Every bidder has a separate one-second spam throttle. Bare command reads the setting. |
+| `/adirect on` or `/adirect off` | Allow arbitrary valid bid amounts, or restrict every bid to the next increment. Bare command reads the setting. `/bid` without an amount bids the next step. |
+| `/asetsexport [json\|csv]` | Download every set with stable IDs and player metadata. |
+| `/asetsimport [replace]` | Reply to an exported JSON/CSV document to generate a review. Use `/asetsreview token` to download its full changes and `/asetsconfirm token` to apply. `replace` withdraws unlisted available players. Owned players stay intact. |
+| `/awithdraw player` | Withdraw an unowned player; a standing bid prevents withdrawal. |
+| `/areinstate player, …` | Return withdrawn players to the queue. |
+| `/astart`, `/apause`, `/aresume` | Start the first lot, freeze its clock, or resume with the saved remaining time. Resolve RTM before pausing. |
+| `/anext` | Open the next lot. |
+| `/arestart confirm` | Undo sales, clear bids/squads, restore starting purses, and rebuild the queue. Withdrawn players stay withdrawn. |
+| `/aextend [seconds]` | Add seconds to the current lot; defaults to 10. |
+| `/asold` | Sell at the standing bid. |
+| `/aunsold [67, 88, 89]` | Pass the current or listed players. Rejects squad members and players with standing bids. |
+| `/aforce player` | Move the player to the front; open immediately when the block is empty. |
+| `/arecall player` | Refund the buyer, remove the player from their squad, and queue the player next. |
+| `/aundobid` | Remove the standing bid and restore the previous bid from this lot. |
+| `/aaccel [go]` | Re-list unsold players. |
+| `/afinish [go\|go quick]` | Complete squads under the rules, then play back simulated sales. |
+| `/afinish quick\|slow\|mute` | During playback: five sales per message, one per message, or jump to the summary. |
+| `/acall [message]` | Tag teams and DM owners/co-owners. Reply to an image to include it. Reports failed DMs (owners must have started the bot). |
+| `/aremoveteam team` | Release the team's players and share its refunded budget equally among remaining teams; leftover units go in owner-ID order. Refuses removal of the standing bidder. |
+| `/ateamsummary [team]`, `/asummary` | Full categorized squads, overall/batting/bowling ratings, spending, purse balance and limits. |
+
+The `/atimer` policy is stored separately for each auction. Opening a lot starts
+the clock immediately. Restored live lots are paused until `/aresume`.
+
+`/afinish` fills each team to at least the auction minimum squad size and satisfies
+configured composition minimums, without exceeding squad size, composition caps,
+or purses. It honors a standing bid first. Other simulated purchases use base
+price (minimum one purse unit), with deterministic allocation; leftover players
+are unsold. Use optional `role` (`Bat`, `Bowl`, `AR`, `WK`), `nationality`, and
+`base_price` import columns to configure composition and simulation costs.
+If no complete allocation is found, or the bounded allocation search runs out,
+no simulated sales are applied. Successful allocations are committed together
+before playback, so a playback interruption cannot leave half-completed squads.
+
+
+### Flexible mixed-gender and rating rules
+
+Open **Squad rules** at `/draft/rules`, or use Telegram:
+
+```text
+/asquad 15_17
+/arules Batsman 4, Bowler 4, Allrounder 4, Wicketkeeper 2, Women 2, 84_Rating 4
+```
+
+New rule commands always use **minimum_maximum**. A single number is a minimum;
+`Batsman 4` means at least four batsmen. For an exact count use `Batsman 4_4`.
+Maximum `0` means no category cap (the squad maximum still applies).
+This differs from the older positional `/setlimit` command, which keeps its
+original `maximum-minimum` syntax for compatibility.
+
+Gender and rating are independent dimensions: a woman bowler with rating 82 counts
+as **Bowler**, **Women**, and **Rating ≤84** at the same time. The role minimums in
+the example total 14, so a 15–17 squad can accommodate them plus another player.
+Gender/rating quotas do not require additional players beyond those roles.
+
+```text
+/arule Women 2_6
+/arule Rating<=84 4
+/arule Rating<=90.5 3_7
+/arule Rating<=84 off
+/arules show
+/arules clear
+```
+
+The number is configurable; `84_Rating` and `Rating<=84` both mean **overall rating
+84 or less, inclusive**. Unknown/invalid ratings do not qualify. Supported roles
+include Batsman/Batter, Bowler, Allrounder and Wicketkeeper (or Bat/Bowl/AR/WK).
+Store the role in `category`; a recognized category takes priority over the legacy
+`role` field. Overseas and Indian quotas are also supported. Rules are stored per
+auction and checked by bidding, draft picks, and automatic completion. Configuration
+rejects contradictory nested rating quotas, role minimums that exceed squad capacity,
+and caps that conflict with existing squads. Admin manual squad/transfer tools remain
+explicit overrides; their database changes are audited.
+
+**Purse protection:** `/areserve auto` is on by default. Before accepting a bid it
+reserves the combined cost of the cheapest eligible remaining players needed to
+reach the squad/category minimums (base price, minimum one purse unit). It also
+checks remaining slots and individual quota availability. `/areserve off` disables
+the reserve/pool check; caps and slot feasibility remain enforced. This is a lower
+bound, not a promise that other teams will leave those players available or that
+all overlapping quotas can be completed together. `/afinish` performs the complete
+allocation search before changing any sales.
+
+**Import review:** player uploads from the control room now show new/updated/unchanged
+records, protected squad members, field-level before/after changes, duplicate-name
+warnings, and players withdrawn by replacement. Review and apply within 30 minutes.
+A changed player pool or team state invalidates the preview. Telegram set imports
+use the same preview/confirmation process. The older `/draft/players` programmatic
+endpoint continues to accept direct imports for existing clients.
+
+**Audit trail:** `/draft/audit` shows the latest 200 events and exports the full log.
+`/aaudit` shows recent events; `/aaudit json` downloads the log. Database triggers
+record player changes, bid insertion/removal, purse/squad changes and team deletion,
+including changes made through legacy commands. Command entries identify the
+requester; mutation entries identify affected teams/bidders or system/web actions.
+Rules and confirmed imports are also recorded. Logs start when this version runs;
+prior history is not reconstructed.
+
+**Spectator board:** `/watch` is read-only and updates every two seconds. It shows
+the current lot, clock, standing bid, queue size, team purses, full squads and each
+quota's current count. `/watch/data` supplies its read-only JSON snapshot. Player
+details are rendered as text, and owner/co-owner Telegram IDs are omitted.
